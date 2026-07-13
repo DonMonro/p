@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            tests/requirements.txt
+
+      - name: Install test deps & panel
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+          # pyproject.toml lives at repo root (not inside panel/) so that
+          # setuptools packages.find discovers panel/*.py. See pyproject.toml
+          # header comment for the bug history.
+          pip install -e .
+
+      - name: Ruff lint
+        run: ruff check panel tests
+
+      - name: Ruff format check
+        run: ruff format --check panel tests
+
+      - name: Pytest
+        env:
+          PSIPHON3XUI_SESSION_SECRET: ci-secret
+        run: pytest tests -ra
+
+  shellcheck:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          # Only check our authored shell; skip the templated systemd stubs.
+          ignore_paths: >
+            systemd
+          # Ignore the intentional stdin-not-implemented stub in phase 0.
+          ignore_names: >
+            bootstrap.sh

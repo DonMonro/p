@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Psiphon-3X-UI — Management Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    .country-flag { margin-right: .35rem; }
+    .healthy-badge { color: #2a9d8f; font-weight: 600; }
+    .unhealthy-badge { color: #b2182b; font-weight: 600; }
+    .inactive-badge { color: #777; }
+    .busy { opacity: .55; pointer-events: none; }
+    table.grid td, table.grid th { padding: .45rem .55rem; }
+    pre.log { max-height: 22rem; overflow: auto; background: #111; color: #eee;
+              padding: .65rem; border-radius: 4px; font-size: .85rem; }
+    summary h3 { display: inline; margin: 0; }
+    details { margin-bottom: 1rem; }
+    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: .65rem 1rem;
+             background: #222; color: #fff; border-radius: 4px; font-size: .9rem;
+             z-index: 9; box-shadow: 0 6px 16px rgba(0,0,0,.35); }
+    .toast.err { background: #b2182b; }
+    .toast.ok { background: #2a7d2f; }
+  </style>
+</head>
+<body>
+  <nav class="container-fluid">
+    <ul><li><strong>Psiphon-3X-UI</strong> — Management Dashboard</li></ul>
+    <ul>
+      <li><a href="#" @click.prevent="refreshAll()">⟳ Refresh</a></li>
+      <li><a href="#" @click.prevent="logout()">Logout</a></li>
+    </ul>
+  </nav>
+
+  <main class="container" x-data="appDashboard()">
+    <!-- Toast banner for inline feedback -->
+    <template x-if="toast.text">
+      <div class="toast" :class="toast.kind" x-text="toast.text"></div>
+    </template>
+
+    <!-- -------------------------------------------------------------------
+         Countries panel — list + enable/disable + delete
+    -------------------------------------------------------------------- -->
+    <details open>
+      <summary><h3>Countries</h3> <small x-text="`(${countries.length})`"></small></summary>
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>Code</th><th>Name</th><th>Enabled</th><th>SOCKS</th><th>Public</th>
+            <th>Unit</th><th>Inbound</th><th>Healthy</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody :class="{ busy: busy.countries }">
+          <template x-for="c in countries" :key="c.code">
+            <tr>
+              <td><span class="country-flag" x-text="c.flag"></span><code x-text="c.code"></code></td>
+              <td x-text="c.name"></td>
+              <td>
+                <input type="checkbox" :checked="c.enabled"
+                       @change="toggleEnabled(c, $event.target.checked)">
+              </td>
+              <td x-text="c.socks_port ?? '—'"></td>
+              <td x-text="c.public_port ?? '—'"></td>
+              <td>
+                <span x-text="c.unit_active ? '▲ active' : '▼ inactive'"
+                      :class="c.unit_active ? 'healthy-badge' : 'inactive-badge'"></span>
+              </td>
+              <td x-text="c.inbound_id ?? '—'"></td>
+              <td>
+                <span x-text="c.healthy ? 'healthy' : (c.inbound_id ? 'unhealthy' : '—')"
+                      :class="c.healthy ? 'healthy-badge' : (c.inbound_id ? 'unhealthy-badge' : 'inactive-badge')"></span>
+              </td>
+              <td>
+                <button class="outline secondary" @click="viewLogs(c)">Logs</button>
+                <button class="outline" @click="openPorts(c)">Edit ports</button>
+                <button class="outline contrast" @click="deleteCountry(c)">Delete</button>
+              </td>
+            </tr>
+          </template>
+          <template x-if="!countries.length">
+            <tr><td colspan="9"><em>No countries yet — run the wizard's add-country step first.</em></td></tr>
+          </template>
+        </tbody>
+      </table>
+    </details>
+
+    <!-- -------------------------------------------------------------------
+         Ports edit dialog (per-country)
+    -------------------------------------------------------------------- -->
+    <article x-show="ports.open" x-cloak>
+      <header><strong x-text="`Edit ports — ${ports.code}`"></strong></header>
+      <fieldset :disabled="busy.ports">
+        <label>SOCKS port (internal)
+          <input type="number" min="1024" max="65535" x-model.number="ports.socks">
+        </label>
+        <label>Public port (3x-ui listener)
+          <input type="number" min="1" max="65535" x-model.number="ports.public">
+        </label>
+        <small>Re-apply rewrites the per-country Psiphon config, restarts the tunnel, and re-clones the
+          matching 3x-ui inbound so the remark + listener match the new public port.</small>
+      </fieldset>
+      <footer>
+        <button class="secondary" @click="closePorts()">Cancel</button>
+        <button @click="submitPorts()">Re-apply</button>
+      </footer>
+    </article>
+
+    <!-- -------------------------------------------------------------------
+         Logs modal (per-country)
+    -------------------------------------------------------------------- -->
+    <article x-show="logs.open" x-cloak>
+      <header><strong x-text="`Logs — ${logs.code}`"></strong></header>
+      <fieldset>
+        <label>Lines to tail
+          <input type="number" min="1" max="5000" x-model.number="logs.lines">
+        </label>
+        <pre class="log"><template x-for="ln in logs.lines"><span x-text="ln"></span><br></template></pre>
+      </fieldset>
+      <footer>
+        <button class="secondary" @click="closeLogs()">Close</button>
+        <button @click="loadLogs(logs.code, logs.lines)">Reload</button>
+      </footer>
+    </article>
+
+    <!-- -------------------------------------------------------------------
+         Idempotent re-apply of the whole panel state
+    -------------------------------------------------------------------- -->
+    <details>
+      <summary><h3>Re-apply everything</h3></summary>
+      <p>Iterate every <code>PortAssignment</code> row and re-write its per-country Psiphon
+         config + restart the templated unit. Unhealthy 3x-ui clones are re-cloned from the
+         wizard's template inbound.</p>
+      <button @click="reapplyAll()" :disabled="busy.reapply"
+              :class="{ busy: busy.reapply }">Re-apply whole panel</button>
+      <pre x-show="reapply.result" class="log"><code x-text="JSON.stringify(reapply.result, null, 2)"></code></pre>
+    </details>
+
+    <!-- -------------------------------------------------------------------
+         Backup / restore
+    -------------------------------------------------------------------- -->
+    <details>
+      <summary><h3>Backup / Restore</h3></summary>
+      <p>Export a tar archive of <code>panel.db</code> + <code>config/*.json</code> or restore from a
+         previously-exported archive.</p>
+      <button @click="downloadBackup()" :disabled="busy.backup">Download backup</button>
+      <hr>
+      <label>Restore from tar archive
+        <input type="file" accept=".tar,application/x-tar" @change="uploadRestore($event)">
+      </label>
+      <pre x-show="restore.result" class="log"><code x-text="JSON.stringify(restore.result, null, 2)"></code></pre>
+    </details>
+
+    <!-- -------------------------------------------------------------------
+         Settings — rotate password + change panel port
+    -------------------------------------------------------------------- -->
+    <details>
+      <summary><h3>Settings</h3></summary>
+      <article>
+        <header><strong>Rotate admin password</strong></header>
+        <fieldset :disabled="busy.rotate">
+          <label>Current password <input type="password" x-model="rotate.current"></label>
+          <label>New password (>= 8 chars) <input type="password" x-model="rotate.next"></label>
+        </fieldset>
+        <footer><button @click="rotatePassword()">Rotate password</button></footer>
+      </article>
+      <article>
+        <header><strong>Change panel port</strong></header>
+        <fieldset :disabled="busy.port">
+          <label>New panel listen port
+            <input type="number" min="1024" max="65535" x-model.number="port.new">
+          </label>
+          <small>After change: <code>systemctl restart psiphon-3x-ui.service</code> + re-run
+            <code>installer/firewall.sh</code>.</small>
+        </fieldset>
+        <footer><button @click="changePanelPort()">Change port</button></footer>
+      </article>
+    </details>
+  </main>
+
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script>
+    function appDashboard() {
+      return {
+        countries: [],
+        busy: { countries: false, ports: false, reapply: false, backup: false,
+                rotate: false, port: false },
+        ports: { open: false, code: "", socks: 0, public: 0 },
+        logs:  { open: false, code: "", lines: [], lines: 200, linesInput: 200 },
+        reapply: { result: null },
+        restore: { result: null },
+        rotate: { current: "", next: "" },
+        port:   { new: 0 },
+        toast:  { text: "", kind: "ok" },
+
+        async init() {
+          await this.refreshAll();
+        },
+
+        _csrf: { token: "", fetched: false },
+
+        async _csrfHeaders() {
+          // Phase 7 — fetch a CSRF token on first mutating call. Re-fetch on
+          // a 403 (the server may have rotated the cookie). The cookie is set
+          // at login time but we echo it back as a header for defense-in-depth.
+          if (!this._csrf.fetched) {
+            try {
+              const r = await fetch("/auth/csrf");
+              if (r.ok) {
+                const body = await r.json();
+                this._csrf.token = body.token || "";
+                this._csrf.fetched = true;
+              }
+            } catch (e) { /* ignore — server may not enforce CSRF */ }
+          }
+          const fromCookie = document.cookie
+            .split("; ")
+            .find(row => row.startsWith("psiphon3xui_csrf="));
+          const token = this._csrf.token || (fromCookie ? fromCookie.split("=")[1] : "");
+          return token ? {"X-CSRF-Token": token} : {};
+        },
+
+        async refreshAll() {
+          this.busy.countries = true;
+          try {
+            const r = await fetch("/api/dashboard/countries");
+            if (r.status === 401) { window.location.href = "/login"; return; }
+            if (!r.ok) throw new Error(`GET /api/dashboard/countries → ${r.status}`);
+            const body = await r.json();
+            this.countries = body.countries || [];
+          } catch (e) {
+            this.notify(`failed to list countries: ${e.message}`, "err");
+          } finally {
+            this.busy.countries = false;
+          }
+        },
+
+        async toggleEnabled(c, newValue) {
+          try {
+            const r = await fetch(`/api/dashboard/countries/${c.code}`, {
+              method: "PATCH",
+              headers: {...(await this._csrfHeaders()), "Content-Type": "application/json"},
+              body: JSON.stringify({enabled: newValue}),
+            });
+            if (r.ok) {
+              const updated = await r.json();
+              this.countries = this.countries.map(x => x.code === c.code ? updated : x);
+              this.notify(`${c.code} ${newValue ? "enabled" : "disabled"}`);
+            } else {
+              const detail = (await r.json()).detail || r.status;
+              this.notify(`failed to toggle ${c.code}: ${detail}`, "err");
+              await this.refreshAll();
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          }
+        },
+
+        async deleteCountry(c) {
+          if (!confirm(`Delete ${c.code}? This stops the tunnel, removes the PortAssignment, ` +
+                        `and deletes the 3x-ui clone inbound.`)) return;
+          try {
+            const r = await fetch(`/api/dashboard/countries/${c.code}`, {
+              method: "DELETE",
+              headers: await this._csrfHeaders(),
+            });
+            if (r.ok) {
+              const summary = await r.json();
+              this.countries = this.countries.filter(x => x.code !== c.code);
+              this.notify(`deleted ${c.code} — stopped=${summary.stopped_unit}, ` +
+                          `inbound_deleted=${summary.deleted_inbound}`);
+            } else {
+              this.notify(`failed to delete ${c.code}`, "err");
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          }
+        },
+
+        openPorts(c) {
+          this.ports = { open: true, code: c.code,
+                         socks: c.socks_port || 11000, public: c.public_port || 31000 };
+        },
+        closePorts() { this.ports.open = false; },
+
+        async submitPorts() {
+          this.busy.ports = true;
+          try {
+            const r = await fetch(`/api/dashboard/countries/${this.ports.code}/_ports`, {
+              method: "POST",
+              headers: {...(await this._csrfHeaders()), "Content-Type": "application/json"},
+              body: JSON.stringify({socks_port: this.ports.socks, public_port: this.ports.public}),
+            });
+            const body = r.ok ? await r.json() : await r.json();
+            if (!r.ok) {
+              this.notify(`re-apply failed: ${body.detail || r.status}`, "err");
+              return;
+            }
+            this.notify(`re-applied ${this.ports.code} — restarted=${body.restarted_unit}, ` +
+                        `recloned=${body.recloned_inbound}`);
+            this.closePorts();
+            await this.refreshAll();
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.busy.ports = false;
+          }
+        },
+
+        viewLogs(c) {
+          this.logs = { open: true, code: c.code, linesInput: 200, lines: [] };
+          this.loadLogs(c.code, 200);
+        },
+        closeLogs() { this.logs.open = false; },
+
+        async loadLogs(code, lines) {
+          try {
+            const r = await fetch(`/api/dashboard/tunnels/${code}/logs?lines=${lines}`);
+            const body = await r.json();
+            if (!r.ok) {
+              this.notify(`logs failed: ${body.detail || r.status}`, "err");
+              return;
+            }
+            this.logs.lines = body.lines || [];
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          }
+        },
+
+        async reapplyAll() {
+          this.busy.reapply = true;
+          try {
+            const r = await fetch("/api/dashboard/reapply", {
+              method: "POST",
+              headers: await this._csrfHeaders(),
+            });
+            this.reapply.result = r.ok ? await r.json() : {error: r.status};
+            if (r.ok) this.notify(`re-apply done — applied=${this.reapply.result.applied.length}, ` +
+                                  `failed=${this.reapply.result.failed.length}, recloned=${this.reapply.result.recloned.length}`);
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.busy.reapply = false;
+          }
+        },
+
+        async downloadBackup() {
+          this.busy.backup = true;
+          try {
+            const r = await fetch("/api/dashboard/backup");
+            if (!r.ok) throw new Error(`backup failed: ${r.status}`);
+            const blob = await r.blob();
+            const cd = r.headers.get("Content-Disposition") || "";
+            const m = cd.match(/filename="([^"]+)"/);
+            const filename = m ? m[1] : "psiphon-3x-ui-backup.tar";
+            const a = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            a.href = url; a.download = filename;
+            document.body.appendChild(a); a.click();
+            a.remove(); URL.revokeObjectURL(url);
+            this.notify("backup downloaded");
+          } catch (e) {
+            this.notify(e.message, "err");
+          } finally {
+            this.busy.backup = false;
+          }
+        },
+
+        async uploadRestore(ev) {
+          const file = ev.target.files && ev.target.files[0];
+          if (!file) return;
+          const fd = new FormData();
+          fd.append("file", file);
+          try {
+            const r = await fetch("/api/dashboard/restore", {
+              method: "POST",
+              headers: await this._csrfHeaders(),
+              body: fd,
+            });
+            this.restore.result = await r.json();
+            if (r.ok) {
+              this.notify(`restored — panel_db=${this.restore.result.restored_panel_db}, ` +
+                          `configs=${this.restore.result.restored_configs.length}`);
+              await this.refreshAll();
+            } else {
+              this.notify(`restore failed: ${this.restore.result.detail || r.status}`, "err");
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          }
+        },
+
+        async rotatePassword() {
+          this.busy.rotate = true;
+          try {
+            const r = await fetch("/api/dashboard/rotate-password", {
+              method: "POST",
+              headers: {...(await this._csrfHeaders()), "Content-Type": "application/json"},
+              body: JSON.stringify({
+                current_password: this.rotate.current,
+                new_password: this.rotate.next,
+              }),
+            });
+            if (r.ok) {
+              this.notify("password rotated");
+              this.rotate = { current: "", next: "" };
+            } else {
+              const body = await r.json();
+              this.notify(`rotate failed: ${body.detail || r.status}`, "err");
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.busy.rotate = false;
+          }
+        },
+
+        async changePanelPort() {
+          this.busy.port = true;
+          try {
+            const r = await fetch("/api/dashboard/change-panel-port", {
+              method: "POST",
+              headers: {...(await this._csrfHeaders()), "Content-Type": "application/json"},
+              body: JSON.stringify({new_port: this.port.new}),
+            });
+            const body = await r.json();
+            if (r.ok) {
+              this.notify(`panel_port → ${body.new_port}${body.note ? ` — ${body.note}` : ""}`);
+            } else {
+              this.notify(`change port failed: ${body.detail || r.status}`, "err");
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.busy.port = false;
+          }
+        },
+
+        async logout() {
+          await fetch("/auth/logout", {method: "POST"});
+          window.location.href = "/login";
+        },
+
+        notify(text, kind = "ok") {
+          this.toast = { text, kind };
+          setTimeout(() => this.toast = { text: "", kind: "ok" }, 3500);
+        },
+      };
+    }
+  </script>
+</body>
+</html>

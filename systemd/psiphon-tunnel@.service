@@ -1,0 +1,34 @@
+[Unit]
+Description=Psiphon tunnel instance for region %i
+Documentation=https://github.com/Psiphon-Labs/psiphon-tunnel-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %i is the country code (e.g. US). The wizard (Phase 4) writes the matching
+# per-country config JSON to /opt/psiphon-3x-ui/config/<CODE>.json, then starts
+# this templated unit (systemctl start psiphon-tunnel@US.service).
+ExecStart=/opt/psiphon-3x-ui/bin/psiphon-tunnel-core \
+    -config /opt/psiphon-3x-ui/config/%i.json
+WorkingDirectory=/opt/psiphon-3x-ui
+Restart=on-failure
+RestartSec=10
+
+# Tunnels need outbound network but no privileged capabilities.
+User=psiphon3xui
+Group=psiphon3xui
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/psiphon-3x-ui
+
+# Optional per-country network-namespace isolation. Leave commented out by
+# default — netns management is the operator's responsibility (e.g. via the
+# `ip netns` tooling, not systemd). To enable, install the namespace at
+# `/run/netns/<CODE>` for each country you start a tunnel for, then uncomment:
+# NetworkNamespacePath=/run/netns/%i
+
+[Install]
+WantedBy=multi-user.target

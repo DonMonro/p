@@ -1,0 +1,66 @@
+{
+  "meta": {
+    "name": "Psiphon for 3X-UI",
+    "tagline": "Per-country outbound Psiphon tunnels surfaced through 3x-ui inbounds."
+  },
+  "wizard": {
+    "steps": {
+      "countries": {
+        "title": "Choose countries",
+        "all_mode": "Enable every available country",
+        "specific_mode": "Choose a specific subset of countries"
+      },
+      "ports": {
+        "title": "Port ranges",
+        "socks_hint": "Internal SOCKS5 listeners - one per country",
+        "public_hint": "3x-ui inbound ports - one per country (drawn from a pool)",
+        "smart_rec": "Smart recommendation"
+      },
+      "apply": {
+        "title": "Apply",
+        "progress": "Spawning tunnel {country} ..."
+      },
+      "xui_detect": {
+        "title": "Detect 3x-ui",
+        "not_found": "3x-ui not detected automatically; you can paste its base URL and credentials manually."
+      },
+      "xui_creds": {
+        "title": "3x-ui credentials",
+        "verify": "Verify login"
+      },
+      "template": {
+        "title": "Pick the template inbound",
+        "hint": "The wizard clones this inbound once per country."
+      },
+      "clone": {
+        "title": "Clone",
+        "per_country": "Cloning template for {country} -> public port {port}"
+      },
+      "done": {
+        "title": "Done - manage from the dashboard"
+      }
+    }
+  },
+  "dashboard": {
+    "countries": {
+      "title": "Countries"
+    },
+    "ports": {
+      "title": "Ports"
+    },
+    "logs": {
+      "title": "Logs"
+    },
+    "backup": {
+      "title": "Backup / Restore"
+    },
+    "settings": {
+      "title": "Settings"
+    }
+  },
+  "errors": {
+    "unauthenticated": "not authenticated",
+    "wizard_unfinished": "wizard has not completed yet - finish the setup wizard first.",
+    "not_initialised": "panel not initialised - run the installer or panel.seed first."
+  }
+}
