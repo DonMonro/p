@@ -5,9 +5,9 @@
 > server, exposing per-country outbound traffic through clones of an existing
 > 3x-ui inbound.
 
-[![CI](https://github.com/psiphon-3x-ui/psiphon-3x-ui/actions/workflows/ci.yml/badge.svg)](https://github.com/psiphon-3x-ui/psiphon-3x-ui/actions/workflows/ci.yml)
+[![CI](https://github.com/DonMonro/p/actions/workflows/ci.yml/badge.svg)](https://github.com/DonMonro/p/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests: 236 passing](https://img.shields.io/badge/tests-236%20passing-brightgreen)](#tests)
+[![Tests: 240 passing](https://img.shields.io/badge/tests-240%20passing-brightgreen)](#tests)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#tests)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)](https://fastapi.tiangolo.com/)
 
@@ -34,8 +34,8 @@
 > (exposing only local SOCKS proxies) if `3x-ui` is absent.
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/psiphon-3x-ui/psiphon-3x-ui/v1.0.0/install.sh) \
-  || sudo bash <(wget -qO- https://raw.githubusercontent.com/psiphon-3x-ui/psiphon-3x-ui/v1.0.0/install.sh)
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) \
+  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh)
 ```
 
 The installer will:
@@ -76,13 +76,52 @@ re-seeds creds, and restarts the service. Session cookies stay valid
 to stop and remove the install:
 
 ```bash
-sudo bash install.sh --uninstall
+# The curl-into-bash form works on every box, including ones where the
+# operator never downloaded install.sh to disk (the canonical Psiphon-3X-UI
+# install route is `bash <(curl -sL …install.sh)`). Pass `--uninstall` as
+# the first arg to the resulting shell:
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) --uninstall
 # → Type "yes" to confirm: the panel service + /opt/psiphon-3x-ui are removed.
 #   3x-ui's own inbounds installed through it are NOT touched — you must
 #   delete them from 3x-ui manually.
+
+# Operators who DID clone the repo to disk can instead run the local file:
+#   sudo bash install.sh --uninstall
 ```
 
 Open the URL in a browser and log in to begin the first-run setup wizard.
+
+> ### ⚠️ Psiphon Inc. upstream credentials required (Hotfix #14)
+>
+> The four commercial credentials the per-country psiphon-tunnel-core units
+> authenticate upstream with (`PropagationChannelId`, `SponsorId`,
+> `RemoteServerListUrl`, `RemoteServerListSignaturePublicKey`) are **NOT**
+> shipped in this repo — they are issued by Psiphon Inc. only to licensed
+> sponsors and are embedded only inside Psiphon's own first-party client
+> binaries. The stub values this repo shipped through Hotfix #13 pass the
+> binary's `Config.Commit` `"== \"\"` check but fail downstream at remote
+> server-list signature verification → `{AvailableEgressRegions:[]}` + 5-minute
+> `EstablishTunnelTimeout` + restart. **Hotfix #14 made the panel
+> fast-fail** with an actionable error instead of that silent deathloop.
+>
+> On an interactive TTY install the installer surveys the operator for all
+> four (see [`installer/prompt.sh`](installer/prompt.sh)
+> `_prompt_psiphon_credentials`) and writes them into
+> `/opt/psiphon-3x-ui/panel.env`. On a piped/non-interactive install the
+> prompt is skipped — you MUST then edit `panel.env` by hand:
+>
+> ```bash
+> sudo vi /opt/psiphon-3x-ui/panel.env
+> #   PSIPHON_PROPAGATION_CHANNEL_ID="<your 32-hex value>"
+> #   PSIPHON_SPONSOR_ID="<your 16-hex value>"
+> #   PSIPHON_REMOTE_SERVER_LIST_URL="<https://…>"
+> #   PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY="<base64 ed25519 pubkey>"
+> sudo systemctl restart psiphon-3x-ui
+> ```
+>
+> To obtain real values contact Psiphon Inc. via <https://psiphon.ca/contact.html>.
+> Full format/validator details + the fast-fail message format are in
+> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md#psiphon-inc-upstream-credentials-required-hotfix-14).
 
 ---
 
@@ -201,7 +240,7 @@ edge (Cloudflare / Caddy) in addition to the panel's in-process limit.
 
 ## Project status
 
-Phases 0–7 are complete and validated by 236 passing tests + 4 green gates.
+Phases 0–7 are complete and validated by 240 passing tests + 4 green gates.
 A full phased roadmap is in [`plans/ROADMAP.md`](plans/ROADMAP.md).
 
 | Phase | Scope                                                          | Status |
@@ -221,13 +260,13 @@ A snapshot of the suite at v1.0.0:
 
 ```
 $ python -m pytest tests/ -q
-236 passed, 3 skipped in 85.61s
+240 passed, 3 skipped in 92.71s
 ```
 
 - **ruff check** — `0 errors` across `panel` + `tests`.
 - **ruff format --check** — `32 files already formatted`.
 - **shellcheck** — `9/9 install.sh + installer/*.sh` clean.
-- **pytest** — `236 passed, 3 skipped` (the 3 skips are the
+- **pytest** — `240 passed, 3 skipped` (the 3 skips are the
   `bash install.sh --uninstall` smoke tests, gated by `shutil.which("bash")` on
   Windows dev hosts; run cleanly on Ubuntu CI).
 
@@ -255,6 +294,22 @@ edit it and `systemctl restart psiphon-3x-ui` to pick up changes:
 | `PSIPHON3XUI_CSRF_ENFORCE`           | `true` (production); `0` in tests        | enable/disable the CSRF middleware                                    |
 | `PSIPHON3XUI_LOGIN_RATE_LIMIT`       | `10`                                     | attempts per window before 429                                       |
 | `PSIPHON3XUI_LOGIN_RATE_WINDOW`       | `60`                                     | sliding-window width in seconds                                      |
+
+### Psiphon-Inc upstream credentials (Hotfix #14 — required for tunnels to actually establish)
+
+These four are read by [`panel.psiphon.render_config`](panel/psiphon/__init__.py)
+at config-write time. **The panel fast-fails with `PsiphonCredentialError`
+(instead of silently writing a stub that the per-country unit will then
+5-minute-deathloop on) if any value looks like a placeholder.** See
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md#psiphon-inc-upstream-credentials-required-hotfix-14)
+for the credential-acquisition path (Psiphon Inc. commercial relationship).
+
+| Env var (panel.env)                                  | Default | Purpose                                                                  |
+| ---------------------------------------------------- | ------- | ------------------------------------------------------------------------ |
+| `PSIPHON_PROPAGATION_CHANNEL_ID`                     | (none)  | 32 hex chars; rejected if all-`F`'s                                       |
+| `PSIPHON_SPONSOR_ID`                                 | (none)  | 16 hex chars; rejected if all-`0`'s                                      |
+| `PSIPHON_REMOTE_SERVER_LIST_URL`                     | (none)  | must start with `https://`/`http://`                                     |
+| `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`    | (none)  | base64-encoded ed25519 public key (~44 chars, matches `[A-Za-z0-9+/]{42,}={0,2}`); rejected if it's the shipped stub |
 
 ---
 

@@ -1,9 +1,0 @@
-........................................................................ [ 30%]
-..................sss................................................... [ 60%]
-........................................................................ [ 90%]
-.......................                                                  [100%]
-=========================== short test summary info ===========================
-SKIPPED [1] tests\test_hardening.py:575: bash not on PATH (Windows dev host; installer targets Ubuntu)
-SKIPPED [1] tests\test_hardening.py:586: bash not on PATH (Windows dev host; installer targets Ubuntu)
-SKIPPED [1] tests\test_hardening.py:598: bash not on PATH (Windows dev host; installer targets Ubuntu)
-236 passed, 3 skipped in 84.06s (0:01:24)

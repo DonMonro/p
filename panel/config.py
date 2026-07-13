@@ -22,8 +22,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Repository layout anchors. Resolve relative to this file so the panel works
 # regardless of the CWD used by the systemd unit.
 PACKAGE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = PACKAGE_DIR.parent
-COUNTRIES_FILE = REPO_ROOT / "config" / "countries.yaml"
+# countries.yaml ships inside the panel package wheel as ``panel/data/countries.yaml``
+# (see [tool.setuptools.package-data] in pyproject.toml) so the seeded panel can
+# find it from the installed site-packages location regardless of install prefix.
+# A dev-only duplicate lives at <repo-root>/config/countries.yaml for tests +
+# contributors; both copies MUST be kept byte-identical when edited (see PACKAGING
+# NOTE at the top of panel/data/countries.yaml).
+COUNTRIES_FILE = PACKAGE_DIR / "data" / "countries.yaml"
 
 
 class Settings(BaseSettings):

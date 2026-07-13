@@ -94,9 +94,15 @@ Notes:
   the `get` endpoint omits; cloning only uses `get` output.
 * The panel enriches the inbound after creation: a server-side `clientStats[]`
   row keyed by the new `subId` appears in the created inbound's response, and
-  the client's `tgId` becomes `0`, `comment` and `created_at`/`updated_at`
-  are populated. The clone engine does **not** need to provide these — it
-  sends the minimal client fields the panel accepts.
+  the client's `comment` and `created_at`/`updated_at` are populated
+  server-side. The clone engine sends the minimal client fields the panel
+  accepts.
+* Hotfix #7 (Bug #9) — `tgId` MUST be the integer sentinel `0` (NOT the
+  empty string `""`). 3x-ui's newer Go schema unmarshals `Client.tgId` as
+  `int64`; the pre-Hotfix-#7 `""` was rejected with the verbatim error:
+  `cannot unmarshal string into Go struct field Client.tgId of type int64`.
+  Setting `0` for both the outgoing clone payload AND the server response
+  is the only valid value without a Telegram ID configured.
 
 ## Where the SOCKS5 outbound lives
 
@@ -156,7 +162,7 @@ with `<fresh client>`:
   "flow": "xtls-rprx-vision",
   "email": "clone-30001@psiphon3xui",
   "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true,
-  "tgId": "", "subId": "<new uuid4>", "reset": 0
+  "tgId": 0, "subId": "<new uuid4>", "reset": 0
 }
 ```
 

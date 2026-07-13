@@ -11,7 +11,17 @@
     .unhealthy-badge { color: #b2182b; font-weight: 600; }
     .inactive-badge { color: #777; }
     .busy { opacity: .55; pointer-events: none; }
-    table.grid td, table.grid th { padding: .45rem .55rem; }
+    /* Hotfix #8 (Bug #c): Pico.css v2 ships its own `.grid` utility that sets
+       `display: grid`, which when applied to a <table class="grid"> collapses
+       native table row/column semantics (no zebra, no borders, columns drifting
+       out of alignment). Plain <table> already gets Pico's native table styling,
+       so we drop the class. Keep a tight cell padding override scoped to this
+       table by ID so the actions column stays compact. */
+    table#countries { width: 100%; }
+    table#countries th, table#countries td { padding: .45rem .55rem; white-space: nowrap; }
+    table#countries td[data-col="name"] { white-space: normal; }
+    table#countries td[data-col="actions"] { white-space: normal; }
+    table#countries button { margin: .1rem .15rem; }
     pre.log { max-height: 22rem; overflow: auto; background: #111; color: #eee;
               padding: .65rem; border-radius: 4px; font-size: .85rem; }
     summary h3 { display: inline; margin: 0; }
@@ -24,15 +34,22 @@
   </style>
 </head>
 <body>
-  <nav class="container-fluid">
-    <ul><li><strong>Psiphon-3X-UI</strong> — Management Dashboard</li></ul>
-    <ul>
-      <li><a href="#" @click.prevent="refreshAll()">⟳ Refresh</a></li>
-      <li><a href="#" @click.prevent="logout()">Logout</a></li>
-    </ul>
-  </nav>
-
   <main class="container" x-data="appDashboard()">
+    <!-- Hotfix #10 (Bug #1 / logout 8th time): the <nav> previously lived
+         OUTSIDE the <main x-data="appDashboard()"> root. Alpine's
+         @click.prevent (and every other Alpine directive) is only bound for
+         elements INSIDE the x-data root scope. The Logout anchor at line ~56
+         was therefore NEVER wired by Alpine across ANY version of this SPA.
+         All previous logout "hotfixes" (#3/#4/#5v3/#5v4/#6/#7/#8/#9) edited
+         JS the browser never invoked. Moving the <nav> inside <main> is the
+         first and only real logout fix. -->
+    <nav class="container-fluid">
+      <ul><li><strong>Psiphon-3X-UI</strong> — Management Dashboard</li></ul>
+      <ul>
+        <li><a href="#" @click.prevent="logout()">Logout</a></li>
+      </ul>
+    </nav>
+
     <!-- Toast banner for inline feedback -->
     <template x-if="toast.text">
       <div class="toast" :class="toast.kind" x-text="toast.text"></div>
@@ -43,7 +60,7 @@
     -------------------------------------------------------------------- -->
     <details open>
       <summary><h3>Countries</h3> <small x-text="`(${countries.length})`"></small></summary>
-      <table class="grid">
+      <table id="countries">
         <thead>
           <tr>
             <th>Code</th><th>Name</th><th>Enabled</th><th>SOCKS</th><th>Public</th>
@@ -54,7 +71,7 @@
           <template x-for="c in countries" :key="c.code">
             <tr>
               <td><span class="country-flag" x-text="c.flag"></span><code x-text="c.code"></code></td>
-              <td x-text="c.name"></td>
+              <td data-col="name" x-text="c.name"></td>
               <td>
                 <input type="checkbox" :checked="c.enabled"
                        @change="toggleEnabled(c, $event.target.checked)">
@@ -70,10 +87,15 @@
                 <span x-text="c.healthy ? 'healthy' : (c.inbound_id ? 'unhealthy' : '—')"
                       :class="c.healthy ? 'healthy-badge' : (c.inbound_id ? 'unhealthy-badge' : 'inactive-badge')"></span>
               </td>
-              <td>
+              <td data-col="actions">
                 <button class="outline secondary" @click="viewLogs(c)">Logs</button>
                 <button class="outline" @click="openPorts(c)">Edit ports</button>
-                <button class="outline contrast" @click="deleteCountry(c)">Delete</button>
+                <!-- Hotfix #11 (Bug #4): the Delete button + the deleteCountry()
+                     method below were removed at the operator's request — the
+                     only country-level actions now are editing ports and
+                     viewing logs. The backend DELETE /api/dashboard/countries/
+                     {code} route is kept (so tests/api surface stays stable)
+                     but is no longer reachable from the SPA. -->
               </td>
             </tr>
           </template>
@@ -106,6 +128,31 @@
     </article>
 
     <!-- -------------------------------------------------------------------
+         Hotfix #10 (Bug #3): inline port-prompt modal — when the operator
+         toggles "Enabled" on a country that has no PortAssignment yet (i.e.
+         c.socks_port === null), the dashboard cannot just PATCH /countries
+         because the wizard's apply step never persisted a port pair. This
+         modal collects socks_port + public_port and submits them alongside
+         the enabled=true flag so the backend can run apply_country inline.
+    ----------------------------------------------------------------------->
+    <article x-show="ports.enable_open" x-cloak>
+      <header><strong x-text="`Enable ${ports.enable_code} — assign ports`"></strong></header>
+      <fieldset :disabled="busy.ports">
+        <label>SOCKS port (internal)
+          <input type="number" min="1024" max="65535" x-model.number="ports.enable_socks">
+        </label>
+        <label>Public port (3x-ui listener)
+          <input type="number" min="1" max="65535" x-model.number="ports.enable_public">
+        </label>
+        <small>Leave blank/zero to use the smart-recommendation defaults.</small>
+      </fieldset>
+      <footer>
+        <button class="secondary" @click="cancelEnableWithPorts()">Cancel</button>
+        <button @click="confirmEnableWithPorts()">Enable & apply</button>
+      </footer>
+    </article>
+
+    <!-- -------------------------------------------------------------------
          Logs modal (per-country)
     -------------------------------------------------------------------- -->
     <article x-show="logs.open" x-cloak>
@@ -114,7 +161,14 @@
         <label>Lines to tail
           <input type="number" min="1" max="5000" x-model.number="logs.lines">
         </label>
-        <pre class="log"><template x-for="ln in logs.lines"><span x-text="ln"></span><br></template></pre>
+        <!-- Hotfix #9 (Bug #5v6): Alpine's x-for requires a SINGLE root
+             child per iteration. The previous "<span x-text='ln'></span><br>"
+             had TWO children — Alpine logged "x-for templates require a
+             single root element" at component init and silently failed to
+             bind downstream @click.prevent handlers (notably the nav's
+             Logout anchor). Symptom: clicking Logout was a literal no-op.
+             Wrap the span+br in a single <div> root per iteration line. -->
+        <pre class="log"><template x-for="ln in logs.lines"><div><span x-text="ln"></span><br></div></template></pre>
       </fieldset>
       <footer>
         <button class="secondary" @click="closeLogs()">Close</button>
@@ -169,8 +223,10 @@
           <label>New panel listen port
             <input type="number" min="1024" max="65535" x-model.number="port.new">
           </label>
-          <small>After change: <code>systemctl restart psiphon-3x-ui.service</code> + re-run
-            <code>installer/firewall.sh</code>.</small>
+          <small>Hotfix #10 (Bug #5): after change the panel re-runs
+            <code>installer/firewall.sh</code> and restarts itself in-band — no
+            manual action required. The browser must reload the panel at the
+            new port once the request returns.</small>
         </fieldset>
         <footer><button @click="changePanelPort()">Change port</button></footer>
       </article>
@@ -184,7 +240,15 @@
         countries: [],
         busy: { countries: false, ports: false, reapply: false, backup: false,
                 rotate: false, port: false },
-        ports: { open: false, code: "", socks: 0, public: 0 },
+        // Hotfix #10 (Bug #3): the ports object now also carries the enable-
+        // with-ports modal state. enable_* fields are populated by
+        // toggleEnabled() when the operator tries to enable a no-
+        // PortAssignment country.
+        ports: {
+          open: false, code: "", socks: 0, public: 0,
+          enable_open: false, enable_code: "", enable_socks: 0,
+          enable_public: 0, enable_country: null,
+        },
         logs:  { open: false, code: "", lines: [], lines: 200, linesInput: 200 },
         reapply: { result: null },
         restore: { result: null },
@@ -224,6 +288,11 @@
           try {
             const r = await fetch("/api/dashboard/countries");
             if (r.status === 401) { window.location.href = "/login"; return; }
+            // 409 == wizard not completed yet. The dashboard surface is
+            // post-wizard only (see panel.dashboard.router).
+            // _require_wizard_completed) — bounce the operator to the wizard
+            // SPA so they can finish the first-run setup.
+            if (r.status === 409) { window.location.href = "/wizard"; return; }
             if (!r.ok) throw new Error(`GET /api/dashboard/countries → ${r.status}`);
             const body = await r.json();
             this.countries = body.countries || [];
@@ -234,7 +303,31 @@
           }
         },
 
+        // Hotfix #10 (Bug #3): if the operator is ENABLING a country that
+        // has no PortAssignment yet (socks_port === null), the backend's
+        // PATCH would 409. Open the inline port-prompt modal so the operator
+        // enters socks_port + public_port, then we PATCH {enabled:true,
+        // socks_port, public_port} together and the backend runs
+        // apply_country inline to write the config + start the unit.
         async toggleEnabled(c, newValue) {
+          if (newValue && c.socks_port == null) {
+            // Open the port-prompt modal; remember the pending toggle so
+            // confirmEnableWithPorts() can complete it once the operator
+            // submits the ports form.
+            this.ports = {
+              open: false,
+              enable_open: true,
+              enable_code: c.code,
+              enable_socks: 0,
+              enable_public: 0,
+              enable_country: c,
+              code: "",
+              socks: 0,
+              public: 0,
+            };
+            this.notify(`${c.code} has no ports yet — enter SOCKS + Public ports to enable`);
+            return;
+          }
           try {
             const r = await fetch(`/api/dashboard/countries/${c.code}`, {
               method: "PATCH",
@@ -255,32 +348,64 @@
           }
         },
 
-        async deleteCountry(c) {
-          if (!confirm(`Delete ${c.code}? This stops the tunnel, removes the PortAssignment, ` +
-                        `and deletes the 3x-ui clone inbound.`)) return;
-          try {
-            const r = await fetch(`/api/dashboard/countries/${c.code}`, {
-              method: "DELETE",
-              headers: await this._csrfHeaders(),
-            });
-            if (r.ok) {
-              const summary = await r.json();
-              this.countries = this.countries.filter(x => x.code !== c.code);
-              this.notify(`deleted ${c.code} — stopped=${summary.stopped_unit}, ` +
-                          `inbound_deleted=${summary.deleted_inbound}`);
-            } else {
-              this.notify(`failed to delete ${c.code}`, "err");
-            }
-          } catch (e) {
-            this.notify(`network error: ${e.message}`, "err");
-          }
-        },
-
         openPorts(c) {
           this.ports = { open: true, code: c.code,
                          socks: c.socks_port || 11000, public: c.public_port || 31000 };
         },
         closePorts() { this.ports.open = false; },
+
+        // Hotfix #10 (Bug #3): cancel/dismiss the inline enable-with-ports
+        // modal. Resets the checkbox the operator just ticked so the row
+        // reflects reality (disabled) and aborts the pending toggle.
+        cancelEnableWithPorts() {
+          this.ports.enable_open = false;
+          // Reset the checkbox back to unchecked since the operator bailed.
+          if (this.ports.enable_country) {
+            this.ports.enable_country.enabled = false;
+            this.countries = this.countries.map(x =>
+              x.code === this.ports.enable_country.code ? this.ports.enable_country : x
+            );
+          }
+          this.ports = { ...this.ports,
+            enable_open: false, enable_code: "", enable_socks: 0,
+            enable_public: 0, enable_country: null };
+        },
+
+        // Hotfix #10 (Bug #3): submit the inline enable-with-ports form.
+        // PATCHes {enabled:true, socks_port, public_port} in one shot; the
+        // backend handler runs apply_country inline (write_config + start_unit
+        // + create PortAssignment row) on the server side.
+        async confirmEnableWithPorts() {
+          this.busy.ports = true;
+          const code = this.ports.enable_code;
+          const payload = {
+            enabled: true,
+            // Server treats 0 / null as "use smart recommendation".
+            socks_port: this.ports.enable_socks || null,
+            public_port: this.ports.enable_public || null,
+          };
+          try {
+            const r = await fetch(`/api/dashboard/countries/${code}`, {
+              method: "PATCH",
+              headers: {...(await this._csrfHeaders()), "Content-Type": "application/json"},
+              body: JSON.stringify(payload),
+            });
+            const body = r.ok ? await r.json() : await r.json();
+            if (!r.ok) {
+              this.notify(`failed to enable ${code}: ${body.detail || r.status}`, "err");
+              return;
+            }
+            this.countries = this.countries.map(x => x.code === code ? body : x);
+            this.notify(`enabled ${code} — socks=${body.socks_port}, public=${body.public_port}`);
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.ports.enable_open = false;
+            this.ports.enable_code = "";
+            this.ports.enable_country = null;
+            this.busy.ports = false;
+          }
+        },
 
         async submitPorts() {
           this.busy.ports = true;
@@ -346,7 +471,13 @@
         async downloadBackup() {
           this.busy.backup = true;
           try {
-            const r = await fetch("/api/dashboard/backup");
+            // Hotfix #10 (Bug #2): added method:"POST" + CSRF headers.
+            // The router declares @router.post("/backup") — without an
+            // explicit method the browser sends GET → FastAPI 405.
+            const r = await fetch("/api/dashboard/backup", {
+              method: "POST",
+              headers: await this._csrfHeaders(),
+            });
             if (!r.ok) throw new Error(`backup failed: ${r.status}`);
             const blob = await r.blob();
             const cd = r.headers.get("Content-Disposition") || "";
@@ -435,9 +566,32 @@
           }
         },
 
-        async logout() {
-          await fetch("/auth/logout", {method: "POST"});
-          window.location.href = "/login";
+        logout() {
+          // FIRE-AND-FORGET logout — Hotfix #6 (Bug #5v3). Mirror of the
+          // wizard.html logout() pattern — see the long docblock there
+          // for the full rationale. Operator symptom: "clicking Logout
+          // does nothing — URL doesn't change". Root cause: the previous
+          // `async logout()` AWAITED `fetch("/auth/logout", {keepalive})`
+          // BEFORE calling `window.location.replace()`. If the fetch
+          // promise neither resolved nor rejected (a hung XHR via a
+          // reverse proxy that ate the 204 without closing the
+          // connection, OR the operator's browser was serving a
+          // pre-Hotfix-#5 cached dashboard.html whose logout() was the
+          // unhardened Hotfix-#3 throw-on-fetchAbort body that Alpine's
+          // @click.prevent silently swallowed), the `await` blocked
+          // forever and `window.location.replace()` was never reached.
+          //
+          // Fix: do NOT `await` the fetch. Dispatch it as a keepalive
+          // background request, then IMMEDIATELY navigate synchronously.
+          // `keepalive:true` ensures the request still completes during
+          // the navigation even though we don't wait for its response.
+          // The synchronous navigation line is the first-and-only
+          // statement after the dispatch, so NOTHING in this function
+          // can block the URL change the operator expects.
+          try {
+            void fetch("/auth/logout", { method: "POST", keepalive: true });
+          } catch (_) { /* sync fetch can only throw TypeError — out-raced by .replace below */ }
+          window.location.replace("/login?ts=" + Date.now());
         },
 
         notify(text, kind = "ok") {

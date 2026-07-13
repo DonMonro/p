@@ -1,6 +1,6 @@
 # Psiphon-3X-UI Panel
 
-[![CI](https://github.com/psiphon-3x-ui/psiphon-3x-ui/actions/workflows/ci.yml/badge.svg)](https://github.com/psiphon-3x-ui/psiphon-3x-ui/actions/workflows/ci.yml)
+[![CI](https://github.com/DonMonro/p/actions/workflows/ci.yml/badge.svg)](https://github.com/DonMonro/p/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
 
 > Companion FastAPI panel that installs

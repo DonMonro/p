@@ -83,11 +83,71 @@ class XuiClient:
         client: httpx.AsyncClient | None = None,
         timeout: float = 15.0,
     ) -> None:
-        # Normalise: API base is "{scheme}://{host}/{webBasePath}/". Strip any
-        # /panel suffix the caller might have copied from the SPA URL.
-        b = base_url.rstrip("/")
-        b = b.split("/panel")[0].rstrip("/") + "/"
-        self.base_url = b
+        # The operator pastes the FULL 3x-ui SPA URL visible in the browser
+        # address bar — e.g. ``http://host:2053/panel/`` for a default
+        # install OR ``http://192.168.x.y:12345/WSCM6EhC9pO6T9K0RA/panel``
+        # for a security-hardened 3x-ui install whose ``webBasePath`` is a
+        # random 16-char secret string. The ``/panel`` segment is the React
+        # frontend's SPA page-route (NOT part of the API prefix), per the
+        # Phase-1 spike evidence in ``docs/XUI_API.md`` and
+        # ``spike/spike_1c2_capture.py``:
+        #   * GET  /                              -> HTML login page (parse CSRF)
+        #   * POST {base}/login                  -> session cookie (login URL
+        #     sits at the ROOT of the webBasePath, NOT under /panel)
+        #   * GET  {base}/panel/api/inbounds/list -> inbound JSON list
+        #   * POST {base}/panel/api/inbounds/add  -> clone create
+        # where ``base = {scheme}://{host}:{port}/{webBasePath}/``. So we:
+        #   1. STRIP a trailing ``/panel`` (the SPA page route) so the API
+        #      base drops down to ``{webBasePath}/`` (exact same heuristic
+        #      as ``spike_1c2_capture.py:65`` and ``spike_1e_clone.py:178``).
+        #      For the default-install case where webBasePath is the empty
+        #      string and ``/panel`` is the literal route, the strip
+        #      correctly produces ``http://host:port/`` and login lands at
+        #      ``http://host:port/login`` while API URLs land at
+        #      ``http://host:port/panel/api/inbounds/list``.
+        #   2. TRUST the operator's typed webBasePath verbatim when no
+        #      ``/panel`` suffix is present.
+        #   3. Append the literal ``panel/api/inbounds/{op}`` prefix on
+        #      every API call below (list/get/add/update/del) — ``panel``
+        #      here is the React SPA route prefix the API also sits under.
+        #
+        # Hotfix #4 (Bug #6v1) dropped BOTH the strip heuristic AND the
+        # literal ``panel/api`` prefix in the belief that the operator's
+        # pasted SPA URL already carried everything — but that yielded
+        # ``{base}/panel/login`` (a 404; the operator's reported
+        # ``login: HTTP 404`` at step 5), because the REAL login URL sits
+        # at ``{webBasePath}/login`` and NOT at ``{webBasePath}/panel/login``.
+        # Hotfix #5 (Bug #6v2) corrects this by restoring the strip
+        # heuristic AND restoring the literal ``panel/api`` prefix on every
+        # API call (matching the Phase-1 spikes verbatim).
+        b = base_url.strip().rstrip("/")
+        if not b:
+            raise ValueError("base_url must not be empty")
+        if not (b.startswith("http://") or b.startswith("https://")):
+            # Reject schemeless paths like "/panel" early — they would
+            # otherwise silently normalise to "/" via the strip heuristic
+            # (Hotfix #5 — Bug #6v2 — defensive guard so a typo surfaces
+            # with a clear ValueError instead of producing a base_url
+            # rooted at "/" and a confusing 404 on the first API call).
+            raise ValueError(
+                "base_url must include a scheme and host: 'http(s)://host:port/...'",
+            )
+        # Drop a trailing "/panel" SPA-route segment (segment-matched, exact).
+        # A path like "/WSCM6EhC9pO6T9K0RA/" (no /panel suffix) is left
+        # untouched — we only ever strip a literal "/panel" at the very end.
+        if b.endswith("/panel"):
+            b = b[: -len("/panel")]
+        elif b.endswith("/panel/"):
+            b = b[: -len("/panel/")]
+        b = b.rstrip("/")
+        if b.endswith("://") or b.endswith(":"):
+            # Strip produced a degenerate scheme-only prefix (e.g. operator
+            # typed "http://panel" alone) — the host got eaten. Don't
+            # synthesise one; ask the operator to fix the typo.
+            raise ValueError(
+                "base_url must include a host: 'http(s)://host:port/...'",
+            )
+        self.base_url = b + "/"
         self.username = username
         self.password = password
 
@@ -267,7 +327,11 @@ def _fresh_vless_client(public_port: int) -> dict:
         "totalGB": 0,
         "expiryTime": 0,
         "enable": True,
-        "tgId": "",
+        # Hotfix #7 (Bug #9): 3x-ui's newer Go schema unmarshals tgId as
+        # int64, NOT string — sending `tgId: ""` (empty string) was rejected
+        # with: `cannot unmarshal string into Go struct field Client.tgId
+        # of type int64`. The valid "no Telegram ID" sentinel is `0`.
+        "tgId": 0,
         "subId": str(uuid.uuid4()),
         "reset": 0,
     }
@@ -322,9 +386,32 @@ def _build_clone_payload(
             "VMess/Trojan/Shadowsocks land in Phase 5."
         )
 
-    # Preserve template fields, swap port/tag/remark/clients/streamSettings.
+    # Preserve template fields, swap port/tag/remark (NOT clients/streamSettings).
+    # Hotfix #8 (Bug #d): the operator reported "When cloning is performed,
+    # it should only clone the inbound. Why does it also clone in the client
+    # section? Only the inbound is enough." The previous behaviour overwrote
+    # `settings.clients` with a freshly minted `_fresh_vless_client(public_port)`
+    # entry — that minted a NEW 3x-ui client row (with a brand-new UUID,
+    # email "clone-<port>@…", tgId 0, subId …) for every clone, which surfaced
+    # in the 3x-ui UI as one "client section" entry per cloned inbound even
+    # when the operator had never authorised one. Cloning a 3x-ui inbound
+    # should replicate the LISTENER (port/remark/tag/streamSettings.outbound)
+    # and preserve the template's existing clients verbatim — that way the
+    # operator's existing 3x-ui client roster (already configured once on the
+    # template inbound) just gains a new listener port, with no surprise
+    # client rows minted on the operator's behalf. The mixin is the
+    # `_socks_outbound` injection into `streamSettings.outbound` (kept), but
+    # the `clients` array is now copied THROUGH from the template instead of
+    # being minted. `_fresh_vless_client` is retained as a public helper for
+    # callers that DO want a fresh per-clone client (none currently use it),
+    # so tests/test_xui_client.py stays green; the production clone path no
+    # longer calls it.
     settings = dict(template.get("settings") or {})
-    settings["clients"] = [_fresh_vless_client(public_port)]
+    # Copy the template's existing `clients` array through UNCHANGED. If the
+    # template somehow lacks one, fall back to an empty list (caller can mint
+    # client rows via the 3x-ui UI later if they want one).
+    if "clients" not in settings:
+        settings["clients"] = list(template.get("settings", {}).get("clients") or [])
 
     stream_settings = dict(template.get("streamSettings") or {})
     # Inject the SOCKS5 outbound as a dict sibling of network/security.

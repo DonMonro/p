@@ -237,6 +237,21 @@ def _patch_systemd(monkeypatch):
     monkeypatch.setattr(dashboard_router, "is_unit_active", _SystemdFake.is_unit_active)
     # Disable write_config's real disk writes by pointing the config dir at
     # the per-test tmp_path (set via env in _isolated_env).
+    #
+    # Hotfix #14 (Phase 23): the dashboard endpoints exercise real write_config
+    # -> render_config -> _resolve_upstream_credentials(). Inject fake-but-
+    # real-shape PSIPHON_* env vars so the credential fast-fail does not turn
+    # every TestEditPorts / TestReapply assertion into a 502/failed entry.
+    monkeypatch.setenv("PSIPHON_PROPAGATION_CHANNEL_ID", "0123456789ABCDEF0123456789ABCDEF")
+    monkeypatch.setenv("PSIPHON_SPONSOR_ID", "0123456789ABCDEF")
+    monkeypatch.setenv(
+        "PSIPHON_REMOTE_SERVER_LIST_URL",
+        "https://s3.amazonaws.com/psiphon/web/test-mirror",
+    )
+    monkeypatch.setenv(
+        "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    )
     yield
 
 
@@ -471,14 +486,96 @@ class TestPatchCountry:
         assert _SystemdFake.stopped == ["US"]
         assert r.json()["enabled"] is False
 
-    def test_enable_without_assignment_returns_409(self, monkeypatch, tmp_path):
+    def test_enable_without_assignment_inline_picks_ports_and_persists(self, monkeypatch, tmp_path):
+        """Hotfix #10 (Bug #3) — enabling a country that has NO PortAssignment
+        no longer raises 409. The handler accepts optional socks/public ports
+        (or picks smart-recommendation defaults), runs apply_country inline,
+        persists a fresh PortAssignment row, and flips Country.enabled=True.
+        """
+        from panel.psiphon import HealthProbeResult
+        from panel.wizard import apply as apply_mod
+
+        # Sandbox apply_country: stub all 4 dependencies it calls.
+        start_calls: list[str] = []
+        is_active_calls: list[str] = []
+        write_calls: list[tuple[str, int]] = []
+        health_calls: list[int] = []
+
+        def _fake_write(country_code, socks_port, *, config_dir=None):
+            write_calls.append((country_code, socks_port))
+            return Path(f"/tmp/psiphon-fake-{country_code}.json")
+
+        def _fake_start(country_code):
+            start_calls.append(country_code)
+
+        def _fake_active(country_code):
+            is_active_calls.append(country_code)
+            return True
+
+        def _fake_health(socks_port, **kwargs):  # noqa: ANN001
+            health_calls.append(socks_port)
+            return HealthProbeResult(healthy=True, detail="ok")
+
+        monkeypatch.setattr(apply_mod, "write_config", _fake_write)
+        monkeypatch.setattr(apply_mod, "start_unit", _fake_start)
+        monkeypatch.setattr(apply_mod, "is_unit_active", _fake_active)
+        monkeypatch.setattr(apply_mod, "health_probe", _fake_health)
+
         client = _client(monkeypatch, tmp_path)
         _login(client)
         _seed_country(code="US", enabled=False)
-        # No assignment seeded.
-        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
-        assert r.status_code == 409
-        assert "no PortAssignment" in r.json()["detail"]
+        # No PortAssignment seeded — pre-Hotfix-#10 path raised 409 here.
+
+        r = client.patch(
+            "/api/dashboard/countries/US",
+            json={"enabled": True, "socks_port": 11099, "public_port": 31099},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["enabled"] is True
+        assert body["socks_port"] == 11099
+        assert body["public_port"] == 31099
+
+        # Inline-enable should have run apply_country end-to-end.
+        assert write_calls == [("US", 11099)]
+        assert start_calls == ["US"]
+        assert is_active_calls == ["US"]
+        assert health_calls == [11099]
+
+        # The new PortAssignment row should now be persisted.
+        init_db()
+        with Session(get_engine()) as s:
+            row = s.query(PortAssignment).filter(PortAssignment.country_code == "US").one()
+            assert row.socks_port == 11099
+            assert row.public_port == 31099
+            assert s.get(Country, {"code": "US"}).enabled is True
+
+    def test_enable_without_assignment_failure_returns_502(self, monkeypatch, tmp_path):
+        """Hotfix #10 (Bug #3) — if apply_country returns a ``failed`` event
+        during inline-enable, the handler raises 502 carrying the underlying
+        failure message (NOT a 409 telling the operator to revisit the wizard).
+        """
+        from panel.psiphon import HealthProbeResult
+        from panel.wizard import apply as apply_mod
+
+        # Force apply_country to fail at the health-probe step (progress=75).
+        monkeypatch.setattr(apply_mod, "write_config", lambda *a, **k: Path("/tmp/x.json"))
+        monkeypatch.setattr(apply_mod, "start_unit", lambda *a, **k: None)
+        monkeypatch.setattr(apply_mod, "is_unit_active", lambda *a, **k: True)
+        monkeypatch.setattr(
+            apply_mod,
+            "health_probe",
+            lambda *a, **k: HealthProbeResult(healthy=False, detail="connection refused"),
+        )
+
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="DE", enabled=False)
+
+        r = client.patch("/api/dashboard/countries/DE", json={"enabled": True})
+        assert r.status_code == 502
+        assert "inline enable for DE failed" in r.json()["detail"]
+        assert "connection refused" in r.json()["detail"]
 
     def test_enable_start_unit_failure_returns_502(self, monkeypatch, tmp_path):
         client = _client(monkeypatch, tmp_path)

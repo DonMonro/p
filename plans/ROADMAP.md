@@ -377,8 +377,8 @@ Bonus: post-wizard management dashboard → `panel/dashboard/router.py`, `static
 - [x] Translations scaffold: [`panel/i18n/en.json`](panel/i18n/en.json) + [`panel/i18n/__init__.py`](panel/i18n/__init__.py) + `GET /api/i18n/{locale}` endpoint.
 - [x] [`README.md`](README.md) finalized with copy-paste one-liner (v1.0.0 tag URL), HTTPS subsection, dashboard, 26-row API table, Security section, Configuration reference, and release procedure:
   ```bash
-  sudo bash <(curl -sL https://raw.githubusercontent.com/psiphon-3x-ui/psiphon-3x-ui/v1.0.0/install.sh) \
-    || sudo bash <(wget -qO- https://raw.githubusercontent.com/psiphon-3x-ui/psiphon-3x-ui/v1.0.0/install.sh)
+  sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) \
+    || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh)
   ```
 - [ ] Tag `v1.0.0`, GitHub Release with SHA256 manifest — pending operator approval (final 7k step).
 

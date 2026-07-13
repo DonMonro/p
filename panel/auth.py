@@ -115,10 +115,25 @@ def set_session_cookie(response: Response, username: str) -> None:
 
 
 def clear_session_cookie(response: Response) -> None:
-    """Delete the session cookie from the client."""
+    """Delete the session cookie from the client.
+
+    Starlette's ``Response.delete_cookie`` only supports the Set-Cookie delete
+    if EVERY attribute that the original Set-Cookie used on login is also set
+    on the delete response — otherwise the browser treats them as TWO distinct
+    cookies (RFC 6265 §5.3: cookies are keyed by name+domain+path, but Chrome
+    refuses to delete a ``HttpOnly`` cookie via a Set-Cookie that lacks the
+    HttpOnly flag, and refuses to delete a ``SameSite=Lax`` cookie via a
+    Set-Cookie that lacks ``SameSite``). Mirroring every attribute here matches
+    the original ``set_session_cookie`` Set-Cookie exactly so the logout DELETE
+    fires against the right jar entry and the operator's session actually ends
+    (Hotfix #3 in the v1.0.0 amend cycle — logout button appeared broken).
+    """
     response.delete_cookie(
         key=SESSION_COOKIE_NAME,
         path=SESSION_COOKIE_PATH,
+        secure=_cookies_secure(),
+        httponly=SESSION_COOKIE_HTTPONLY,
+        samesite=SESSION_COOKIE_SAMESITE,
     )
 
 
@@ -261,8 +276,20 @@ def set_csrf_cookie(response: Response, token: str | None = None) -> str:
 
 
 def clear_csrf_cookie(response: Response) -> None:
-    """Delete the CSRF cookie alongside the session cookie on logout."""
-    response.delete_cookie(key=CSRF_COOKIE_NAME, path=SESSION_COOKIE_PATH)
+    """Delete the CSRF cookie alongside the session cookie on logout.
+
+    Propagates every Set-Cookie attribute used by :func:`set_csrf_cookie` so the
+    browser registers the delete against the SAME jar entry; see the rationale
+    on :func:`clear_session_cookie` (Hotfix #3 — logout actually clears both
+    cookies now).
+    """
+    response.delete_cookie(
+        key=CSRF_COOKIE_NAME,
+        path=SESSION_COOKIE_PATH,
+        secure=_cookies_secure(),
+        httponly=CSRF_COOKIE_HTTPONLY,
+        samesite=CSRF_COOKIE_SAMESITE,
+    )
 
 
 def csrf_tokens_match(cookie_token: str | None, header_token: str | None) -> bool:

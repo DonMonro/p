@@ -1,6 +1,6 @@
 [Unit]
 Description=Psiphon-3X-UI management panel
-Documentation=https://github.com/psiphon-3x-ui/psiphon-3x-ui
+Documentation=https://github.com/DonMonro/p
 After=network-online.target
 Wants=network-online.target
 

@@ -1,0 +1,88 @@
+// systemd/49-psiphon-3x-ui.rules — polkit rule granting the panel service
+// user (default `psiphon3xui`) the right to start/stop/restart the per-country
+// templated `psiphon-tunnel@<CODE>.service` units.
+//
+// Background (Hotfix #9, Bug #2):
+//   The FastAPI panel (`psiphon-3x-ui.service`) runs as the unprivileged
+//   system user `psiphon3xui`. The wizard's apply step (panel.wizard.apply
+//   .start_unit) and the dashboard's enable/disable toggle (panel.dashboard
+//   .router.patch_country) both call `systemctl start/stop/restart
+//   psiphon-tunnel@<CODE>.service` from inside that service's process.
+//   Without a polkit rule, systemd rejects the call with:
+//       "Interactive authentication required."
+//   — surfacing to the operator as a 502 with body "failed to toggle US:
+//   start_unit(US) failed: systemctl start psiphon-tunnel@US.service -> exit 1".
+//
+// Scope:
+//   The rule covers TWO distinct unit-name classes — both restricted to the
+//   minimal set of verbs required by the panel's own automation:
+//
+//   (1) The per-country tunnel fleet — any unit whose name matches the
+//       `psiphon-tunnel@*.service` template (start/stop/restart, called
+//       from panel.wizard.apply.start_unit + panel.dashboard.router.patch_country).
+//
+//   (2) The panel's OWN systemd unit `psiphon-3x-ui.service` — restricted to
+//       the `restart` verb only (called from panel.dashboard.router.
+//       change_panel_port after Hotfix #10 / Bug #5 so that the
+//       "change panel port" button can re-execute systemd in-band instead
+//       of forcing the operator to drop to a shell). The panel NEVER tries
+//       to start/stop its own unit from in-band code (only the installer,
+//       running as root, can/should do `systemctl enable` + `start`). The
+//       explicit-name guard means the panel CANNOT enumerate arbitrary
+//       units, and the verb scope means it cannot enable/mask/reload them.
+//
+// The panel can NEVER start/stop arbitrary units. Only its own tunnel fleet
+// plus its own unit restart are authorised.
+//
+// The rule is JavaScript (polkit's native rules language) and runs inside
+// polkitd's JS interpreter. The numerical prefix `49-` keeps it ahead of
+// the default catch-all `50-default.rules`, while leaving room for any
+// site-local `4X-*` overrides. Install to:
+//   /etc/polkit-1/rules.d/49-psiphon-3x-ui.rules
+// and reload polkit (`systemctl reload polkit.service`); polkitd picks up
+// rules at install time without a restart on most distros, but the reload
+// is harmless insurance.
+
+polkit.addRule(function(action, subject) {
+    // Only the panel service's tunnel fleet is in scope.
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Restrict to the start/stop/restart verbs (the panel never tries to
+    // enable/mask/reload those units — only operate on their runtime state).
+    var verb = action.lookup("verb");
+    if (verb !== "start" && verb !== "stop" && verb !== "restart") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Allow EITHER psiphon-tunnel@*.service (the per-country fleet —
+    // start/stop/restart all already gated by the verb check above) OR
+    // the panel's own unit, restricted to restart only (the unit MUST
+    // remain enabled since the operator only started the panel here in
+    // the first place; we never authorise the panel to STOP or disable
+    // its own unit — see Hotfix #10 / Bug #5 docblock above).
+    var unit = action.lookup("unit");
+    if (!unit || !String(unit).endsWith(".service")) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unitStr = String(unit);
+    var isFleet = unitStr.startsWith("psiphon-tunnel@");
+    var isPanelSelf = unitStr === "psiphon-3x-ui.service";
+    if (!isFleet && !isPanelSelf) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (isPanelSelf && verb !== "restart") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Restrict to the panel service user. Default is `psiphon3xui`; if the
+    // operator renamed it during install (PSIPHON3XUI_USER env), they must
+    // update the literal here. We match the widely-known default rather
+    // than risk a false-positive on root (root doesn't need this rule).
+    if (subject.user !== "psiphon3xui") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    return polkit.Result.YES;
+});

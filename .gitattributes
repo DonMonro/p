@@ -1,0 +1,40 @@
+# Git line-ending & diff policy for Psiphon-3X-UI.
+#
+# WHY: On Windows dev hosts ``core.autocrlf=true`` converts LF ↔ CRLF on
+# checkout/commit. That's fine for code (IDEs cope) BUT it means the SHA256
+# of the working-tree copy of an artefact differs from the SHA256 of the
+# git blob (which is LF-canonical). raw.githubusercontent.com serves the
+# git blob, so the operator-facing ``sha256sum -c release-artifacts.sha256``
+# verification must compute the same hash the operator sees after a fresh
+# ``git clone`` — i.e. the LF-canonical hash, not the working-tree hash.
+#
+# Pinning ``eol=lf`` for the SHIPPED artefacts (install scripts, panel HTML,
+# i18n JSON, manifest itself) keeps those hashes stable across hosts without
+# retraining contributors' editors. Source Python/JS/etc. inherit git's
+# default text handling.
+#
+# To re-normalise the working tree after editing this file:
+#   git add --renormalize .
+#   git commit -m "chore: enforce .gitattributes line-ending policy"
+
+# ── Shipped operator-facing release artefacts (LF canonical) ──────────────
+*.sh               text eol=lf
+*.html             text eol=lf
+*.css              text eol=lf
+*.js               text eol=lf
+*.json             text eol=lf
+install.sh         text eol=lf
+release-artifacts.sha256  text eol=lf
+
+# ── Python source (default text = LF on commit) ─────────────────────────
+*.py               text
+
+# ── Documentation ───────────────────────────────────────────────────────
+*.md               text eol=lf
+
+# ── Binary assets (no line-ending conversion) ───────────────────────────
+*.png              binary
+*.jpg              binary
+*.ico              binary
+*.svg              text eol=lf
+*.woff2            binary

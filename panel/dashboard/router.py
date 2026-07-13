@@ -26,6 +26,7 @@ import contextlib
 import io
 import json
 import logging
+import re
 import subprocess
 import tarfile
 from datetime import datetime, timezone
@@ -49,6 +50,7 @@ from ..models import (
     XuiLink,
 )
 from ..psiphon import (
+    PsiphonCredentialError,
     PsiphonUnitError,
     is_unit_active,
     restart_unit,
@@ -56,6 +58,10 @@ from ..psiphon import (
     stop_unit,
     write_config,
 )
+
+# Hotfix #10 (Bug #3): apply_country / PortAssignmentSpec power the inline
+# enable-without-existing-PortAssignment branch inside patch_country.
+from ..wizard.apply import PortAssignmentSpec, apply_country
 from .xui_client import XuiClient, XuiClientError
 
 _log = logging.getLogger(__name__)
@@ -225,17 +231,236 @@ def _validate_port(value: int, *, name: str) -> int:
     return int(value)
 
 
+def _pick_free_socks_port(db: Session) -> int:
+    """Hotfix #10 (Bug #3): smart-recommend a free SOCKS port.
+
+    Walks from 11000 upwards, skipping any port already claimed by an existing
+    PortAssignment row. Returns the first free integer.
+    """
+    used_rows = db.query(PortAssignment).all()
+    used: set[int] = {int(r.socks_port) for r in used_rows}
+    panel_port = int(db.get(Settings, {"id": 1}).panel_port) if db.get(Settings, {"id": 1}) else 0
+    used.add(panel_port)
+    candidate = 11000
+    while candidate in used or candidate < 1024:
+        candidate += 1
+    return candidate
+
+
+def _pick_free_public_port(db: Session) -> int:
+    """Hotfix #10 (Bug #3): smart-recommend a free public port.
+
+    Walks from 31000 upwards, skipping any port already claimed by an existing
+    PortAssignment row OR the panel port.
+    """
+    used_rows = db.query(PortAssignment).all()
+    used: set[int] = {int(r.public_port) for r in used_rows}
+    settings_row = db.get(Settings, {"id": 1})
+    panel_port = int(settings_row.panel_port) if settings_row else 0
+    used.add(panel_port)
+    candidate = 31000
+    while candidate in used or candidate < 1024:
+        candidate += 1
+    return candidate
+
+
+def _reload_firewall() -> tuple[bool, str]:
+    """Hotfix #10 (Bug #5): re-run installer/firewall.sh in-band.
+
+    Returns (ok, detail). The installer directory lives adjacent to the
+    installed panel. We best-effort locate it via the install prefix (the
+    psiphon_install.sh places the repo at /opt/psiphon3xui). If firewall.sh
+    is missing or fails, returns (False, error message).
+    """
+    for repo_path in ("/opt/psiphon3xui", "/usr/local/share/psiphon-3x-ui"):
+        candidate = Path(repo_path) / "installer" / "firewall.sh"
+        if candidate.is_file():
+            try:
+                proc = subprocess.run(  # noqa: S603 — system binary
+                    ["bash", str(candidate)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60.0,
+                    check=False,
+                )
+                ok = proc.returncode == 0
+                detail = proc.stdout.strip() if ok else proc.stderr.strip() or proc.stdout.strip()
+                return ok, detail
+            except (OSError, subprocess.SubprocessError) as exc:
+                return False, f"firewall.sh invocation failed: {type(exc).__name__}: {exc}"
+    return False, "firewall.sh not found under /opt/psiphon3xui or /usr/local/share/psiphon-3x-ui"
+
+
+def _panel_env_path() -> Path:
+    """Resolve the on-disk ``panel.env`` EnvironmentFile.
+
+    Sits as a sibling of ``panel.db`` (i.e. ``${INSTALL_PREFIX}/panel.env``).
+    The systemd unit ``psiphon-3x-ui.service`` declares
+    ``EnvironmentFile=/opt/psiphon-3x-ui/panel.env`` and the installer
+    (installer/panel_install.sh) writes it via heredoc.
+    """
+    return _panel_db_path().parent / "panel.env"
+
+
+def _update_panel_env_port(new_port: int) -> tuple[bool, str]:
+    """Hotfix #11 (Bug #3): rewrite ``PSIPHON3XUI_PORT=<new>`` in
+    ``${INSTALL_PREFIX}/panel.env`` **before** ``systemctl restart``.
+
+    The panel process loads its listen port from the env var
+    ``PSIPHON3XUI_PORT`` (panel.config.Settings via pydantic-settings, NOT
+    from panel.db's Settings row — see panel/__main__.py:main → uvicorn ports
+    spawned from ``settings.port``). Pre-Hotfix-#11 ``change_panel_port``
+    only flipped the DB row and never touched the env file, so a
+    ``systemctl restart`` bound the panel back to the OLD port — the new port
+    never opened. Now we rewrite the env file in place so the next boot reads
+    the new port. Returns (ok, detail).
+    """
+    path = _panel_env_path()
+    try:
+        if not path.is_file():
+            return False, f"env file not found at {path}"
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        # Keep trailing newline if present. Use a regex so we tolerate the
+        # installer's exact `PSIPHON3XUI_PORT=${PANEL_PORT}` rendering.
+        new_lines: list[str] = []
+        port_re = re.compile(r"^[#\s]*PSIPHON3XUI_PORT\s*=.*$")
+        replaced = False
+        for ln in lines:
+            if not replaced and port_re.match(ln):
+                new_lines.append(f"PSIPHON3XUI_PORT={new_port}")
+                replaced = True
+            else:
+                new_lines.append(ln)
+        if not replaced:
+            # Env file exists but lacks the line entirely — append it.
+            new_lines.append(f"PSIPHON3XUI_PORT={new_port}")
+        out = "\n".join(new_lines)
+        if not out.endswith("\n"):
+            out += "\n"
+        path.write_text(out, encoding="utf-8")
+        return True, f"PSIPHON3XUI_PORT rewritten to {new_port} in {path}"
+    except OSError as exc:
+        return False, f"env rewrite failed: {type(exc).__name__}: {exc}"
+
+
+def _restart_panel_service() -> tuple[bool, str]:
+    """Hotfix #10 (Bug #5) + Hotfix #11 (Bug #3 part 2) + **Hotfix #12
+    (Bug #3 part 2, real fix)**: trigger a detached systemctl restart of
+    ``psiphon-3x-ui.service``.
+
+    Authorised by the polkit rule (systemd/49-psiphon-3x-ui.rules — extended
+    in 19f5 to allow restart of psiphon-3x-ui.service).
+
+    Critical: the in-flight HTTP request is served by THIS panel process. A
+    *synchronous* ``subprocess.run(["systemctl","restart",...])`` waits for
+    the restart to finish, which kills the very process streaming our
+    response back to the operator mid-stream — the browser sees no body, no
+    redirect, and looks exactly like "the panel dropped offline and didn't
+    restart itself" (this was the second half of Bug #3). We therefore use
+    ``systemd-run --no-block`` so systemctl returns immediately while
+    systemd schedules the restart fractionally after. The JSON response
+    completes first; the panel then re-kicks on the new port once systemd
+    stops + restarts it.
+
+    Hotfix #12 (Bug #3 part 2): the previous implementation used plain
+    ``systemctl restart psiphon-3x-ui.service`` (synchronous) — the docblock
+    claimed it was detached, but the code wasn't. The operator-reported
+    symptom ("panel does not change, does not restart, new page does not
+    work") was the in-flight HTTP cut-off: the unit restarted fine, but the
+    browser received a truncated/empty body because uvicorn's worker was
+    SIGTERM'd mid-stream by systemd. Fix: spawn through ``systemd-run --no-block``
+    so the child exits immediately and the actual unit restart is scheduled
+    behind us (≈50–200 ms later), giving our JSON response time to flush.
+    """
+    # `systemd-run --no-block --no-ambush ... systemctl restart ...` returns
+    # immediately while scheduling the restart after our response flushes.
+    # We run it via `setsid`/`nohup`-style double-fork fallback if
+    # `systemd-run` is unavailable (older/minimal Linux distros). The inner
+    # `systemctl restart` is invoked synchronously from THAT detached scope.
+    try:
+        proc = subprocess.run(  # noqa: S603 — system binary, trusted args
+            [
+                "systemd-run",
+                "--no-block",
+                "--unit=psiphon-3x-ui-restart",
+                "--description=psiphon-3x-ui panel port-change self-restart",
+                "--collect",
+                "systemctl",
+                "restart",
+                "psiphon-3x-ui.service",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        # If systemd-run isn't available (exit 127 / FileNotFoundError), fall
+        # back to a `nohup ... &` detached restart so the child still runs
+        # outside our process group and our HTTP response can complete.
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"systemd-run exit {proc.returncode}"
+    except (OSError, subprocess.SubprocessError):
+        detail = "systemd-run unavailable"
+    # Fallback: detached `nohup systemctl restart` — survives our parent's
+    # imminent SIGTERM because start_new_session re-parents the child to
+    # init (PID 1) when our process dies. We deliberately do NOT poll/wait —
+    # the whole point is to exit immediately so our HTTP response can flush.
+    # A missing-binary OSError at Popen construction is caught below.
+    try:
+        subprocess.Popen(  # noqa: S603 — system binary
+            ["systemctl", "restart", "psiphon-3x-ui.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            # start_new_session=True → setsid() in the child, detaching it
+            # from our process group so it survives our imminent SIGTERM.
+            start_new_session=True,
+        )
+        return True, "(detached fallback; systemd-run failed: " + detail + ")"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, (
+            f"systemctl restart failed: {type(exc).__name__}: {exc} "
+            f"(systemd-run also failed: {detail})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Body schemas
 # ---------------------------------------------------------------------------
 class PatchCountryBody(BaseModel):
     """``PATCH /api/dashboard/countries/{code}`` body.
 
-    Partial update: only ``enabled`` is mutable here (true to start the unit,
-    false to stop it). Other country fields are immutable via the dashboard.
+    Hotfix #10 (Bug #3): the dashboard now supports enabling a country that
+    has NO existing PortAssignment yet. When ``enabled == True`` and the
+    country has no PortAssignment, the operator MUST supply ``socks_port``
+    and ``public_port`` so the backend can run ``apply_country`` inline and
+    persist a new PortAssignment row. Either field may be ``None`` to opt
+    into the smart-recommendation defaults (the handler picks sensible free
+    ports). When ``enabled == False`` the socks/public fields are ignored.
     """
 
     enabled: bool = Field(..., description="true starts the unit, false stops it")
+    socks_port: int | None = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description="optional SOCKS port for enabling a no-PortAssignment country",
+    )
+    public_port: int | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        description="optional public port for enabling a no-PortAssignment country",
+    )
+
+    @field_validator("socks_port", "public_port")
+    @classmethod
+    def _no_bool(cls, v: int | None) -> int | None:
+        if isinstance(v, bool):
+            raise ValueError("port must be an integer, not bool")
+        return v
 
 
 class EditPortsBody(BaseModel):
@@ -309,8 +534,15 @@ def patch_country(
     * ``enabled == True`` → start_unit + Country.enabled = True
     * ``enabled == False`` → stop_unit + Country.enabled = False
 
-    Missing PortAssignment raises 409 (the operator must add the country
-    first via the wizard's add-country flow, not via this toggle).
+    Hotfix #10 (Bug #3): if the country has NO existing PortAssignment and
+    the operator requests ``enabled == True``, instead of raising 409 we
+    NOW accept optional ``socks_port``/``public_port`` from the request body
+    (or use sensible smart-recommendation defaults when those are null),
+    persist a fresh PortAssignment row, run ``apply_country`` inline so the
+    tunnel unit starts cleanly, and finally flip ``Country.enabled = True``.
+    If ``apply_country`` returns a ``failed`` ApplyEvent the handler raises
+    a structured 502 with the underlying failure detail so the operator sees
+    a useful error message instead of being bounced back to the wizard.
     """
     _require_wizard_completed(db)
     country = _get_country(db, code)
@@ -318,13 +550,42 @@ def patch_country(
         db.query(PortAssignment).filter(PortAssignment.country_code == country.code).first()
     )
     if assignment is None and body.enabled is True:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"country {country.code} has no PortAssignment — add it via "
-                "the wizard's add-country step before enabling"
-            ),
+        # Hotfix #10: enable a country that has no PortAssignment yet by
+        # accepting socks_port + public_port from the operator (or picking
+        # smart-recommendation defaults) and running apply_country inline.
+        socks_port = int(body.socks_port) if body.socks_port else _pick_free_socks_port(db)
+        public_port = int(body.public_port) if body.public_port else _pick_free_public_port(db)
+        spec = PortAssignmentSpec(
+            country_code=country.code,
+            socks_port=socks_port,
+            public_port=public_port,
         )
+        event = apply_country(spec)
+        if event.status != "healthy":
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(f"inline enable for {country.code} failed: {event.message}"),
+            )
+        # Persist the new PortAssignment row so subsequent toggles don't
+        # re-enter this branch.
+        port_row = PortAssignment(
+            socks_port=socks_port,
+            public_port=public_port,
+            country_code=country.code,
+        )
+        db.add(port_row)
+        country.enabled = True
+        db.add(country)
+        db.commit()
+        db.refresh(country)
+        db.refresh(port_row)
+        _log.info(
+            "patch_country inline-enabled %s socks=%d public=%d",
+            country.code,
+            socks_port,
+            public_port,
+        )
+        return _country_card(country, db)
 
     if body.enabled:
         try:
@@ -517,6 +778,19 @@ async def edit_country_ports(
     try:
         write_config(country.code, socks_port, config_dir=_config_dir())
         summary["rewrote_config"] = True
+    except PsiphonCredentialError as exc:
+        # Hotfix #14 (Phase 23): render_config fast-failed because the
+        # operator hasn't populated the four Psiphon-Inc upstream credentials
+        # in panel.env. Surface as 502 with the actionable credential
+        # message (names the env-var + panel.env path + restart command)
+        # rather than the opaque 500.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"write_config({country.code}, {socks_port}) failed — "
+                f"Psiphon upstream credentials error: {exc}"
+            ),
+        ) from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -705,6 +979,21 @@ async def reapply_all(
             write_config(code, int(pa.socks_port), config_dir=_config_dir())
             restart_unit(code)
             summary["applied"].append({"code": code, "socks_port": int(pa.socks_port)})
+        except PsiphonCredentialError as exc:
+            # Hotfix #14 (Phase 23): render_config fast-failed with an
+            # actionable credential-rejection message. Surface it as a
+            # per-code failed entry (carrying the actionable message naming
+            # the env var + panel.env path) instead of bubbling up as a 500.
+            summary["failed"].append(
+                {
+                    "code": code,
+                    # PsiphonCredentialError's str() is the actionable message
+                    # so the operator sees the same fix steps regardless of
+                    # which surface (here vs inline-enable vs edit-ports)
+                    # they triggered the failure from.
+                    "error": f"PsiphonCredentialError: {exc}",
+                }
+            )
         except (OSError, ValueError, PsiphonUnitError) as exc:
             summary["failed"].append(
                 {
@@ -929,14 +1218,18 @@ def change_panel_port(
     user: Annotated[dict, Depends(get_current_user)],
     db: Session = Depends(get_db),  # noqa: B008  FastAPI idiom
 ) -> dict[str, Any]:
-    """Persist a new panel listen port.
+    """Persist a new panel listen port AND apply it in-band.
 
-    Note: actually switching the listen port requires restarting the systemd
-    ``psiphon-3x-ui.service`` unit + reloading the firewall (the
-    ``installer/firewall.sh`` stage). This endpoint only flips
-    :attr:`Settings.panel_port`; the front-end surfaces a follow-up banner
-    reminding the operator to run ``systemctl restart psiphon-3x-ui`` and
-    ``bash installer/firewall.sh``.
+    Hotfix #10 (Bug #5): as well as flipping :attr:`Settings.panel_port`
+    in panel.db, this endpoint NOW (a) re-runs ``installer/firewall.sh`` so
+    the new port is reachable through the host firewall, and (b) calls
+    ``systemctl restart psiphon-3x-ui.service`` — authorised by the polkit
+    rule's newly-extended scope (see systemd/49-psiphon-3x-ui.rules). The
+    operator no longer needs to drop to a shell. The response surfaces
+    ``firewall_ok`` + ``service_restart_ok`` flags plus a joined note so the
+    SPA can tell the user the browser must reload at the new port once the
+    service comes back. Pre-Hotfix-#10 this endpoint only flipped the field
+    and the operator had to run the two shell commands manually.
     """
     _require_wizard_completed(db)
     settings = db.get(Settings, {"id": 1})
@@ -968,12 +1261,59 @@ def change_panel_port(
     settings.panel_port = new_port
     db.add(settings)
     db.commit()
+
+    # Hotfix #11 (Bug #3, part 1): rewrite ``PSIPHON3XUI_PORT=<new>`` in
+    # ``${INSTALL_PREFIX}/panel.env`` BEFORE the restart. The panel process
+    # loads its listen port from the env var (panel.config.Settings via
+    # pydantic-settings; see panel/__main__.py:main → uvicorn ports spawned
+    # from ``settings.port``), NOT from panel.db's Settings row — so merely
+    # flipping the DB row then restarting bound the panel back at the OLD
+    # port. `_update_panel_env_port` rewrites the env file in place so the
+    # next boot picks up the new port. Skipped only if the env file is
+    # missing (defensive — operator can drop the panel back up manually).
+    env_ok, env_detail = _update_panel_env_port(new_port)
+    if not env_ok:
+        _log.warning("change_panel_port env-file rewrite failed: %s", env_detail)
+
+    # Hotfix #10 (Bug #5) + Hotfix #11 (Bug #3, part 2): re-run
+    # installer/firewall.sh + restart the panel service in-band so the
+    # operator doesn't have to drop to a shell. The polkit rule
+    # (systemd/49-psiphon-3x-ui.rules — extended in 19f5) must authorise the
+    # psiphon3xui user to restart `psiphon-3x-ui.service`. If the service
+    # restart succeeds the panel process is killed while this very request
+    # is still streaming — the response body may be cut short in-flight.
+    # We deliberately return the success payload with a browser-self-refresh
+    # hint so the operator's tab reloads on the new port once the service
+    # comes back.
+    fw_ok, fw_detail = _reload_firewall()
+    if not fw_ok:
+        _log.warning("change_panel_port firewall reload failed: %s", fw_detail)
+    svc_ok, svc_detail = _restart_panel_service()
+    if not svc_ok:
+        _log.warning("change_panel_port systemctl restart failed: %s", svc_detail)
+
+    note_bits: list[str] = [f"panel_port updated to {new_port}"]
+    note_bits.append(
+        f"panel.env PSIPHON3XUI_PORT rewrite {'OK' if env_ok else 'FAILED'}"
+        + (f" — {env_detail}" if env_detail else "")
+    )
+    note_bits.append(
+        f"firewall.sh {'OK' if fw_ok else 'FAILED'}" + (f" — {fw_detail}" if fw_detail else "")
+    )
+    note_bits.append(
+        f"systemctl restart psiphon-3x-ui.service {'OK' if svc_ok else 'FAILED'}"
+        + (f" — {svc_detail}" if svc_detail else "")
+    )
+    note_bits.append(
+        "the panel is restarting on the new port — please reload the browser "
+        f"at http://<host>:{new_port}/dashboard once the service comes back"
+    )
     return {
         "changed": True,
         "old_port": old_port,
         "new_port": new_port,
-        "note": (
-            "panel_port updated — restart psiphon-3x-ui.service and re-run "
-            "installer/firewall.sh to apply the new listen port"
-        ),
+        "env_rewrite_ok": env_ok,
+        "firewall_ok": fw_ok,
+        "service_restart_ok": svc_ok,
+        "note": " | ".join(note_bits),
     }

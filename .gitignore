@@ -71,3 +71,39 @@ panel.db-shm
 # Local install staging
 /artifacts/
 /tmp/
+
+# ──────────────────────────────────────────────────────────────────────
+# Dev-host command-output scratch files & test logs
+# (added in Phase 7 when validating ruff/pytest/shellcheck gates and
+#  capturing installer dry-run output; should never be committed.)
+# ──────────────────────────────────────────────────────────────────────
+*.out
+*.txt
+!tests/fixtures/**/*.txt
+!tests/fixtures/**/*.json
+!.github/**/*.txt
+
+# Trash filenames that accidentally appeared when a multi-line
+# `python -c "..." | tee` got saved with the literal command-quoted
+# shell content as the filename — exclude them and any future sibling.
+import io;*
+lines =*
+phase7_*
+pytest_*
+final_p6_check.out
+ruff_check*.out
+ruff_check.out
+shellcheck_pkg.out
+pytest_dash.out
+pytest_final.out
+pytest_phase6_*
+pytest_full_p7.out
+phase7_after_https.out
+phase7_hardening.out
+phase7_https_errk.out
+phase7_regression.out
+pytest_dashboard_after.out
+pytest_pkg_fix.out
+pytest_url_after.out
+ruff_check_pkg.out
+shellcheck_pkg.out

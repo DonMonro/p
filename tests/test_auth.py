@@ -184,3 +184,127 @@ def test_tampered_cookie_returns_401(tmp_path, monkeypatch):
     config.get_settings.cache_clear()
     client.cookies.set("psiphon3xui_session", forged, domain="testserver")
     assert client.get("/api/me").status_code == 401
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hotfix #3 — cookie-clear attribute propagation (Bug #2 in post-release
+# feedback). Starlette's Response.delete_cookie emits a Set-Cookie with ONLY
+# the name+path, never the secure/httponly/samesite attributes that the
+# original set_session_cookie / set_csrf_cookie used. Per RFC 6265 §5.3 +
+# Chrome's strict matching, a HttpOnly+SameSite=Lax cookie cannot be deleted
+# by a Set-Cookie that lacks those flags — the browser stores them as two
+# distinct jars and the stale one persists, so the logout button appeared
+# broken on the live Ubuntu install. The fix mirrors every attribute on the
+# delete_reply; these tests lock that in by parsing the raw Set-Cookie header.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _delete_setcookies(monkeypatch, *, https_only: bool):
+    """Apply the cookie set+clear, return the Set-Cookie header VALUES for
+    the clear reply (session + csrf). Independent of TestClient (which folds
+    jar management in) so we can read the raw header text the browser sees.
+    """
+    from starlette.responses import Response
+
+    from panel import config
+
+    monkeypatch.setenv("PSIPHON3XUI_HTTPS_ONLY", "1" if https_only else "0")
+    config.get_settings.cache_clear()
+
+    from panel.auth import (
+        clear_csrf_cookie,
+        clear_session_cookie,
+        issue_csrf_token,
+        set_csrf_cookie,
+        set_session_cookie,
+    )
+
+    # 1. Set the cookies exactly as login / GET /auth/csrf do.
+    setter = Response()
+    set_session_cookie(setter, username="admin")
+    csrfer = Response()
+    set_csrf_cookie(csrfer, token=issue_csrf_token())
+
+    # 2. Clear them exactly as the logout path does.
+    clearer = Response()
+    clear_session_cookie(clearer)
+    clear_csrf_cookie(clearer)
+
+    return {
+        "session_set": setter.headers.get("set-cookie", ""),
+        "csrf_set": csrfer.headers.get("set-cookie", ""),
+        "delete": clearer.headers.getlist("set-cookie"),
+    }
+
+
+def test_clear_session_cookie_propagates_httponly_and_samesite(monkeypatch):
+    """The Set-Cookie delete emitted by clear_session_cookie MUST carry the
+    HttpOnly and SameSite=Lax attributes. Without them Chrome holds the
+    original cookie (keyed by name+path+attrs) and the operator stays logged
+    in. See Hotfix #3 + Bug #2 root-cause analysis.
+    """
+    h = _delete_setcookies(monkeypatch, https_only=False)
+    delete_header = next(
+        (v for v in h["delete"] if v.lower().startswith("psiphon3xui_session=")),
+        "",
+    )
+    assert delete_header, (
+        "clear_session_cookie MUST emit a Set-Cookie delete for the session "
+        "cookie name — without it the browser leaves the session cookie in place."
+    )
+
+    # The set reply should have HttpOnly + SameSite=Lax (sanity check the
+    # baseline we're matching).
+    set_header = h["session_set"]
+    assert "httponly" in set_header.lower()
+    assert "samesite=lax" in set_header.lower()
+
+    # And CRUCIALLY the delete reply must mirror those attributes.
+    assert "httponly" in delete_header.lower(), (
+        "clear_session_cookie delete Set-Cookie MUST set HttpOnly — Chrome's "
+        "RFC 6265 §5.3 matching refuses to overwrite a HttpOnly cookie via a "
+        "delete that lacks the flag, so the stale session persists (Bug #2)."
+    )
+    assert "samesite=lax" in delete_header.lower(), (
+        "clear_session_cookie delete Set-Cookie MUST set SameSite=Lax — "
+        "mirrors set_session_cookie; otherwise the browser keeps the stale "
+        "SameSite=Lax session cookie and logout silently no-ops (Bug #2)."
+    )
+
+
+def test_clear_csrf_cookie_propagates_samesite(monkeypatch):
+    """Same lock-in for the CSRF cookie — the delete reply MUST carry
+    SameSite=Lax (it's set with samesite=lax on /auth/csrf) so the browser
+    actually clears the jar on logout."""
+    h = _delete_setcookies(monkeypatch, https_only=False)
+    delete_header = next(
+        (v for v in h["delete"] if v.lower().startswith("psiphon3xui_csrf=")),
+        "",
+    )
+    assert delete_header, (
+        "clear_csrf_cookie MUST emit a Set-Cookie delete for the CSRF cookie "
+        "name — paired with clear_session_cookie on logout."
+    )
+
+    set_header = h["csrf_set"]
+    assert "samesite=lax" in set_header.lower()
+
+    assert "samesite=lax" in delete_header.lower(), (
+        "clear_csrf_cookie delete Set-Cookie MUST set SameSite=Lax — mirrors "
+        "set_csrf_cookie so the browser clears the CSRF jar on logout (Bug #2)."
+    )
+
+
+def test_clear_cookies_set_secure_when_https_only(monkeypatch):
+    """When https_only=true the SET reply marks cookies Secure; the CLEAR
+    reply must also mark them Secure or the browser refuses to overwrite a
+    Secure cookie via a non-Secure delete. Lock in the parity here."""
+    h = _delete_setcookies(monkeypatch, https_only=True)
+    assert "secure" in h["session_set"].lower()
+    assert "secure" in h["csrf_set"].lower()
+    for v in h["delete"]:
+        assert "secure" in v.lower(), (
+            f"When https_only=true EVERY clear-*cookie Set-Cookie delete MUST "
+            f"carry the Secure flag so Chrome overwrites the Secure cookie "
+            f"(Bug #2 — got: {v!r})."
+        )
