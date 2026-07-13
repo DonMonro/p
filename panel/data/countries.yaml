@@ -1,0 +1,173 @@
+# Psiphon EgressRegion country configuration
+# ----------------------------------------------------------------------------
+# This file is the single source of truth for the countries offered by the
+# Psiphon-3X-UI panel. Because the Psiphon upstream occasionally adds or
+# removes supported EgressRegions, this file is intentionally editable.
+#
+# Each entry maps a 2-letter ISO-3166 code used by Psiphon's `EgressRegion`
+# field to a human-friendly display name and flag emoji shown in the wizard
+# and dashboard. To extend the list, simply append a new entry with a unique
+# `code`; no code changes are required.
+#
+# IMPORTANT (YAML gotcha): every `code` value is QUOTED. YAML 1.1 parsers
+# interpret a few bare 2-letter codes (e.g. `NO`, `no`, `On`, `Yes`) as
+# booleans, and others (`AT`, `IN`, `0X`) inconsistently. Quoting them all
+# keeps the file's semantics stable across YAML parser versions.
+# These codes are based on the regions supported in recent psiphon-tunnel-core
+# releases; the exact count may drift over time. Display "N available" in the UI
+# rather than a hard-coded number.
+# ----------------------------------------------------------------------------
+#
+# PACKAGING NOTE: this file ships inside the panel wheel under
+# ``panel/data/countries.yaml`` via ``[tool.setuptools.package-data]`` in
+# pyproject.toml so the seeded panel can find it from
+# ``Path(panel.config.__file__).parent / "data" / "countries.yaml"`` regardless
+# of the install prefix. The duplicate copy at ``<repo-root>/config/countries.yaml``
+# is kept only for the test suite + dev contributors; the canonical source
+# of truth is THIS file. Keep both copies byte-identical if you edit either.
+
+version: 1
+
+# Default recommended ranges used by the wizard's "smart recommendation"
+# feature. The user can override these.
+defaults:
+  socks_port_range:
+    start: 10001
+    end:   10032
+  public_port_range:
+    start: 30000
+    end:   30031
+
+countries:
+  - code: "AT"
+    name: Austria
+    flag: 🇦🇹
+    region: Europe
+  - code: "AU"
+    name: Australia
+    flag: 🇦🇺
+    region: Oceania
+  - code: "BE"
+    name: Belgium
+    flag: 🇧🇪
+    region: Europe
+  - code: "BG"
+    name: Bulgaria
+    flag: 🇧🇬
+    region: Europe
+  - code: "BR"
+    name: Brazil
+    flag: 🇧🇷
+    region: South America
+  - code: "CA"
+    name: Canada
+    flag: 🇨🇦
+    region: North America
+  - code: "CH"
+    name: Switzerland
+    flag: 🇨🇭
+    region: Europe
+  - code: "CZ"
+    name: Czech Republic
+    flag: 🇨🇿
+    region: Europe
+  - code: "DE"
+    name: Germany
+    flag: 🇩🇪
+    region: Europe
+  - code: "DK"
+    name: Denmark
+    flag: 🇩🇰
+    region: Europe
+  - code: "EE"
+    name: Estonia
+    flag: 🇪🇪
+    region: Europe
+  - code: "ES"
+    name: Spain
+    flag: 🇪🇸
+    region: Europe
+  - code: "FI"
+    name: Finland
+    flag: 🇫🇮
+    region: Europe
+  - code: "FR"
+    name: France
+    flag: 🇫🇷
+    region: Europe
+  - code: "GB"
+    name: United Kingdom
+    flag: 🇬🇧
+    region: Europe
+  - code: "HR"
+    name: Croatia
+    flag: 🇭🇷
+    region: Europe
+  - code: "HU"
+    name: Hungary
+    flag: 🇭🇺
+    region: Europe
+  - code: "IE"
+    name: Ireland
+    flag: 🇮🇪
+    region: Europe
+  - code: "IN"
+    name: India
+    flag: 🇮🇳
+    region: Asia
+  - code: "IT"
+    name: Italy
+    flag: 🇮🇹
+    region: Europe
+  - code: "JP"
+    name: Japan
+    flag: 🇯🇵
+    region: Asia
+  - code: "LV"
+    name: Latvia
+    flag: 🇱🇻
+    region: Europe
+  - code: "NL"
+    name: Netherlands
+    flag: 🇳🇱
+    region: Europe
+  - code: "NO"
+    name: Norway
+    flag: 🇳🇴
+    region: Europe
+  - code: "PL"
+    name: Poland
+    flag: 🇵🇱
+    region: Europe
+  - code: "PT"
+    name: Portugal
+    flag: 🇵🇹
+    region: Europe
+  - code: "RO"
+    name: Romania
+    flag: 🇷🇴
+    region: Europe
+  - code: "RS"
+    name: Serbia
+    flag: 🇷🇸
+    region: Europe
+  - code: "SE"
+    name: Sweden
+    flag: 🇸🇪
+    region: Europe
+  - code: "SG"
+    name: Singapore
+    flag: 🇸🇬
+    region: Asia
+  - code: "SK"
+    name: Slovakia
+    flag: 🇸🇰
+    region: Europe
+  - code: "UA"
+    name: Ukraine
+    flag: 🇺🇦
+    region: Europe
+  - code: "US"
+    name: United States
+    flag: 🇺🇸
+    region: North America

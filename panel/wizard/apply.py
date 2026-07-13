@@ -19,12 +19,14 @@ keeps the SSE transport concerns in the router.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from ..models import PortAssignment
 from ..psiphon import (
     HealthProbeResult,
+    PsiphonCredentialError,
     PsiphonUnitError,
     health_probe,
     is_unit_active,
@@ -176,6 +178,18 @@ def apply_country(
     """
     try:
         _initial_unit_start(spec.country_code, spec.socks_port, config_dir=config_dir)
+    except PsiphonCredentialError as exc:
+        # Hotfix #14 (Phase 23): render_config fast-failed because the
+        # operator hasn't yet populated the four Psiphon-Inc upstream
+        # credentials in panel.env. Surface as a failed ApplyEvent carrying
+        # the actionable message — DON'T bubble so the SSE stream keeps
+        # going for the remaining countries.
+        return ApplyEvent(
+            country_code=spec.country_code,
+            status="failed",
+            progress=0,
+            message=f"config/unit start failed: PsiphonCredentialError: {exc}",
+        )
     except (PsiphonUnitError, OSError, ValueError) as exc:
         return ApplyEvent(
             country_code=spec.country_code,
@@ -192,13 +206,31 @@ def apply_country(
             message=f"unit psiphon-tunnel@{spec.country_code}.service not active after start",
         )
 
-    probe: HealthProbeResult = health_probe(spec.socks_port, _sock_factory=health_probe_factory)
+    # Hotfix #11 (Bug #2): Psiphon's local SOCKS5 listener takes 5–30 seconds
+    # to actually bind *after* `systemctl start` reports the unit "active"
+    # (the ExecStart-ed process must bootstrap, reach the upstream Psiphon root
+    # servers, handshake, and only then open its local listener). A single
+    # eager probe therefore hits `Connection refused` → `failed` even on a
+    # healthy tunnel — which in turn blocks the wizard's post-apply
+    # auto-enable path (Bug #5, gated on `event.status == "healthy"`). We
+    # retry with bounded backoff so a transient ConnectionRefused doesn't
+    # fail the whole apply. `health_probe_factory` is honoured every
+    # iteration so unit tests that stub the probe stay deterministic (their
+    # stub returns healthy on the first call → loop exits immediately).
+    deadline = time.monotonic() + 30.0
+    probe: HealthProbeResult = health_probe(
+        spec.socks_port,
+        _sock_factory=health_probe_factory,
+    )
+    while not probe.healthy and time.monotonic() < deadline:
+        time.sleep(1.0)
+        probe = health_probe(spec.socks_port, _sock_factory=health_probe_factory)
     if not probe.healthy:
         return ApplyEvent(
             country_code=spec.country_code,
             status="failed",
             progress=75,
-            message=f"SOCKS5 health probe on 127.0.0.1:{spec.socks_port} failed: {probe.detail}",
+            message=f"SOCKS5 health probe on 127.0.0.1:{spec.socks_port} failed after retry: {probe.detail}",
         )
 
     return ApplyEvent(

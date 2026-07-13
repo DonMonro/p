@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psiphon-3x-ui-panel"
-version = "0.1.0"
+version = "1.0.0"
 description = "Psiphon-3X-UI management panel — install Psiphon and clone 3x-ui inbounds per country."
 readme = "panel/README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,13 @@ license = "MIT"
 authors = [{ name = "Psiphon-3X-UI contributors" }]
 
 dependencies = [
+    # FastAPI pulls its own subset of optional extras; the dashboard's
+    # `@router.post("/restore")` route declares an `UploadFile = File(...)`
+    # form payload, which triggers FastAPI's `ensure_multipart_is_installed()`
+    # at import time. Without `python-multipart` in the venv the panel
+    # refuses to boot → systemd restart loop → install.sh socket probe fails.
+    # Pin it as a hard runtime dependency (not an optional extra).
+    "python-multipart>=0.0.9",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "bcrypt>=4.1",
@@ -48,7 +55,7 @@ where = ["."]
 include = ["panel*"]
 
 [tool.setuptools.package-data]
-"panel" = ["static/**/*"]
+"panel" = ["static/**/*", "data/*.yaml"]
 
 # ------------------------------------------------------------------
 # Ruff configuration (canonical copy; ruff.toml at repo root mirrors it)

@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Psiphon-3X-UI — First-run Setup Wizard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    /* ── Page chrome ─────────────────────────────────────────── */
+    .stepper { display: flex; flex-wrap: wrap; gap: .25rem; margin: 0 0 1rem; padding: 0; list-style: none; }
+    .stepper li { padding: .25rem .6rem; border-radius: 999px; background: #eef; color: #556;
+                  font-size: .8rem; border: 1px solid #ccd; }
+    .stepper li.active { background: #2a7d2f; color: #fff; border-color: #2a7d2f; font-weight: 600; }
+    .stepper li.done   { background: #dde; color: #456; border-color: #bcc; text-decoration: line-through; }
+
+    /* ── Country picker grid ─────────────────────────────────── */
+    .country-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                    gap: .35rem; margin: .5rem 0; }
+    .country-grid label { display: flex; align-items: center; gap: .4rem; padding: .25rem;
+                          border: 1px solid #ddd; border-radius: 4px; cursor: pointer;
+                          font-size: .9rem; background: #fff; }
+    .country-grid label:hover { background: #f3f3ff; }
+    .country-grid input:disabled + span { opacity: .5; }
+    .country-flag { margin-right: .25rem; }
+
+    /* ── SSE progress logs ───────────────────────────────────── */
+    pre.log { max-height: 22rem; overflow: auto; background: #111; color: #eee;
+              padding: .65rem; border-radius: 4px; font-size: .85rem; margin: 0; }
+    .ev-work  { color: #ffd866; }
+    .ev-healthy, .ev-cloned { color: #9fef00; }
+    .ev-failed, .ev-unhealthy { color: #ff5b5b; }
+    .ev-done  { color: #66d9ef; font-weight: 600; }
+    .ev-line  { white-space: pre-wrap; word-break: break-word; }
+    .progress-bar { height: .6rem; background: #eee; border-radius: 999px; overflow: hidden; }
+    .progress-bar > span { display: block; height: 100%; background: #2a7d2f;
+                           transition: width .3s ease; }
+
+    /* ── Inbound list ────────────────────────────────────────── */
+    table.inbounds td, table.inbounds th { padding: .35rem .45rem; }
+
+    /* ── Toast banner (mirrors dashboard.html) ───────────────── */
+    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: .65rem 1rem;
+             background: #222; color: #fff; border-radius: 4px; font-size: .9rem;
+             z-index: 9; box-shadow: 0 6px 16px rgba(0,0,0,.35); max-width: 36rem; }
+    .toast.err { background: #b2182b; }
+    .toast.ok  { background: #2a7d2f; }
+    .toast.warn{ background: #b8860b; }
+
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main class="container" x-data="appWizard()" x-cloak>
+    <!-- Hotfix #10 (Bug #1): the <nav> previously lived OUTSIDE the
+         <main x-data="appWizard()"> root. Alpine's @click.prevent (and
+         every other Alpine directive) is only bound for elements INSIDE
+         the x-data root scope. The Logout anchor at line 56 was therefore
+         NEVER wired by Alpine across ANY version of this SPA. Moving the
+         <nav> inside <main> is the first real logout fix here too. -->
+    <nav class="container-fluid">
+      <ul><li><strong>Psiphon-3X-UI</strong> — First-run Setup Wizard</li></ul>
+      <ul>
+        <li><a href="#" @click.prevent="logout()">Logout</a></li>
+      </ul>
+    </nav>
+    <!-- ─────────────────────────  Toast  ───────────────────────── -->
+    <template x-if="toast.text">
+      <div class="toast" :class="toast.kind" x-text="toast.text"></div>
+    </template>
+
+    <!-- ─────────────────────────  Stepper  ──────────────────────── -->
+    <ol class="stepper">
+      <template x-for="(s, i) in steps" :key="s">
+        <li :class="{
+              active: s === state.current_step && !state.is_completed && i === state.step_index,
+              done:   state.is_completed || i < state.step_index
+            }" x-text="`${i+1}. ${titleFor(s)}`"></li>
+      </template>
+    </ol>
+
+    <!-- ─────────────────────────  Step: countries  ──────────────── -->
+    <article x-show="state.current_step === 'countries'">
+      <h3 x-text="titleFor('countries')"></h3>
+      <p>Choose which countries the panel should expose egress for. You can enable all or hand-pick a subset.</p>
+      <fieldset :disabled="busy">
+        <label>
+          <input type="radio" name="countryMode" value="all"
+                 x-model="form.countries.mode" @change="onCountryModeChange()">
+          Enable every available country
+        </label>
+        <label>
+          <input type="radio" name="countryMode" value="specific"
+                 x-model="form.countries.mode" @change="onCountryModeChange()">
+          Choose a specific subset of countries
+        </label>
+      </fieldset>
+
+      <div class="country-grid" x-show="form.countries.mode === 'specific'">
+        <template x-for="c in countryCatalog" :key="c.code">
+          <label>
+            <input type="checkbox" :value="c.code" x-model="form.countries.codes"
+                   :disabled="form.countries.mode !== 'specific'">
+            <span><span class="country-flag" x-text="c.flag"></span>
+                  <code x-text="c.code"></code> · <span x-text="c.name"></span></span>
+          </label>
+        </template>
+      </div>
+      <p x-show="form.countries.mode === 'specific'">
+        <small x-text="`${form.countries.codes.length} of ${countryCatalog.length} selected`"></small>
+      </p>
+
+      <button @click.prevent="submitCountries()" :disabled="busy">Continue → ports</button>
+    </article>
+
+    <!-- ─────────────────────────  Step: ports  ───────────────────── -->
+    <article x-show="state.current_step === 'ports'">
+      <h3 x-text="titleFor('ports')"></h3>
+      <p>The wizard writes one Psiphon SOCKS5 listener per country (internal)
+         and clones one 3x-ui inbound per country (public).</p>
+
+      <fieldset :disabled="busy">
+        <label>
+          <input type="radio" name="portAssign" value="one_per_country"
+                 x-model="form.ports.assignment">
+          One socks port + one public port <em>per</em> country
+          <small>(needs N socks + N public ports — recommended for clarity)</small>
+        </label>
+        <label>
+          <input type="radio" name="portAssign" value="shared_range"
+                 x-model="form.ports.assignment">
+          Shared ranges — every country re-uses one socks+public pair
+          <small>(only useful if the panel is fronted by a load-balancer)</small>
+        </label>
+
+        <hr>
+        <label>
+          <input type="checkbox" x-model="form.ports.use_recommendation"
+                 @change="onRecommendationToggle()">
+          Smart recommendation — let the panel pick free ranges for me
+        </label>
+
+        <div class="grid" x-show="!form.ports.use_recommendation">
+          <fieldset>
+            <legend>SOCKS5 range <small>(internal listeners)</small></legend>
+            <label>Start
+              <input type="number" min="1" max="65535" x-model.number="form.ports.socks.start">
+            </label>
+            <label>End
+              <input type="number" min="1" max="65535" x-model.number="form.ports.socks.end">
+            </label>
+          </fieldset>
+          <fieldset>
+            <legend>Public range <small>(3x-ui clone inbounds)</small></legend>
+            <label>Start
+              <input type="number" min="1" max="65535" x-model.number="form.ports.public.start">
+            </label>
+            <label>End
+              <input type="number" min="1" max="65535" x-model.number="form.ports.public.end">
+            </label>
+          </fieldset>
+        </div>
+      </fieldset>
+
+      <button @click.prevent="submitPorts()" :disabled="busy">Apply → spawn tunnels</button>
+      <button class="secondary" @click.prevent="back()" :disabled="busy">← back</button>
+    </article>
+
+    <!-- ─────────────────────────  Step: apply (SSE)  ─────────────── -->
+    <article x-show="state.current_step === 'apply'">
+      <h3 x-text="titleFor('apply')"></h3>
+      <p>Spawning one per-country Psiphon tunnel systemd unit and SOCKS5-probing each.
+         Stay on this page until the stream ends — closing the tab aborts.</p>
+      <button @click.prevent="runApply()" :disabled="busy"
+              x-text="busy ? 'Applying…' : 'Start apply (stream)'"></button>
+      <div class="progress-bar" x-show="busy"><span :style="`width: ${apply.progress}%`"></span></div>
+      <pre class="log" x-show="apply.lines.length"><code>
+        <template x-for="l in apply.lines" :key="l.id">
+          <span class="ev-line" :class="l.cls" x-text="l.text"></span>
+        </template>
+      </code></pre>
+    </article>
+
+    <!-- ─────────────────────────  Step: xui_detect  ──────────────── -->
+    <article x-show="state.current_step === 'xui_detect'">
+      <h3 x-text="titleFor('xui_detect')"></h3>
+      <p>The panel can probe the local host for an already-running 3x-ui installation.
+         If detection finds nothing you can still type the base URL manually in the next step.</p>
+      <button @click.prevent="runXuiDetect()" :disabled="busy"
+              x-text="busy ? 'Probing…' : 'Detect 3x-ui'"></button>
+
+      <details x-show="state.step_data?.xui_detect" style="margin-top:1rem">
+        <summary>Last detection result</summary>
+        <pre x-text="JSON.stringify(state.step_data?.xui_detect || {}, null, 2)"></pre>
+      </details>
+    </article>
+
+    <!-- ─────────────────────────  Step: xui_creds  ───────────────── -->
+    <article x-show="state.current_step === 'xui_creds'">
+      <h3 x-text="titleFor('xui_creds')"></h3>
+      <p>Enter the credentials the panel should use to log into 3x-ui.
+         The cached session is reused for the clone step.</p>
+      <fieldset :disabled="busy">
+        <label>Base URL
+          <input type="text" x-model="form.xui_creds.base_url"
+                 placeholder="http://127.0.0.1:2053/panel/  (paste the FULL 3x-ui URL visible in your browser address bar, e.g. /panel/ for a default install or /<secret>/panel for a hardened one. A trailing /panel SPA route is stripped automatically.)">
+        </label>
+        <label>Username
+          <input type="text" x-model="form.xui_creds.username" placeholder="admin">
+        </label>
+        <label>Password
+          <input type="password" x-model="form.xui_creds.password" placeholder="password">
+        </label>
+      </fieldset>
+      <button @click.prevent="submitXuiCreds()" :disabled="busy">Verify login → pick template</button>
+      <button class="secondary" @click.prevent="back()" :disabled="busy">← back</button>
+    </article>
+
+    <!-- ─────────────────────────  Step: template  ───────────────── -->
+    <article x-show="state.current_step === 'template'">
+      <h3 x-text="titleFor('template')"></h3>
+      <p>Pick the existing 3x-ui inbound the panel should clone for every country.</p>
+      <button @click.prevent="loadInbounds()" :disabled="busy"
+              x-text="busy ? 'Loading…' : 'Refresh inbound list'"></button>
+
+      <table class="inbounds" x-show="inbounds.length" style="margin-top:.5rem">
+        <thead><tr><th></th><th>ID</th><th>Remark</th><th>Port</th><th>Protocol</th><th>Tag</th></tr></thead>
+        <tbody>
+          <template x-for="ib in inbounds" :key="ib.id">
+            <tr>
+              <td><input type="radio" name="tmplId" :value="ib.id" x-model.number="form.template.template_inbound_id"></td>
+              <td><code x-text="ib.id"></code></td>
+              <td x-text="ib.remark || '—'"></td>
+              <td x-text="ib.port"></td>
+              <td x-text="ib.protocol"></td>
+              <td x-text="ib.tag || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <p x-show="!inbounds.length && !busy"><small>No inbounds loaded yet — click "Refresh inbound list" above.</small></p>
+
+      <button @click.prevent="submitCloneTemplate()" :disabled="busy || !form.template.template_inbound_id">
+        Confirm template → clone
+      </button>
+      <button class="secondary" @click.prevent="back()" :disabled="busy">← back</button>
+    </article>
+
+    <!-- ─────────────────────────  Step: clone (SSE)  ────────────── -->
+    <article x-show="state.current_step === 'clone'">
+      <h3 x-text="titleFor('clone')"></h3>
+      <p>Cloning the template inbound once per country via the 3x-ui API.
+         Stay on this page until the stream ends — closing the tab aborts.</p>
+      <button @click.prevent="runClone()" :disabled="busy"
+              x-text="busy ? 'Cloning…' : 'Start clone (stream)'"></button>
+      <div class="progress-bar" x-show="busy"><span :style="`width: ${clone.progress}%`"></span></div>
+      <pre class="log" x-show="clone.lines.length"><code>
+        <template x-for="l in clone.lines" :key="l.id">
+          <span class="ev-line" :class="l.cls" x-text="l.text"></span>
+        </template>
+      </code></pre>
+    </article>
+
+    <!-- ─────────────────────────  Step: done  ───────────────────── -->
+    <article x-show="state.current_step === 'done' || state.is_completed">
+      <h3 x-text="titleFor('done')"></h3>
+      <p>The setup wizard has completed. Your per-country tunnels are running and
+         3x-ui has a cloned inbound per country. Continue to the dashboard to
+         enable/disable countries, edit ports, view logs, backup/restore,
+         rotate the admin password and change the panel's port.</p>
+      <button @click.prevent="goToDashboard()">Open the Management Dashboard →</button>
+    </article>
+
+    <!-- ─────────────────────────  Footer state dump  ────────────── -->
+    <details style="margin-top:2rem">
+      <summary>Wizard state snapshot (debug)</summary>
+      <pre x-text="JSON.stringify(state, null, 2)"></pre>
+    </details>
+  </main>
+
+  <!-- Alpine.js pulls the same minimal build used by the dashboard/login SPAs -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script>
+    /** Single-page wizard SPA.
+      *
+      * State machine mirrors panel.wizard.steps.WizardStep (countries →
+      * ports → apply → xui_detect → xui_creds → template → clone → done).
+      * Every POST handler here targets the matching ``/api/wizard/<step>``
+      * endpoint and then refreshes the wizard snapshot via ``GET /api/wizard``.
+      * The two SSE steps (apply, clone) double-handshake their CSRF exemption
+      * by NOT sending the X-CSRF-Token header (see ``_csrf_exempt_prefixes``
+      * in panel.main — those endpoints are exempt because browsers refuse to
+      * let fetch() attach custom headers on EventSource-style streaming POSTs).
+      */
+    function appWizard() {
+      const STEP_TITLES = {
+        countries:  "Specify countries",
+        ports:      "Port ranges",
+        apply:      "Apply",
+        xui_detect: "Detect 3x-ui",
+        xui_creds:  "3x-ui credentials",
+        template:   "Pick the template inbound",
+        clone:      "Clone",
+        done:       "Done",
+      };
+
+      return {
+        steps: ["countries","ports","apply","xui_detect","xui_creds","template","clone","done"],
+        state: { current_step: "countries", is_completed: false, step_index: 0, step_data: {}, steps: [] },
+
+        countryCatalog: [],
+        inbounds: [],
+
+        busy: false,
+        toast: { text: "", kind: "ok" },
+
+        // Per-step form models. Initialized to empty defaults; repopulated
+        // from state.step_data on each refreshState() so a page reload does
+        // not lose user input already persisted server-side.
+        form: {
+          countries: { mode: "all", codes: [] },
+          ports:     { socks: {start: 10001, end: 10032}, public: {start: 30000, end: 30031},
+                       assignment: "one_per_country", use_recommendation: false },
+          xui_creds:  { base_url: "http://127.0.0.1:2053/", username: "", password: "" },
+          template:   { template_inbound_id: 0 },
+        },
+
+        // SSE live log writers (apply + clone).
+        apply: { progress: 0, lines: [] },
+        clone: { progress: 0, lines: [] },
+
+        _csrf: { token: "", fetched: false },
+        _logSeq: 0,
+
+        // ── CSRF ─────────────────────────────────────────────────
+        async _csrfHeaders() {
+          // Match panel.static.dashboard's pattern: lazily fetch /auth/csrf
+          // once, fall back to the cookie value, re-fetch on a 403 elsewhere.
+          if (!this._csrf.fetched) {
+            try {
+              const r = await fetch("/auth/csrf");
+              if (r.ok) {
+                this._csrf.token = (await r.json()).token || "";
+                this._csrf.fetched = true;
+              } else if (r.status === 401) { this.redirectLogin(); }
+            } catch (e) { /* CSRF may be disabled server-side */ }
+          }
+          const fromCookie = document.cookie
+            .split("; ")
+            .find(row => row.startsWith("psiphon3xui_csrf="));
+          const token = this._csrf.token || (fromCookie ? fromCookie.split("=")[1] : "");
+          return token ? { "X-CSRF-Token": token } : {};
+        },
+
+        // ── Boot ─────────────────────────────────────────────────
+        async init() {
+          // If the wizard is already done, GET /api/wizard returns is_completed=true
+          // and we render the DONE panel. We never auto-advance: every POST is
+          // strictly user-driven (the API is the source of truth).
+          await this.refreshState();
+          if (this.state.is_completed) return;
+          if (this.state.current_step === "countries" && !this.countryCatalog.length) {
+            await this.loadCountries();
+          }
+          // Pre-fill forms from any persisted step_data so a hard reload
+          // mid-wizard folds the persisted selections back into the UI.
+          this.hydrateFormFromState();
+        },
+
+        async refreshState() {
+          try {
+            const r = await fetch("/api/wizard");
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) throw new Error(`GET /api/wizard → ${r.status}`);
+            this.state = await r.json();
+            if (!this.state.steps || !this.state.steps.length) {
+              this.state.steps = [...this.steps];
+            }
+            // Ensure current_step is one we recognise (defensive).
+            if (!this.steps.includes(this.state.current_step)) {
+              this.state.current_step = "countries";
+              this.state.step_index = 0;
+            }
+          } catch (e) {
+            this.notify(`failed to load wizard state: ${e.message}`, "err");
+          }
+        },
+
+        hydrateFormFromState() {
+          const sd = this.state.step_data || {};
+          if (sd.countries && typeof sd.countries === "object") {
+            this.form.countries.mode = sd.countries.mode || "all";
+            this.form.countries.codes = [...(sd.countries.codes || [])];
+          }
+          if (sd.ports && typeof sd.ports === "object") {
+            const p = sd.ports;
+            if (p.socks)  this.form.ports.socks  = { start: p.socks.start,  end: p.socks.end };
+            if (p.public) this.form.ports.public = { start: p.public.start, end: p.public.end };
+            if (p.assignment) this.form.ports.assignment = p.assignment;
+            this.form.ports.use_recommendation = !!p.use_recommendation;
+          }
+          if (sd.xui_creds && typeof sd.xui_creds === "object") {
+            this.form.xui_creds.base_url = sd.xui_creds.base_url || this.form.xui_creds.base_url;
+            this.form.xui_creds.username = sd.xui_creds.username || "";
+          }
+          if (sd.template && typeof sd.template === "object") {
+            this.form.template.template_inbound_id = sd.template.template_inbound_id || 0;
+          }
+        },
+
+        titleFor(step) { return STEP_TITLES[step] || step; },
+
+        // ── Step helpers ─────────────────────────────────────────
+        onCountryModeChange() {
+          if (this.form.countries.mode === "all") this.form.countries.codes = [];
+        },
+
+        onRecommendationToggle() {
+          // Nothing more to do — server picks ranges; draft inputs are kept
+          // so toggling it back off restores the operator's edited values.
+        },
+
+        // GET /api/countries — list the catalog for the picker.
+        async loadCountries() {
+          try {
+            const r = await fetch("/api/countries");
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) throw new Error(`GET /api/countries → ${r.status}`);
+            const body = await r.json();
+            this.countryCatalog = (body.countries || []).slice().sort(
+              (a, b) => a.code.localeCompare(b.code));
+          } catch (e) {
+            this.notify(`failed to load country catalog: ${e.message}`, "err");
+          }
+        },
+
+        // POST /api/wizard/countries
+        async submitCountries() {
+          this.busy = true;
+          try {
+            const body = { mode: this.form.countries.mode,
+                           codes: this.form.countries.mode === "specific"
+                                  ? [...this.form.countries.codes] : [] };
+            const r = await fetch("/api/wizard/countries", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { ...(await this._csrfHeaders()), "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`countries step failed: ${detail}`, "err");
+              return;
+            }
+            this.state = await r.json();
+            this.hydrateFormFromState();
+            this.notify(`countries chosen — ${body.mode === "all" ? "all" : body.codes.length}`);
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // POST /api/wizard/ports
+        async submitPorts() {
+          this.busy = true;
+          try {
+            const body = {
+              socks:  { start: this.form.ports.socks.start,  end: this.form.ports.socks.end },
+              public: { start: this.form.ports.public.start, end: this.form.ports.public.end },
+              assignment: this.form.ports.assignment,
+              use_recommendation: this.form.ports.use_recommendation,
+            };
+            const r = await fetch("/api/wizard/ports", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { ...(await this._csrfHeaders()), "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`ports step failed: ${detail}`, "err");
+              return;
+            }
+            this.state = await r.json();
+            this.hydrateFormFromState();
+            this.notify("port ranges verified");
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // POST /api/wizard/apply — SSE stream
+        async runApply() {
+          this.busy = true;
+          this.apply = { progress: 0, lines: [] };
+          try {
+            // CSRF-exempt in panel.main._csrf_exempt_prefixes; do not send header.
+            const r = await fetch("/api/wizard/apply", {
+              method: "POST", credentials: "same-origin",
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok || !r.body) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`apply step failed: ${detail}`, "err");
+              return;
+            }
+            await this._drainSSE(r, this.apply, "apply");
+            // Final summary flips current_step to xui_detect on the server.
+            await this.refreshState();
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // POST /api/wizard/xui-detect
+        async runXuiDetect() {
+          this.busy = true;
+          try {
+            const r = await fetch("/api/wizard/xui-detect", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: await this._csrfHeaders(),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`xui-detect failed: ${detail}`, "err");
+              return;
+            }
+            const body = await r.json();
+            this.state = body;
+            this.hydrateFormFromState();
+            // Pre-fill the next step's base_url with the detected value if any.
+            const det = body.detect || {};
+            if (det.detected && det.base_url) this.form.xui_creds.base_url = det.base_url;
+            this.notify(det.detected
+                        ? `3x-ui detected at ${det.base_url}`
+                        : "no 3x-ui detected — type creds manually on the next step",
+                        det.detected ? "ok" : "warn");
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // POST /api/wizard/xui-creds
+        async submitXuiCreds() {
+          this.busy = true;
+          try {
+            const body = {
+              base_url: this.form.xui_creds.base_url.trim(),
+              username: this.form.xui_creds.username.trim(),
+              password: this.form.xui_creds.password,
+            };
+            if (!body.base_url || !body.username || !body.password) {
+              this.notify("all three fields (base_url, username, password) are required", "err");
+              return;
+            }
+            const r = await fetch("/api/wizard/xui-creds", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { ...(await this._csrfHeaders()), "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`xui-creds step failed: ${detail}`, "err");
+              return;
+            }
+            this.state = await r.json();
+            this.hydrateFormFromState();
+            // Auto-load inbounds right away so the next-step UX is snappy.
+            await this.loadInbounds();
+            this.notify("3x-ui login verified — credentials cached");
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // GET /api/wizard/inbounds
+        async loadInbounds() {
+          try {
+            const r = await fetch("/api/wizard/inbounds");
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`inbound list failed: ${detail}`, "err");
+              this.inbounds = [];
+              return;
+            }
+            const body = await r.json();
+            this.inbounds = body.inbounds || [];
+            if (!this.inbounds.length) this.notify("3x-ui has no inbounds to clone", "warn");
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+        },
+
+        // POST /api/wizard/clone-template
+        async submitCloneTemplate() {
+          this.busy = true;
+          try {
+            const tid = Number(this.form.template.template_inbound_id);
+            if (!Number.isInteger(tid) || tid < 1) {
+              this.notify("pick one inbound from the list first", "err");
+              return;
+            }
+            const r = await fetch("/api/wizard/clone-template", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { ...(await this._csrfHeaders()), "Content-Type": "application/json" },
+              body: JSON.stringify({ template_inbound_id: tid }),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`clone-template step failed: ${detail}`, "err");
+              return;
+            }
+            this.state = await r.json();
+            this.hydrateFormFromState();
+            this.notify(`template inbound #${tid} selected`);
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // POST /api/wizard/clone — SSE stream
+        async runClone() {
+          this.busy = true;
+          this.clone = { progress: 0, lines: [] };
+          try {
+            const r = await fetch("/api/wizard/clone", {
+              method: "POST", credentials: "same-origin",
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (!r.ok || !r.body) {
+              const detail = (await this._safeJson(r)).detail || r.status;
+              this.notify(`clone step failed: ${detail}`, "err");
+              return;
+            }
+            await this._drainSSE(r, this.clone, "clone");
+            // Final summary flips wizard_completed=True server-side.
+            await this.refreshState();
+            if (this.state.is_completed || this.state.current_step === "done") {
+              this.notify("wizard complete — redirecting to dashboard…", "ok");
+              setTimeout(() => this.goToDashboard(), 1500);
+            }
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        // ── Generic SSE drainer ──────────────────────────────────
+        // Reads the StreamingResponse body in chunks, splits on the
+        // "data: {...}\n\n" record separator, JSON-parses each record,
+        // appends a colour-coded line to <sink>.lines and updates
+        // <sink>.progress. Final record has country="*" status="done".
+        async _drainSSE(resp, sink, stepLabel) {
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buf = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf("\n\n")) >= 0) {
+              const chunk = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              this._handleSSEChunk(chunk, sink, stepLabel);
+            }
+          }
+          if (buf.trim()) this._handleSSEChunk(buf, sink, stepLabel);
+        },
+
+        _handleSSEChunk(chunk, sink, stepLabel) {
+          // SSE record shape: "data: <json>"
+          for (const lineRaw of chunk.split("\n")) {
+            const line = lineRaw.trim();
+            if (!line.startsWith("data:")) continue;
+            let ev;
+            try { ev = JSON.parse(line.slice("data:".length).trim()); }
+            catch (e) { continue; }
+            const status = ev.status || "";
+            const country = ev.country || "?";
+            const msg = ev.message || "";
+            const prog = Number.isFinite(ev.progress) ? ev.progress : 0;
+            const cls = status === "done"      ? "ev-done"
+                      : status === "healthy"   ? "ev-healthy"
+                      : status === "cloned"    ? "ev-cloned"
+                      : status === "failed"    ? "ev-failed"
+                      : status === "unhealthy" ? "ev-unhealthy"
+                      : status === "working"   ? "ev-work"
+                      : "";
+            const prefix = country === "*"
+              ? `[${stepLabel}/summary] `
+              : `[${stepLabel}/${country}] `;
+            this._pushLog(sink, `${prefix}${status} — ${msg} (${prog}%)`, cls);
+            if (prog > sink.progress) sink.progress = prog;
+          }
+        },
+
+        _pushLog(sink, text, cls) {
+          sink.lines.push({ id: ++this._logSeq, text: text + "\n", cls: cls || "" });
+          // Cap at last 500 lines to bound DOM size for very long country lists.
+          if (sink.lines.length > 500) sink.lines.shift();
+        },
+
+        // ── Misc ─────────────────────────────────────────────────
+        async back(body) {
+          // Hotfix #4 (Bug #7): actual backward navigation. The server's new
+          // POST /api/wizard/back endpoint flips wizard.current_step to an
+          // earlier safe step (it returns the same snapshot shape as
+          // GET /api/wizard). Refuses terminal steps (clone/done — their
+          // per-country tunnels/clone-records must be torn down via the
+          // dashboard first) and refuses to back THROUGH 'apply' (which
+          // created PortAssignment rows with socks_port PRIMARY KEY + on-disk
+          // configs + running units — re-running apply would conflict and
+          // leave stale units behind). On 409 we surface the server's detail
+          // message as a toast so the operator knows exactly why it refused.
+          this.busy = true;
+          try {
+            const payload = body || {};
+            const r = await fetch("/api/wizard/back", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { ...(await this._csrfHeaders()), "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            if (r.status === 401) { this.redirectLogin(); return; }
+            if (r.status === 409) {
+              const err = await this._safeJson(r);
+              this.notify(err.detail || "cannot step back from this step", "warn");
+              return;
+            }
+            if (!r.ok) {
+              const err = await this._safeJson(r);
+              throw new Error(`POST /api/wizard/back → ${r.status}: ${err.detail || ""}`);
+            }
+            // Server moved wizard.current_step back; refreshState() re-reads
+            // the snapshot, rehydrates form fields from any previously-stored
+            // step_data, and the SPA re-renders the matching step article.
+            await this.refreshState();
+          } catch (e) { this.notify(`network error: ${e.message}`, "err"); }
+          finally { this.busy = false; }
+        },
+
+        goToDashboard() { window.location.href = "/dashboard"; },
+        redirectLogin() { window.location.href = "/login"; },
+
+        logout() {
+          // FIRE-AND-FORGET logout — Hotfix #6 (Bug #5v3). The operator
+          // reported "clicking Logout does nothing — the URL does not
+          // change at all". Previous-handler root cause: the handler was
+          // `async` and `await`ed `fetch("/auth/logout", {keepalive:true})`
+          // BEFORE calling `window.location.replace()`. If the fetch
+          // promise neither resolves nor rejects (a hung XHR — e.g. an
+          // intermediate reverse proxy that ate the 204 without closing the
+          // connection, or the operator's browser kept a PRE-Hotfix-#5
+          // cached /wizard whose `logout()` was the unhardened Hotfix-#3
+          // body that re-threw inside Alpine's @click.prevent wrapper),
+          // the `await` blocks FOREVER and `window.location.replace()` is
+          // never reached → the operator perceives "logout does nothing".
+          //
+          // The fix: don't `await` the fetch. Dispatch it as a
+          // keepalive background request, then IMMEDIATELY navigate away
+          // synchronously (`window.location.replace(...)`). The browser
+          // will still send the keepalive POST during the navigation
+          // even though we don't wait for the response — that's exactly
+          // what `keepalive: true` is for (MDN: "the request will be
+          // completed even if the page that initiated it is unloaded
+          // mid-flight"). The synchronous navigation GUARANTEES the
+          // operator sees the URL change the instant they click — no
+          // path through this function reaches the navigation line
+          // before its predecessors resolve; the navigation is the first
+          // and only line after the dispatch.
+          //
+          // Hotfix #5's "?ts=Date.now()" cache-bust suffix on /login is
+          // preserved so the operator always sees a FRESH login SPA (the
+          // panel's /login FileResponse now sets Cache-Control: no-store
+          // in panel.main.py to back this up). Hotfix #3's clear_session_cookie
+          // + clear_csrf_cookie attribute parity means the server's
+          // Set-Cookie delete reply emanating from the keepalive POST
+          // actually clears the operator's jar entries.
+          try {
+            // Fire the cookie-clear POST. `keepalive:true` lets the request
+            // complete even though we are about to navigate away before its
+            // response arrives. NO `await` — the navigation line below runs
+            // SYNCHRONOUSLY immediately after this dispatch, before the
+            // request even reaches the network in many cases.
+            void fetch("/auth/logout", { method: "POST", keepalive: true });
+          } catch (_) { /* cannot happen — fetch is async; sync throw is a TypeError which .replace will out-race */ }
+          // .replace() (not .href=) so the back button doesn't bring the
+          // operator BACK into the wizard after logout. Forces a full reload
+          // so /login's probeSession() re-evaluates from a blank slate. The
+          // "?ts=..." cache-bust suffix defeats browser-side HTML caching
+          // of /login (combine with the Cache-Control: no-store header set
+          // on the /login FileResponse in panel.main.py per Hotfix #5).
+          window.location.replace("/login?ts=" + Date.now());
+        },
+
+        async _safeJson(r) {
+          try { return await r.json(); } catch (e) { return {}; }
+        },
+
+        notify(text, kind = "ok") {
+          this.toast = { text, kind };
+          setTimeout(() => this.toast = { text: "", kind: "ok" }, 4500);
+        },
+      };
+    }
+  </script>
+</body>
+</html>

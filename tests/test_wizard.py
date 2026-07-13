@@ -461,3 +461,181 @@ def test_ports_endpoint_unauthenticated_returns_401(tmp_path, monkeypatch):
         },
     )
     assert r.status_code == 401, r.text
+
+
+# ===========================================================================
+# Hotfix #4 (Bug #7) — POST /api/wizard/back
+#
+# The wizard is forward-only by design (each step's POST handler runs
+# _require_step to reject 409 on out-of-order jumps). Bug #7 surfaced that
+# the SPA drew a back button on every step but backed it with a no-op stub
+# toasting a confusing "the wizard is forward-only…" message. Hotfix #4 adds
+# a real backward-navigation endpoint with a constrained safety contract:
+#
+#   * terminal steps (clone/done) refuse 409 — their per-country side
+#     effects require the dashboard's per-country delete flow to undo;
+#   * backing *through* the apply step refuses 409 — apply created
+#     PortAssignment rows (socks_port PRIMARY KEY) + systemd units + tunnel
+#     configs that the dashboard's teardown must undo before a re-run is safe;
+#   * an empty/absent target jumps to the immediately-preceding step;
+#   * an explicit target must be strictly earlier than the current step;
+#   * stored step_data is preserved so the SPA re-renders the form pre-filled.
+#
+# The cases below were distilled from the operator's report (back button "does
+# not work") and exercise the backend's safety contract directly.
+# ===========================================================================
+_SEED_STEP_DATA = {
+    "countries": {"mode": "specific", "codes": ["US", "DE"]},
+    "ports": {
+        "socks": {"start": 11000, "end": 11009},
+        "public": {"start": 12000, "end": 12009},
+        "assignment": "one_per_country",
+    },
+    "xui_creds": {"base_url": "http://localhost:2053/panel/"},
+    "template": {"template_inbound_id": 42},
+}
+
+
+def _set_wizard_step(step: str) -> None:
+    """Force-set the singleton Wizard row's current_step + seed step_data via
+    a direct DB write.
+
+    Used by the Hotfix #4 back-endpoint tests because submit_back reads
+    wizard.current_step directly — we can't pre-set it through the public
+    POST handlers (each one advances the step *forward*, never back). The
+    persisted step_data is also asserted by test_back_preserves_stored_
+    step_data — without it the back endpoint returns an empty snapshot. We
+    ALWAYS set step_data here, regardless of whether the row pre-existed.
+    """
+    import json
+
+    from sqlalchemy.orm import Session
+
+    from panel.db import get_engine, init_db
+    from panel.models import Wizard
+
+    payload = json.dumps(_SEED_STEP_DATA)
+    init_db()
+    with Session(get_engine()) as s:
+        w = s.get(Wizard, {"id": 1})
+        if w is None:
+            w = Wizard(id=1, current_step=step, step_data=payload)
+            s.add(w)
+        else:
+            w.current_step = step
+            w.step_data = payload
+        s.commit()
+
+
+def test_back_unauthenticated_returns_401(tmp_path, monkeypatch):
+    client = _client(monkeypatch, tmp_path)
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 401, r.text
+
+
+def test_back_default_target_jumps_to_preceding_step(tmp_path, monkeypatch):
+    """No target in body → server picks the step immediately before current."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("xui_detect")  # Apply already done → only safe zone back.
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # xui_detect (idx 3) → previous is apply (idx 2).
+    assert body["current_step"] == "apply", body
+    assert body["step_index"] == 2
+
+
+def test_back_explicit_target_skips_directly_to_it(tmp_path, monkeypatch):
+    """An explicit earlier target label jumps straight to it (skips over)."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("template")  # idx 5
+    r = client.post("/api/wizard/back", json={"target": "xui_detect"})  # idx 3
+    assert r.status_code == 200, r.text
+    assert r.json()["current_step"] == "xui_detect"
+
+
+def test_back_preserves_stored_step_data(tmp_path, monkeypatch):
+    """Backing must not wipe step_data — the SPA re-renders the form pre-filled."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("xui_creds")
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 200, r.text
+    payload = r.json()["step_data"]
+    assert payload.get("countries", {}).get("codes") == ["US", "DE"]
+    assert payload.get("ports", {}).get("assignment") == "one_per_country"
+
+
+def test_back_from_terminal_clone_refuses_409(tmp_path, monkeypatch):
+    """Backing out of clone (already cloned inbounds) → 409 with a dashboard hint."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("clone")
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"].lower()
+    assert "terminal" in detail or "clone" in detail
+    assert "dashboard" in detail
+
+
+def test_back_from_terminal_done_refuses_409(tmp_path, monkeypatch):
+    """Backing out of done (wizard_completed flipped) → 409."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("done")
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 409, r.text
+
+
+def test_back_target_equal_to_current_refuses_409(tmp_path, monkeypatch):
+    """Target may not equal the current step."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("template")
+    r = client.post("/api/wizard/back", json={"target": "template"})
+    assert r.status_code == 409, r.text
+
+
+def test_back_target_after_current_refuses_409(tmp_path, monkeypatch):
+    """Target must be strictly earlier — a later target is rejected."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("ports")
+    r = client.post("/api/wizard/back", json={"target": "apply"})
+    assert r.status_code == 409, r.text
+
+
+def test_back_unknown_target_returns_422(tmp_path, monkeypatch):
+    """An unrecognised target label surfaces as 422 (payload validation)."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("template")
+    r = client.post("/api/wizard/back", json={"target": "nonesuch"})
+    assert r.status_code == 422, r.text
+
+
+def test_back_from_countries_returns_409_already_first(tmp_path, monkeypatch):
+    """The first step has nothing to step back to — explicit or default."""
+    client = _authed_client(monkeypatch, tmp_path)
+    r = client.post("/api/wizard/back", json={})
+    assert r.status_code == 409, r.text
+
+
+def test_back_through_apply_refuses_409(tmp_path, monkeypatch):
+    """Apply created PortAssignment rows (socks_port PRIMARY KEY) + units +
+    configs; backing past apply to countries/ports would imply a re-run that
+    hits the socks_port uniqueness conflict unless the dashboard tears them
+    down first."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("xui_detect")  # past apply
+    r = client.post("/api/wizard/back", json={"target": "countries"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"].lower()
+    assert "apply" in detail
+    assert "dashboard" in detail or "teardown" in detail
+
+
+def test_back_to_apply_is_allowed(tmp_path, monkeypatch):
+    """Landing ON the apply step (target == apply) is permitted — re-running
+    apply is gated by its own _require_step + the apply handler hitting the
+    PortAssignment uniqueness conflict if rows already exist, not by the
+    back endpoint."""
+    client = _authed_client(monkeypatch, tmp_path)
+    _set_wizard_step("xui_detect")
+    r = client.post("/api/wizard/back", json={"target": "apply"})
+    assert r.status_code == 200, r.text
+    assert r.json()["current_step"] == "apply"

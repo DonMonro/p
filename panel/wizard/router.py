@@ -132,6 +132,23 @@ class PortsBody(BaseModel):
         return v
 
 
+class BackBody(BaseModel):
+    """``POST /api/wizard/back`` body — Hotfix #4 (Bug #7).
+
+    Omitting ``target`` (or passing ``None``) jumps back to the immediately
+    preceding step. Passing an explicit earlier step label skips directly to
+    it. Both forms are gated by the rules in :func:`submit_back`:
+    terminal steps (``clone``/``done``) refuse, and backing THROUGH ``apply``
+    refuses because apply created per-country PortAssignment rows (with
+    ``socks_port`` as a PRIMARY KEY) + systemd units + tunnel configs that
+    can only be torn down via the dashboard's per-country delete flow.
+    """
+
+    target: str | None = Field(
+        default=None, description="Optional earlier step label to jump back to"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -383,6 +400,128 @@ def wizard_state_row(row: Wizard) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# POST /back — Hotfix #4 (Bug #7): explicit backward-navigation endpoint.
+#
+# The wizard is forward-only by design — step handlers refuse out-of-order
+# input via _require_step so step_data stays internally consistent. Earlier
+# this meant the operator could not re-edit a previously-submitted step from
+# the SPA — the only escape hatch was to start over (re-seed the panel.db
+# Wizard row). Bug #7 surfaced that UX: the SPA drew a back button on every
+# step but backed it with a no-op stub that toasted a confusing "the wizard
+# is forward-only…" message.
+#
+# This endpoint is the constrained escape hatch. It allows jumps back to
+# any step strictly before the apply step is reached, OR jumps that stay
+# within the post-apply, pre-terminal run (template/xui_creds/xui_detect
+# back-and-forth is harmless). The two hard refusals are:
+#
+#   (1) the *terminal* steps — `clone` (already producing cloned inbounds)
+#       and `done` (wizard_completed flipped) — refuse 409 because their
+#       side effects already exist; rolling them back requires the
+#       dashboard's per-country teardown (delete_country stops the unit +
+#       deletes the CloneRecord + PortAssignment + Country rows) — not a
+#       wizard concern.
+#
+#   (2) backing *through* the apply step (i.e. current step already passed
+#       apply, but the operator wants to step into countries/ports) —
+#       refuse 409 because apply is the source of `PortAssignment` rows
+#       (socks_port is a PRIMARY KEY — see panel/models.py:65-73) plus
+#       the on-disk psiphon config.json + the running systemd unit. Going
+#       back to ports/countries implies re-running apply, which would hit
+#       the uniqueness conflict on the per-country socks_port + leave stale
+#       units behind. Re-running from countries requires teardown first.
+#
+# Permitted backward jumps just flip `wizard.current_step`. Already-stored
+# step_data for the new current step is preserved — the SPA re-renders the
+# form pre-filled from the snapshot returned here so the operator edits
+# incrementally without losing prior input. Re-submitting that step's POST
+# (e.g. POST /api/wizard/countries) re-runs its validator and overwrites
+# the stored payload in place.
+# ---------------------------------------------------------------------------
+@router.post("/back", status_code=status.HTTP_200_OK)
+def submit_back(
+    body: BackBody,
+    user: Annotated[dict, Depends(get_current_user)],
+    db: Session = Depends(get_db),  # noqa: B008  FastAPI idiom
+) -> dict:
+    """Jump backward within the wizard's safe-zone.
+
+    Returns the updated wizard-state snapshot (same shape as ``GET /api/wizard``)
+    on success, or 409 with a structured ``detail`` message explaining why the
+    requested jump is forbidden.
+    """
+    row = _get_wizard_row(db)
+    current = _current_step(row)
+
+    # (1) terminal steps (clone/done) — side effects only undoable via dashboard.
+    if current in (WizardStep.CLONE, WizardStep.DONE):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"cannot step back from terminal step '{current.value}' — "
+                "per-country tunnels/clone-records must be torn down via the "
+                "dashboard (delete a country or use Reapply) before re-running "
+                "the wizard"
+            ),
+        )
+
+    # Resolve target: explicit label, else the immediately-preceding step.
+    if body.target is None:
+        idx = step_index(current)
+        if idx == 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="already on the first step — nothing to step back to",
+            )
+        target = STEPS[idx - 1]
+    else:
+        try:
+            target = normalize_step(body.target)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+
+    target_idx = step_index(target)
+    current_idx = step_index(current)
+
+    # target must be strictly earlier than current.
+    if target_idx >= current_idx:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"target step '{target.value}' is not earlier than the "
+                f"current step '{current.value}' — back may only navigate "
+                "to a step strictly before the current one"
+            ),
+        )
+
+    # (2) refuse to back THROUGH apply — apply created PortAssignment rows
+    # (socks_port PRIMARY KEY) + systemd units + tunnel configs that the
+    # dashboard's per-country teardown must undo before a re-run is safe.
+    apply_idx = step_index(WizardStep.APPLY)
+    if target_idx < apply_idx < current_idx:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "cannot back through 'apply' — apply created per-country "
+                "PortAssignment rows (socks_port PRIMARY KEY) + tunnel "
+                "configs + systemd units; tearing them down requires the "
+                "dashboard's per-country Delete flow. Re-running the wizard "
+                "from countries/ports would hit a uniqueness conflict on "
+                "socks_port"
+            ),
+        )
+
+    row.current_step = target.value
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return wizard_state_row(row)
+
+
 # ===========================================================================
 # Phase 4 wizard handlers (steps 3–6: apply, xui-creds, inbounds, clone-template)
 #
@@ -459,15 +598,61 @@ def _sse(event: dict[str, Any]) -> str:
 
 
 async def _async_get_xui_client(db: Session) -> XuiClient | None:
-    """Return a logged-out :class:`XuiClient` backed by the cached XuiLink,
-    or ``None`` if no cached creds exist. Caller must ``aclose()`` it."""
+    """Build a *logged-in* :class:`XuiClient` from the cached XuiLink row.
+
+    Mirrors ``panel.dashboard.router._async_get_xui_client``: read the cached
+    XuiLink, decrypt the password, construct a XuiClient, then AWAIT
+    ``client.login()`` before returning so every caller (``GET /inbounds`` at
+    step *template*, ``POST /clone`` at step *clone*) gets a client whose
+    ``/3x-ui`` session cookie + CSRF token are already populated and ready to
+    hit ``{base}panel/api/inbounds/...``. Caller must ``aclose()`` it.
+
+    Hotfix #6 (Bug #8): the previous version of this helper returned the
+    FRESH ``XuiClient`` WITHOUT calling ``client.login()`` — the cached 3x-ui
+    session lived only inside the closed ``XuiClient`` instance used by
+    ``POST /xui-creds`` to verify the operator's credentials at step 5 (that
+    client's ``aclose()`` dropped the session). Then ``GET /inbounds`` at
+    step *template* would call ``client.list_inbound_summaries()`` on the
+    un-authed client → no ``3x-ui`` session cookie + ``self._csrf is None``
+    → the ``X-CSRF-Token`` header wasn't sent → 3x-ui's ``/panel/api/...``
+    middleware returned HTTP 404 (its SPA 404 fallback for unauthed API
+    routes — a 404 rather than a 401 because the path segment behind the
+    secret ``webBasePath`` is hidden from un-authed callers). The operator
+    reported this as ``3x-ui list_inbounds failed: list_inbounds: HTTP
+    404:`` at wizard step 6.
+
+    Returning ``None`` on any login failure (no cached creds, decryption
+    failure, ``XuiClientError`` from login, or any other exception) lets the
+    public callers surface a clean 409 ``"no 3x-ui credentials stored —
+    POST /api/wizard/xui-creds first to cache 3x-ui credentials"`` (the
+    pattern they already had) instead of a confusing 502 mid-list-flow. If
+    the operator's creds have gone stale (3x-ui restart, password rotate,
+    csrf-key rotation) the wizard's next visit to /inbounds will see the
+    None return and the operator will be prompted to re-enter creds at
+    step 5.
+    """
     link = db.get(XuiLink, {"id": 1})
     if link is None:
         return None
-    creds = decrypt_creds(link.password_enc)
-    if creds is None:
+    creds = decrypt_creds(link.password_enc) if link.password_enc else None
+    password = creds.get("password") if creds else None
+    if not password:
         return None
-    return XuiClient(link.base_url, link.username, creds.get("password", ""))
+    client = XuiClient(
+        base_url=link.base_url,
+        username=link.username,
+        password=password,
+    )
+    try:
+        await client.login()
+    except Exception:  # noqa: BLE001  any login failure → stale creds → None
+        # Stale credentials (3x-ui rotated the password / restarted /
+        # rotated its CSRF signing key) — disclose nothing to the caller,
+        # return None so the public endpoint surfaces the 409 "no creds"
+        # message and the operator is re-routed to step 5 to re-enter them.
+        await client.aclose()
+        return None
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +740,19 @@ async def submit_apply(
             event = apply_country(spec)
             events.append(event)
             yield _sse(event.as_dict())
+
+            # Hotfix #9 (Bug #3): auto-enable on a healthy apply. The dashboard
+            # grid reads Country.enabled to render the per-country toggle checkbox;
+            # under Hotfix #8 it stayed False after apply (the model default),
+            # so the operator saw rows whose tunnels were actually running but
+            # whose checkbox was unchecked — and the first dashboard Enable click
+            # then re-fired start_unit, surfacing Bug #2. A country whose tunnel
+            # just came up healthy must be marked enabled here.
+            if event.status == "healthy":
+                country_row = db.get(Country, spec.country_code)
+                if country_row is not None and not country_row.enabled:
+                    country_row.enabled = True
+                    db.add(country_row)
 
         # Advance the wizard to xui_detect.
         row.current_step = WizardStep.XUI_DETECT.value

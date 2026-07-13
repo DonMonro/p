@@ -97,7 +97,10 @@ def make_clone_payload(
             "totalGB": 0,
             "expiryTime": 0,
             "enable": True,
-            "tgId": "",
+            # Hotfix #7 (Bug #9): tgId is int64 in newer 3x-ui Go schema,
+            # NOT string — "" was rejected with: "cannot unmarshal string
+            # into Go struct field Client.tgId of type int64".
+            "tgId": 0,
             "subId": str(uuid.uuid4()),
             "reset": 0,
         }

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -288,35 +288,110 @@ if _ASSETS_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=_ASSETS_DIR), name="assets")
 
 
+@app.get("/", include_in_schema=False)
+def root_redirect() -> RedirectResponse:
+    """Send the bare panel URL to the login form.
+
+    Without an explicit ``GET /`` handler FastAPI serves its default JSON
+    info object (``{"name": "Psiphon-3X-UI", "version": "1.0.0", "docs":
+    "/docs"}``), which is confusing for an operator opening the panel URL in
+    a browser. Redirect instead — ``/login`` itself probes ``GET /api/me``
+    on load and jumps straight to ``/dashboard`` if a valid session cookie
+    is already present, so a logged-in user sees no intermediate hop.
+    """
+    return RedirectResponse(url="/login", status_code=status.HTTP_302_FOUND)
+
+
 @app.get("/dashboard", include_in_schema=False)
 def dashboard_html():
     """Serve the management-dashboard SPA shell after the wizard has completed.
 
     The page is a single self-contained HTML file with Alpine.js + Pico.css
     pulled from CDN; it calls ``/api/dashboard/*`` for state. The router-level
-    gate isn't repeated here because the SPA itself renders nothing until
-    ``GET /api/dashboard/countries`` 200s (and a 409 surfaces a redirect to
-    ``/wizard``).
+    gate isn't repeated here because the SPA itself redirects to ``/wizard``
+    when ``GET /api/dashboard/countries`` returns 409 (wizard not completed)
+    rather than rendering its dashboard chrome.
     """
     from fastapi.responses import FileResponse
 
-    return FileResponse(STATIC_DIR / "dashboard.html", media_type="text/html")
+    # Hotfix #5 (Bug #5v2): Cache-Control: no-store so the browser always
+    # fetches a fresh dashboard.html from the panel after a wheel reinstall.
+    # Before this change, Starlette's FileResponse set NO Cache-Control,
+    # letting browsers default-cache the SPA HTML via the Last-Modified
+    # heuristic — an operator reinstalling the wheel after Hotfix #4 kept
+    # their OLD dashboard.html (with the pre-Hotfix-#4 unhardened logout)
+    # served from disk cache, so clicking "Logout" ran the old handler →
+    # fetch abort swallowed the navigation → "logout does nothing".
+    return FileResponse(
+        STATIC_DIR / "dashboard.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-@app.get("/login", include_in_schema=False)
-def login_html():
-    """Convenience route for the login SPA shell (placeholder for Phase 7)."""
+@app.get("/wizard", include_in_schema=False)
+def wizard_html():
+    """Serve the first-run setup wizard SPA shell.
+
+    The page is a self-contained Alpine.js + Pico.css SPA that drives every
+    ``POST /api/wizard/<step>`` endpoint (countries → ports → apply →
+    xui-detect → xui-creds → inbounds → template → clone). On terminal
+    success the ``POST /api/wizard/clone`` SSE handler flips
+    ``Settings.wizard_completed`` to True and the wizard SPA redirects the
+    operator to ``/dashboard``.
+
+    This route is intentionally *not* gated by ``_require_wizard_completed`` —
+    the whole point of the wizard is to BE the route an operator uses before
+    ``wizard_completed=True``. ``login.html`` probes ``GET /api/me`` after a
+    successful login and redirects here when ``wizard_completed == false``,
+    and ``dashboard.html`` redirects here on a 409 from
+    ``GET /api/dashboard/countries``.
+    """
     from fastapi.responses import FileResponse
 
-    candidate = STATIC_DIR / "login.html"
+    candidate = STATIC_DIR / "wizard.html"
     if candidate.is_file():
-        return FileResponse(candidate, media_type="text/html")
+        # Hotfix #5 (Bug #5v2): no-store so the wizard SPA is re-fetched after
+        # any wheel reinstall; see dashboard_html() for the rationale.
+        return FileResponse(
+            candidate,
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+    # Should never happen — ``panel/static/wizard.html`` ships in the wheel
+    # (see ``[tool.setuptools.package-data]`` in pyproject.toml) — but fall
+    # back to a JSON hint rather than crash if the asset is missing.
     return JSONResponse(
-        {"detail": "login SPA shell not bundled yet — POST /auth/login directly"},
+        {"detail": "wizard SPA shell not bundled — POST /api/wizard/* directly"},
         status_code=404,
     )
 
 
-@app.get("/", include_in_schema=False)
-def _root():
-    return JSONResponse({"name": app.title, "version": app.version, "docs": "/docs"})
+@app.get("/login", include_in_schema=False)
+def login_html():
+    """Serve the bundled login SPA shell.
+
+    The page is a self-contained Alpine.js + Pico.css form (no build step)
+    that ``POST``s JSON to ``/auth/login`` and redirects to ``/dashboard``
+    on a 204. It also probes ``GET /api/me`` on load and jumps straight to
+    ``/dashboard`` if a valid session cookie is already present, so a
+    logged-in operator hitting ``/login`` directly sees no intermediate hop.
+    """
+    from fastapi.responses import FileResponse
+
+    candidate = STATIC_DIR / "login.html"
+    if candidate.is_file():
+        # Hotfix #5 (Bug #5v2): no-store so the login SPA is re-fetched
+        # after any wheel reinstall (logout's "?ts=..." cache-bust + no-store
+        # here together guarantee the operator sees the current logout flow).
+        return FileResponse(
+            candidate,
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+    # Should never happen — ``panel/static/login.html`` ships in the wheel —
+    # but fall back to a JSON hint rather than crash if the asset is missing.
+    return JSONResponse(
+        {"detail": "login SPA shell not bundled — POST /auth/login directly"},
+        status_code=404,
+    )

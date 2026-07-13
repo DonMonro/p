@@ -57,6 +57,95 @@ Then re-run `sudo bash /path/to/install.sh` (idempotent — it will rebuild).
   `systemctl status psiphon-tunnel@<CODE>.service` and
   `journalctl -u psiphon-tunnel@<CODE> -n 200`.
 
+## Psiphon Inc. upstream credentials required (Hotfix #14)
+
+The four Psiphon-Inc-issued upstream credentials the per-country tunnel units
+authenticate with are **NOT** shipped in this repo — they are commercial
+secrets Psiphon Inc. embeds only inside its own first-party client binaries.
+The hardcoded stub constants the panel was shipping through Hotfix #13
+(`PropagationChannelId = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"`,
+`SponsorId = "0000000000000000"`,
+`RemoteServerListSignaturePublicKey` = a 64-hex placeholder) all pass the
+psiphon-tunnel-core `Config.Commit` `"== \"\"` check but **fail downstream at
+remote server-list signature verification**, with the binary's only outward
+symptom being:
+
+```
+noticeType=AvailableEgressRegions  data={"regions":[]}
+noticeType=NetworkID              data={"ID":"UNKNOWN"}
+…5 minutes later…
+noticeType=EstablishTunnelTimeout  data={"timeout":"5m0s","Tunnels":0}  → Exiting
+```
+
+The SOCKS5 listener DOES bind on `127.0.0.1:<socks_port>`, but no upstream
+servers can be negotiated, so a panel/internal `health_probe` against it
+ultimately returns ConnectionRefused / no-acceptable-methods, and the unit
+restarts in a 5-minute deathloop.
+
+Hotfix #14 pivots the four credentials to **operator-supplied env-var
+overrides** that you must place in `/opt/psiphon-3x-ui/panel.env`. The
+panel's [`panel.psiphon.render_config`](../panel/psiphon/__init__.py)
+**fast-fails with an actionable error** instead of letting the per-country
+unit enter that 5-minute deathloop:
+
+> `STUB credential detected for <Field> — env var PSIPHON_<…> <reason>. Set
+> PSIPHON_<…> in /opt/psiphon-3x-ui/panel.env (then `systemctl restart
+> psiphon-3x-ui`) with your real Psiphon-Inc-issued value.`
+
+### Where to obtain the credentials
+
+Psiphon Inc. does **not** publish these values in its open-source repos.
+Reach out to Psiphon Inc. via <https://psiphon.ca/contact.html> for a
+licensing/sponsor relationship — they will issue you:
+
+| Env var (panel.env)                                | JSON field in `<CODE>.json`             | Format note |
+| -------------------------------------------------- | --------------------------------------- | ----------- |
+| `PSIPHON_PROPAGATION_CHANNEL_ID`                   | `PropagationChannelId`                  | 32 hex chars (uppercase; NOT all-`F`'s) |
+| `PSIPHON_SPONSOR_ID`                               | `SponsorId`                             | 16 hex chars (NOT all-`0`'s) |
+| `PSIPHON_REMOTE_SERVER_LIST_URL`                   | `RemoteServerListUrl`                   | must start with `https://` (or `http://`) |
+| `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`  | `RemoteServerListSignaturePublicKey`   | **base64-encoded ed25519 public key** — ~44 chars matching `[A-Za-z0-9+/]{42,}={0,2}` (NOT a bare 64-hex string!) |
+
+### How to set them
+
+The installer's interactive prompt surveys the operator for all four on a
+TTY (see [`installer/prompt.sh`](../installer/prompt.sh)
+`_prompt_psiphon_credentials`); the installer writes them into
+`panel.env` (see [`installer/panel_install.sh`](../installer/panel_install.sh)).
+On a non-interactive (piped) install the prompt is skipped — you must
+instead edit `panel.env` by hand and restart the panel:
+
+```bash
+sudo vi /opt/psiphon-3x-ui/panel.env
+#  append:
+#    PSIPHON_PROPAGATION_CHANNEL_ID="<your 32-hex value>"
+#    PSIPHON_SPONSOR_ID="<your 16-hex value>"
+#    PSIPHON_REMOTE_SERVER_LIST_URL="<https://…>"
+#    PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY="<base64 ed25519 pubkey>"
+sudo systemctl restart psiphon-3x-ui
+```
+
+Then either re-run the wizard apply step (`POST /api/wizard/apply`) or reach
+for the inline-enable button on the dashboard — the first
+`render_config(...)` call after restart will validate all four and
+fast-fail with the actionable message if any are still placeholder-shaped
+(empty / `"..."` literal / all-`F`'s / all-`0`'s / non-base64 pubkey /
+non-`http(s)://` URL).
+
+### Confirming the panel reads them
+
+There's no need to peek at the on-disk config JSON — the panel's
+[`render_config`](../panel/psiphon/__init__.py) raises
+`PsiphonCredentialError` if any value looks like a placeholder, **before**
+any config file is written. So this one-liner is a complete credential
+sanity check after editing `panel.env`:
+
+```bash
+${VENV_DIR:-/opt/psiphon-3x-ui/venv}/bin/python -c \
+  "from panel.psiphon import render_config; print(render_config('US', 1080).keys())"
+# prints dict_keys([... 7 keys ...])  → all four creds are real
+# raises PsiphonCredentialError(...)   → a stub value is still in panel.env
+```
+
 ## Per-country Psiphon tunnels (`psiphon-tunnel@<CODE>.service`)
 
 The Phase 4 apply step starts one systemd instantiated unit per country
@@ -72,7 +161,7 @@ separate). The unit template lives at
 | `systemctl status psiphon-tunnel@US` shows `failed` (no journal) | config file missing — wizard apply step was killed mid-way or `config_dir` was wiped | `journalctl -u psiphon-tunnel@US -n 200 --no-pager`; faster-than-allows fix: re-run the wizard apply step (SSE stream is idempotent for already-applied rows). Unit screams `ERROR: … .json: no such file or directory` if the file is missing. |
 | Unit starts but exits with `Status=1/FAILURE` and `bind on address ('127.0.0.1', 11002): address already in use` | a stale `ConsoleClient` process from a previous unit instance is still holding the SOCKS5 port (commonly happens after the apply step dies midway and the unit restarts before the old port is released) | `sudo ss -tlnp | grep :11002` (or use the configured `<socks_port>`); `sudo kill -9 <PID>`; `sudo systemctl reset-failed psiphon-tunnel@US`; `sudo systemctl restart psiphon-tunnel@US`. See [`panel/psiphon/__init__.py`](../panel/psiphon/__init__.py) `start_unit` for the open+connect health-probe pattern. |
 | Unit is `active (running)` but SOCKS5 handshakes time out (`failed@75` in the SSE stream) | Psiphon tunnel-core hasn't yet dialled upstream; the `CONNECTION_WORKING_TIMEOUT`-second probe expires before the proxy answers | check `journalctl -u psiphon-tunnel@US -n 200`; if the unit logs "Connected" but the probe still fails, the panel-internal `health_probe` might be pointed at the wrong port — verify `/opt/psiphon-3x-ui/config/US.json` `LocalSocksProxyPort` matches the `PortAssignment.socks_port` row in `panel.db`. |
-| Unit logs `Unknown EgressRegion "xx"` and exits | country code in the config filename doesn't match a `config/countries.yaml` entry, or the wizard wrote the lowercase variant of a code that isn't uppercased in `render_config` (the renderer calls `.upper()`, but a hand-edited `US.json` won't be rewritten) | re-run the wizard apply step or open `/opt/psiphon-3x-ui/config/<CODE>.json` and check `PropagationChannelId` + `SponsorId` are present, `EgressRegion` is uppercase 2-letter, and `RemoteServerListURLs` matches [`panel.psiphon.PSIPHON_REMOTE_SERVER_LIST_URLS`](../panel/psiphon/__init__.py). |
+| Unit logs `Unknown EgressRegion "xx"` and exits | country code in the config filename doesn't match a `config/countries.yaml` entry, or the wizard wrote the lowercase variant of a code that isn't uppercased in `render_config` (the renderer calls `.upper()`, but a hand-edited `US.json` won't be rewritten) | re-run the wizard apply step or open `/opt/psiphon-3x-ui/config/<CODE>.json` and check `PropagationChannelId` + `SponsorId` are present, `EgressRegion` is uppercase 2-letter, and `RemoteServerListUrl` matches `PSIPHON_REMOTE_SERVER_LIST_URL` in `panel.env` (see [Psiphon Inc. upstream credentials required](#psiphon-inc-upstream-credentials-required-hotfix-14) above). |
 | `systemctl start psiphon-tunnel@XX` returns `Failed to start … Unit name does not match template` | `psiphon-tunnel@.service` was installed wrong (operator copied the file but didn't `systemctl daemon-reload`) | `sudo systemctl daemon-reload` then retry. Also confirm the template file mode is `0644` and lives under `/etc/systemd/system/` (not `/lib/systemd/system/`). |
 | `systemctl status psiphon-tunnel@US` reports `(dead)` but `is_active` returned True during apply step | apply step spins up the unit then probes SOCKS5; if the unit dropped to `dead` between the start + probe calls (e.g. bogus `ExecStart=`), `is_unit_active` returns True from a cached `systemctl` invocation but the next call sees `dead`. The wizard replay handler now tolerates this — verify nothing else on the box is starting/stopping `psiphon-tunnel@*` outside the panel | `journalctl -u psiphon-tunnel@US -n 200` to see the actual exit reason; `systemd-analyze verify psiphon-tunnel@.service` to template-validate the unit file. |
 

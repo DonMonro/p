@@ -92,6 +92,52 @@ def test_countries_endpoint_count_matches_yaml(tmp_path, monkeypatch):
     assert body["count"] == len(raw["countries"])
 
 
+def test_wizard_html_endpoint_serves_the_spa_shell(tmp_path, monkeypatch):
+    """``GET /wizard`` returns the first-run setup-wizard SPA shell.
+
+    The route is intentionally not authenticated (mirrors ``/login`` and
+    ``/dashboard``); the SPA itself redirects to ``/login`` when its first
+    call to ``GET /api/wizard`` returns 401. The served file MUST be HTML
+    and MUST contain the ``appWizard()`` Alpine.js anchor so the page
+    actually mounts (regression guard for a future accidental overwrite).
+    """
+    _isolated_env(tmp_path, monkeypatch)
+    from panel.main import app
+
+    client = TestClient(app)
+    r = client.get("/wizard", follow_redirects=False)
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/html")
+    body = r.text
+    # Anchor that the GET /wizard handler actually served the bundled file
+    # rather than the JSON 404 fallback (wizard SPA shell not bundled).
+    assert "appWizard()" in body, "wizard.html must mount Alpine.x via appWizard()"
+    # The page must talk to every operating-step endpoint the panel exposes.
+    for endpoint in ("/api/wizard", "/api/wizard/countries", "/api/wizard/ports",
+                     "/api/wizard/apply", "/api/wizard/xui-detect",
+                     "/api/wizard/xui-creds", "/api/wizard/inbounds",
+                     "/api/wizard/clone-template", "/api/wizard/clone",
+                     "/api/countries"):
+        assert endpoint in body, (
+            f"wizard.html SPA must reference {endpoint!r} — the {endpoint} "
+            "endpoint is part of the wizard state machine and the UI should "
+            "either drive it (POST), read it (GET), or hand off to it."
+        )
+
+
+def test_root_redirects_to_login(tmp_path, monkeypatch):
+    """The bare ``/`` URL yields 302 → ``/login`` so an operator opening
+    the panel URL in a browser lands on the auth form rather than on
+    FastAPI's info JSON."""
+    _isolated_env(tmp_path, monkeypatch)
+    from panel.main import app
+
+    client = TestClient(app)
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login"
+
+
 def test_auth_primitives_round_trip(monkeypatch):
     monkeypatch.setenv("PSIPHON3XUI_SESSION_SECRET", "test-secret")
     from panel import config
