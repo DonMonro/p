@@ -1,0 +1,30 @@
+[Unit]
+Description=Psiphon-3X-UI management panel
+Documentation=https://github.com/psiphon-3x-ui/psiphon-3x-ui
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ExecStart is templated by panel_install.sh (Phase 2): it points to the venv
+# python running `python -m panel`. Use EnvironmentFile for host/port/secret.
+WorkingDirectory=/opt/psiphon-3x-ui
+EnvironmentFile=/opt/psiphon-3x-ui/panel.env
+ExecStart=/opt/psiphon-3x-ui/venv/bin/python -m panel
+Restart=on-failure
+RestartSec=5
+# Run as a dedicated unprivileged user (created by the installer).
+User=psiphon3xui
+Group=psiphon3xui
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/psiphon-3x-ui
+# Allowing bind to the admin-chosen panel port across the high range:
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

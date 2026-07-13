@@ -1,0 +1,118 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0 -- C:\Program Files\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: c:\Users\Administrator\Documents\Psiphon 3X-UI
+configfile: pytest.ini (WARNING: ignoring pytest config in pyproject.toml!)
+plugins: anyio-4.14.1, asyncio-1.4.0, respx-0.23.1
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 6 items
+
+tests/test_hardening.py::TestHttpsSettings::test_default_settings_disable_tls PASSED [ 16%]
+tests/test_hardening.py::TestHttpsSettings::test_secure_cookie_flag_follows_https_only PASSED [ 33%]
+tests/test_hardening.py::TestHttpsSettings::test_non_secure_when_https_only_false PASSED [ 50%]
+tests/test_hardening.py::TestHttpsSettings::test_uvicorn_ssl_args_injected_when_cert_present FAILED [ 66%]
+tests/test_hardening.py::TestHttpsSettings::test_uvicorn_omits_ssl_when_cert_missing PASSED [ 83%]
+tests/test_hardening.py::TestHttpsSettings::test_uvicorn_skips_ssl_when_files_absent FAILED [100%]
+
+================================== FAILURES ===================================
+_____ TestHttpsSettings.test_uvicorn_ssl_args_injected_when_cert_present ______
+
+self = <tests.test_hardening.TestHttpsSettings object at 0x000002872C730C50>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002872C761490>
+tmp_path = WindowsPath('C:/Users/Administrator/AppData/Local/Temp/pytest-of-Administrator/pytest-45/test_uvicorn_ssl_args_injected0')
+
+    def test_uvicorn_ssl_args_injected_when_cert_present(self, monkeypatch, tmp_path):
+        # Build a temp cert + key + write paths; verify __main__ wraps them.
+        import panel.__main__ as m
+    
+        cert = tmp_path / "cert.pem"
+        key = tmp_path / "key.pem"
+        cert.write_text("FAKE-CERT")
+        key.write_text("FAKE-KEY")
+        # Capture the dict passed to uvicorn.run.
+        captured: dict = {}
+    
+        def fake_run(app_str, **kwargs):
+            captured.update(kwargs)
+    
+        monkeypatch.setattr(m.uvicorn, "run", fake_run)
+        monkeypatch.setattr(
+            m,
+            "get_settings",
+            lambda: _FakeSettings(
+                host="0.0.0.0",
+                port=18443,
+                tls_cert=cert,
+                tls_key=key,
+                https_only=True,
+                debug=False,
+            ),
+        )
+>       m.main()
+
+tests\test_hardening.py:386: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def main() -> None:
+        settings = get_settings()
+        # Phase 7 — TLS termination. If the installer has populated
+        # settings.tls_cert + settings.tls_key (via panel.env) we bind with
+        # --ssl-certfile/--ssl-keyfile. Either blank → plain HTTP (operator can
+        # instead front the panel with Caddy/nginx).
+        ssl_kwargs: dict = {}
+        if settings.tls_cert and settings.tls_key:
+>           cert = Path(settings.tls_cert)
+                   ^^^^
+E           NameError: name 'Path' is not defined
+
+panel\__main__.py:22: NameError
+_________ TestHttpsSettings.test_uvicorn_skips_ssl_when_files_absent __________
+
+self = <tests.test_hardening.TestHttpsSettings object at 0x000002872C731990>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002872C859DD0>
+tmp_path = WindowsPath('C:/Users/Administrator/AppData/Local/Temp/pytest-of-Administrator/pytest-45/test_uvicorn_skips_ssl_when_fi0')
+
+    def test_uvicorn_skips_ssl_when_files_absent(self, monkeypatch, tmp_path):
+        """Settings have tls_cert set but the file path doesn't exist."""
+        import panel.__main__ as m
+    
+        captured: dict = {}
+    
+        def fake_run(app_str, **kwargs):
+            captured.update(kwargs)
+    
+        monkeypatch.setattr(m.uvicorn, "run", fake_run)
+        monkeypatch.setattr(
+            m,
+            "get_settings",
+            lambda: _FakeSettings(
+                host="0.0.0.0",
+                port=18001,
+                tls_cert=tmp_path / "nope.pem",
+                tls_key=tmp_path / "nope.key",
+                https_only=True,
+                debug=False,
+            ),
+        )
+>       m.main()
+
+tests\test_hardening.py:439: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def main() -> None:
+        settings = get_settings()
+        # Phase 7 — TLS termination. If the installer has populated
+        # settings.tls_cert + settings.tls_key (via panel.env) we bind with
+        # --ssl-certfile/--ssl-keyfile. Either blank → plain HTTP (operator can
+        # instead front the panel with Caddy/nginx).
+        ssl_kwargs: dict = {}
+        if settings.tls_cert and settings.tls_key:
+>           cert = Path(settings.tls_cert)
+                   ^^^^
+E           NameError: name 'Path' is not defined
+
+panel\__main__.py:22: NameError
+=========================== short test summary info ===========================
+FAILED tests/test_hardening.py::TestHttpsSettings::test_uvicorn_ssl_args_injected_when_cert_present
+FAILED tests/test_hardening.py::TestHttpsSettings::test_uvicorn_skips_ssl_when_files_absent
+========================= 2 failed, 4 passed in 1.36s =========================

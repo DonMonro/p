@@ -1,0 +1,93 @@
+# pyproject.toml — Psiphon-3X-UI panel build config (project-root layout)
+#
+# This file lives at the REPO ROOT (not inside panel/) so that setuptools'
+# `[tool.setuptools.packages.find]` `where=["."]` actually sees the `panel/`
+# subdirectory. When pyproject.toml lived INSIDE panel/, find looked for a
+# nested `panel/panel/` directory that does not exist, producing an empty wheel
+# containing only `dist-info/*` — the systemd unit then crashed with
+# `ModuleNotFoundError: No module named 'panel'` on `python -m panel`.
+#
+# See plans/ROADMAP.md §7 Phase 2 for the bug history.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psiphon-3x-ui-panel"
+version = "0.1.0"
+description = "Psiphon-3X-UI management panel — install Psiphon and clone 3x-ui inbounds per country."
+readme = "panel/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Psiphon-3X-UI contributors" }]
+
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "bcrypt>=4.1",
+    "itsdangerous>=2.1",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
+    "sse-starlette>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.20",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["panel*"]
+
+[tool.setuptools.package-data]
+"panel" = ["static/**/*"]
+
+# ------------------------------------------------------------------
+# Ruff configuration (canonical copy; ruff.toml at repo root mirrors it)
+# ------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["venv", ".venv", "build", "dist", "panel/static"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line-length handled by formatter / not enforced strictly in stubs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"panel/__init__.py" = ["F401"]
+
+# ------------------------------------------------------------------
+# Pytest configuration (canonical copy; pytest.ini at repo root mirrors it)
+# ------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra -q"
+
+# ------------------------------------------------------------------
+# Mypy (optional, type-check)
+# ------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
