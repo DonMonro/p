@@ -1,6 +1,6 @@
 # Adding / editing countries
 
-The list of selectable Psiphon countries lives in [`../config/countries.yaml`](../config/countries.yaml).
+The list of selectable Psiphon countries lives in [`../panel/data/countries.yaml`](../panel/data/countries.yaml).
 
 Because Psiphon's upstream `EgressRegion` set drifts over time, this list is
 **just a YAML file** — no code changes are needed to extend or trim it.

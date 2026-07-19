@@ -165,7 +165,7 @@ surface" + "Phase 7 — Hardening" sections).
 | Verb     | Path                                       | Auth | Purpose                                                        |
 | -------- | ------------------------------------------ | ---- | ------------------------------------------------------------- |
 | GET      | `/api/health`                              | —    | liveness probe                                                |
-| GET      | `/api/countries`                           | —    | selectable EgressRegion list (from `config/countries.yaml`)   |
+| GET      | `/api/countries`                           | —    | selectable EgressRegion list (from `panel/data/countries.yaml`)   |
 | POST     | `/auth/login`                              | —    | bcrypt-verify → set signed session + CSRF cookies             |
 | POST     | `/auth/logout`                             | —    | clear session + CSRF cookies                                  |
 | GET      | `/auth/csrf`                               | ✓    | mint / refresh the CSRF cookie + return its token             |

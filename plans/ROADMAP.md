@@ -34,7 +34,7 @@ The whole thing is free, open-source, and globally usable.
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Country list source | External `config/countries.yaml` | Forward-compatible with Psiphon region additions |
+| Country list source | `panel/data/countries.yaml` (shipped inside the wheel) | Forward-compatible with Psiphon region additions |
 | Installer one-liner | `curl` → `wget` fallback | Works on minimal Ubuntu installs |
 | Panel stack | **Python 3.11 + FastAPI** + lightweight HTML/JS (Alpine.js + Pico.css) | Easy to maintain, ships with Ubuntu's Python, small footprint |
 | 3x-ui integration | Official 3x-ui **HTTP API** (`/panel/api/inbounds/*`) | Stable, supported, avoids SQLite corruption risk |

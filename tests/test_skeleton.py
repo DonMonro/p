@@ -6,7 +6,7 @@ Run with::
 
 These verify the things that must work before the Phase 1 spike starts:
 * The FastAPI app boots and answers /api/health.
-* ``config/countries.yaml`` parses cleanly and exposes a non-empty country list.
+* ``panel/data/countries.yaml`` parses cleanly and exposes a non-empty country list.
 * bcrypt hashing and the signed-session round-trip work.
 """
 
@@ -28,7 +28,10 @@ from panel.auth import (
 
 def _fixture_countries_path() -> Path:
     # tests/ sits directly in the repo root, so one level up.
-    return Path(__file__).resolve().parents[1] / "config" / "countries.yaml"
+    # Post-cleanup (post-Phase-23) the canonical yaml lives in-panel:
+    # panel/data/countries.yaml — the historical dev-only duplicate at
+    # <repo-root>/config/countries.yaml was deleted as drifted redundant.
+    return Path(__file__).resolve().parents[1] / "panel" / "data" / "countries.yaml"
 
 
 def _isolated_env(tmp_path: Path, monkeypatch) -> None:
@@ -113,11 +116,18 @@ def test_wizard_html_endpoint_serves_the_spa_shell(tmp_path, monkeypatch):
     # rather than the JSON 404 fallback (wizard SPA shell not bundled).
     assert "appWizard()" in body, "wizard.html must mount Alpine.x via appWizard()"
     # The page must talk to every operating-step endpoint the panel exposes.
-    for endpoint in ("/api/wizard", "/api/wizard/countries", "/api/wizard/ports",
-                     "/api/wizard/apply", "/api/wizard/xui-detect",
-                     "/api/wizard/xui-creds", "/api/wizard/inbounds",
-                     "/api/wizard/clone-template", "/api/wizard/clone",
-                     "/api/countries"):
+    for endpoint in (
+        "/api/wizard",
+        "/api/wizard/countries",
+        "/api/wizard/ports",
+        "/api/wizard/apply",
+        "/api/wizard/xui-detect",
+        "/api/wizard/xui-creds",
+        "/api/wizard/inbounds",
+        "/api/wizard/clone-template",
+        "/api/wizard/clone",
+        "/api/countries",
+    ):
         assert endpoint in body, (
             f"wizard.html SPA must reference {endpoint!r} — the {endpoint} "
             "endpoint is part of the wizard state machine and the UI should "

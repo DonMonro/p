@@ -69,7 +69,7 @@ def health() -> dict:
 
 @app.get("/api/countries", tags=["countries"])
 def list_countries():
-    """Return the configurable country list (see ``config/countries.yaml``)."""
+    """Return the configurable country list (see ``panel/data/countries.yaml``)."""
     data = load_countries()
     return {
         "version": data.version,

@@ -25,9 +25,10 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 # countries.yaml ships inside the panel package wheel as ``panel/data/countries.yaml``
 # (see [tool.setuptools.package-data] in pyproject.toml) so the seeded panel can
 # find it from the installed site-packages location regardless of install prefix.
-# A dev-only duplicate lives at <repo-root>/config/countries.yaml for tests +
-# contributors; both copies MUST be kept byte-identical when edited (see PACKAGING
-# NOTE at the top of panel/data/countries.yaml).
+# (Historical context: a dev-only duplicate lived at <repo-root>/config/
+# countries.yaml, but it was removed in the cleanup pass after Phase 23 — the
+# two copies had drifted, and no production code path resolved to the root
+# path anyway. The canonical source of truth is now THIS file.)
 COUNTRIES_FILE = PACKAGE_DIR / "data" / "countries.yaml"
 
 
@@ -107,7 +108,7 @@ class Country(BaseModel):
         if isinstance(v, bool):
             raise ValueError(
                 f"country code parsed as a YAML boolean ({v!r}). "
-                "Quote the `code:` value in config/countries.yaml — e.g. "
+                "Quote the `code:` value in panel/data/countries.yaml — e.g. "
                 '`- code: "NO"`. See the file header comment.'
             )
         if not isinstance(v, str):
@@ -126,7 +127,7 @@ class CountriesDefaults(BaseModel):
 
 
 class CountriesFile(BaseModel):
-    """In-memory representation of ``config/countries.yaml``."""
+    """In-memory representation of ``panel/data/countries.yaml``."""
 
     version: int
     defaults: CountriesDefaults
