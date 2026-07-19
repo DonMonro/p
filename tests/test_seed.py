@@ -10,7 +10,7 @@ We assert:
   and a *bcrypt* hash (not the plaintext password; verifiable with bcrypt.checkpw).
 * Re-running seed with new creds *upserts* the existing row (no duplicate row,
   wizard_completed preserved as false; password hash actually changed).
-* The Country table is seeded from config/countries.yaml with exactly the
+* The Country table is seeded from panel/data/countries.yaml with exactly the
   count load_countries() reports, all enabled=False.
 * The panel.db engine is disposed+uncached after main() returns, so the
   SQLite file is released (the producing process can delete the tempfile).

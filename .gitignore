@@ -1,34 +1,44 @@
-# Python
+# ============================================================================
+# .gitignore — Psiphon-3X-UI
+# ----------------------------------------------------------------------------
+# Section index:
+#   1.  Python source / bytecode
+#   2.  Virtual environments
+#   3.  Test & coverage output
+#   4.  Distribution / build artefacts
+#   5.  Editors / IDE metadata
+#   6.  Operating-system junk
+#   7.  Project-specific runtime artefacts
+#   8.  Dev-host command-output scratch files & test logs
+#   9.  Local upstream-research scaffolding (sample/capture dumps)
+#   10. Trash filenames from past `python -c "..." | tee` misadventures
+#
+# To re-normalise the working tree after editing .gitattributes:
+#   git add --renormalize .
+#   git commit -m "chore: enforce .gitattributes line-ending policy"
+# ============================================================================
+
+
+# ── 1.  Python source / bytecode ──────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
 *.egg
+*.egg-info
 MANIFEST
 
-# Virtual environments
+
+# ── 2.  Virtual environments ──────────────────────────────────────────────
 venv/
 .venv/
 env/
 .env
 ENV/
 
-# Testing / coverage
+
+# ── 3.  Test & coverage output ────────────────────────────────────────────
 htmlcov/
 .tox/
 .nox/
@@ -42,7 +52,25 @@ coverage.xml
 .ruff_cache/
 .mypy_cache/
 
-# IDEs
+
+# ── 4.  Distribution / build artefacts ────────────────────────────────────
+build/
+dist/
+panel/dist/
+eggs/
+.eggs/
+wheels/
+downloads/
+develop-eggs/
+sdist/
+var/
+lib/
+lib64/
+parts/
+.installed.cfg
+
+
+# ── 5.  Editors / IDE metadata ─────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
@@ -52,58 +80,56 @@ coverage.xml
 .classpath
 .settings/
 
-# OS
+
+# ── 6.  Operating-system junk ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# Project-specific runtime artifacts
-# Panel SQLite databases (created at runtime / install)
+
+# ── 7.  Project-specific runtime artefacts ─────────────────────────────────
+# Panel SQLite databases (created at runtime / install).
 panel.db
 panel.db-journal
 panel.db-wal
 panel.db-shm
 
-# Per-country generated Psiphon configs (created by the wizard at runtime)
+# Per-country generated Psiphon configs (created by the wizard at runtime).
 /opt/psiphon-3x-ui/config/*.json
 
-# Local install staging
+# Local install staging.
 /artifacts/
 /tmp/
 
-# ──────────────────────────────────────────────────────────────────────
-# Dev-host command-output scratch files & test logs
-# (added in Phase 7 when validating ruff/pytest/shellcheck gates and
+
+# ── 8.  Dev-host command-output scratch files & test logs ────────────────
+# (Added in Phase 7 when validating ruff/pytest/shellcheck gates and
 #  capturing installer dry-run output; should never be committed.)
-# ──────────────────────────────────────────────────────────────────────
 *.out
 *.txt
 !tests/fixtures/**/*.txt
 !tests/fixtures/**/*.json
 !.github/**/*.txt
 
+
+# ── 9.  Local upstream-research scaffolding ──────────────────────────────
+# Pre-flight dumps captured while reverse-engineering the Psiphon Inc.
+# upstream client + APK manifest. They contain no hard secrets but they
+# also carry no value to the published repo — they are dev-host scratch
+# and should never be committed to the operator-facing v1.0.0 tag.
+.android_stub.config
+.ios_stub.config
+.psiphon_apk_listing.json
+.psiphon_linux_listing.json
+.upstream_config.go
+.upstream_sample.config.json
+.upstream_tree.json
+
+
+# ── 10.  Trash filenames from past `python -c "..." | tee` misadventures ──
 # Trash filenames that accidentally appeared when a multi-line
-# `python -c "..." | tee` got saved with the literal command-quoted
-# shell content as the filename — exclude them and any future sibling.
+# `python -c "..." | tee` got saved with the literal command-quoted shell
+# content as the filename — exclude them and any future sibling.
 import io;*
 lines =*
-phase7_*
-pytest_*
-final_p6_check.out
-ruff_check*.out
-ruff_check.out
-shellcheck_pkg.out
-pytest_dash.out
-pytest_final.out
-pytest_phase6_*
-pytest_full_p7.out
-phase7_after_https.out
-phase7_hardening.out
-phase7_https_errk.out
-phase7_regression.out
-pytest_dashboard_after.out
-pytest_pkg_fix.out
-pytest_url_after.out
-ruff_check_pkg.out
-shellcheck_pkg.out

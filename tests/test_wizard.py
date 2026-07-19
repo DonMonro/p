@@ -110,7 +110,7 @@ def _authed_client(monkeypatch, tmp_path) -> TestClient:
     return c
 
 
-_VALID_CODES = ("US", "DE")  # both exist in config/countries.yaml (test_skeleton asserts)
+_VALID_CODES = ("US", "DE")  # both exist in panel/data/countries.yaml (test_skeleton asserts)
 
 
 # ----------------------------------------------------------- GET /api/wizard

@@ -280,7 +280,7 @@ def submit_countries(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     f"codes not supported by countries.yaml: {unknown}. "
-                    f"Add them to config/countries.yaml or pick from {sorted(by_code)[:10]}…"
+                    f"Add them to panel/data/countries.yaml or pick from {sorted(by_code)[:10]}…"
                 ),
             )
         chosen = codes_seen

@@ -10,7 +10,7 @@
 - `panel/psiphon/` — generates per-country configs and (Phase 4) spawns tunnel
   processes via templated systemd units.
 - `panel/dashboard/xui_client.py` — thin 3x-ui HTTP API client.
-- `config/countries.yaml` — single source of truth for supported countries.
+- `panel/data/countries.yaml` — single source of truth for supported countries (shipped inside the wheel).
 - `systemd/` — unit templates installed at runtime.
 
 ## Data flow

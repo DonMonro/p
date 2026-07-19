@@ -782,10 +782,13 @@ class TestPackagingRegressions:
     def test_panel_config_countries_file_points_at_packaged_yaml(self):
         """``panel.config.COUNTRIES_FILE`` MUST resolve to the in-package
         ``panel/data/countries.yaml`` (relative to ``panel.config.__file__``),
-        NOT to ``<repo-root>/config/countries.yaml``. The latter exists only in
-        the dev checkout and is NOT shipped inside the wheel — resolving to it
-        from an installed venv site-packages path raises ``FileNotFoundError``
-        at seed time. This test guards the path-resolution line directly.
+        which is the ONLY copy in the repo these days. (A pre-v1.0.0 dev-only
+        duplicate at ``<repo-root>/config/countries.yaml`` was removed during the
+        post-Phase-23 cleanup pass after the two drifted; resolving to that
+        root path from an installed venv site-packages location raised
+        ``FileNotFoundError`` at seed time — see Hotfix #1 / Phase 2 in
+        ``.git/COMMIT_EDITMSG_RELEASE_HEAD`` for the bug history.) This test
+        guards the path-resolution line directly.
         """
         from panel import config as panel_config
 
