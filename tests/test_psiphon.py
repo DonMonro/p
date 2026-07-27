@@ -68,37 +68,70 @@ def _set_real_psiphon_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 # render_config                                                               #
 # --------------------------------------------------------------------------- #
 class TestRenderConfig:
-    # Hotfix #12 (Bug #1) + Hotfix #13 (Bug #1 v2) + Hotfix #14 (Phase 23).
-    # The field name is the LEGACY singular `RemoteServerListUrl` (lowercase
-    # final "l") — a plain string, auto promoted by the upstream binary's
-    # `promoteLegacyTransferURL`. Hotfix #13 added the mandatory `SponsorId`
-    # non-empty string field; Hotfix #14 pivoted all four upstream credentials
-    # to operator-supplied env vars (the panel now fast-fails with
-    # PsiphonCredentialError if any look like the externally-known placeholders).
-    def test_returns_seven_required_keys(self):
+    # Hotfix #12 (Bug #1) + Hotfix #13 (Bug #1 v2) + Hotfix #14 (Phase 23)
+    # + Phase 24 (post-Hotfix-#14 cleanup). Phase 24 emitter:
+    #   - PropagationChannelId, SponsorId           — env-overridable scalars
+    #   - RemoteServerListURLs                     — plural TransferURL array
+    #                                                (env var singular -> 1-elem
+    #                                                list; no env -> 4-mirror
+    #                                                `_PUBLIC_*` default)
+    #   - ObfuscatedServerListRootURLs             — 4-mirror baked-in default
+    #                                                (non env-overridable)
+    #   - RemoteServerListSignaturePublicKey       — env-overridable scalar
+    #   - ServerEntrySignaturePublicKey           — baked-in (Ed25519 ~44 chars)
+    #                                                (non env-overridable)
+    #   - ExchangeObfuscationKey                  — baked-in (~44 chars)
+    #                                                (non env-overridable)
+    #   - UseIndistinguishableTLS: true           — fronting switch
+    #   - EgressRegion, LocalSocksProxyPort       — per-country
+    #   - DisableLocalHTTPProxy: true             — SOCKS-only
+    # Hotfix #14 + Phase 24: a missing env var is no longer fatal — the
+    # baked-in `_PUBLIC_*` default from the public Psiphon-3 APK is used.
+    # A bad-looking env var (placeholder-form) STILL raises
+    # PsiphonCredentialError on the first render attempt.
+    def test_returns_eleven_required_keys(self):
         cfg = render_config("US", 1080)
+        # Phase 24: 11 keys. The legacy singular `RemoteServerListUrl` is
+        # DROPPED — emit plural `RemoteServerListURLs` TransferURL array
+        # directly (the binary's promote-branch is only triggered when the
+        # plural is nil, which we no longer do).
         assert set(cfg) == {
             "PropagationChannelId",
             "SponsorId",
-            "RemoteServerListUrl",
+            "RemoteServerListURLs",
+            "ObfuscatedServerListRootURLs",
             "RemoteServerListSignaturePublicKey",
+            "ServerEntrySignaturePublicKey",
+            "ExchangeObfuscationKey",
+            "UseIndistinguishableTLS",
             "EgressRegion",
             "LocalSocksProxyPort",
             "DisableLocalHTTPProxy",
         }
 
     def test_render_config_uses_env_vars_for_upstream_credentials(self):
-        """Hotfix #14: render_config pulls the four Psiphon-Inc credentials
-        from the operator's env (not from module constants). The autouse
-        fixture above set fake-but-real-shape values; assert they round-trip."""
+        """Phase 24 (was Hotfix #14): render_config still pulls the four
+        ENV-OVERRIDABLE upstream credentials from the operator's env. The
+        autouse fixture above set fake-but-real-shape values; assert they
+        round-trip. Note `RemoteServerListUrl` (singular) is no longer a
+        config key — env var `PSIPHON_REMOTE_SERVER_LIST_URL` is now wrapped
+        into a 1-element `RemoteServerListURLs` TransferURL array."""
         cfg = render_config("US", 1080)
         assert cfg["PropagationChannelId"] == _TEST_PROPAGATION_CHANNEL_ID
         assert cfg["SponsorId"] == _TEST_SPONSOR_ID
-        assert cfg["RemoteServerListUrl"] == _TEST_REMOTE_SERVER_LIST_URL
         assert (
             cfg["RemoteServerListSignaturePublicKey"]
             == _TEST_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
         )
+        # The env var is WRAPPED: 1-element TransferURL array carrying the
+        # raw URL + OnlyAfterAttempts=0 + SkipVerify=False.
+        urls = cfg["RemoteServerListURLs"]
+        assert isinstance(urls, list)
+        assert len(urls) == 1
+        entry = urls[0]
+        assert entry["URL"] == _TEST_REMOTE_SERVER_LIST_URL
+        assert entry["OnlyAfterAttempts"] == 0
+        assert entry["SkipVerify"] is False
 
     def test_sponsor_id_is_nonempty_string(self):
         # Hotfix #13 (Bug #1 v2): SponsorId must be a non-empty string
@@ -133,39 +166,47 @@ class TestRenderConfig:
         with pytest.raises(ValueError):
             render_config(code, socks_port)
 
-    def test_remote_server_list_url_is_singular_string(self):
-        # Hotfix #12 (Bug #1): render_config must emit the legacy singular
-        # string field `RemoteServerListUrl` (NOT a list/array). Hotfix #14
-        # sources the value from the operator's env var (PSIPHON_REMOTE_SERVER_LIST_URL).
+    def test_remote_server_list_urls_is_plural_transfer_url_array(self):
+        # Phase 24 (was Hotfix #12 Bug #1): render_config emits the PLURAL
+        # `RemoteServerListURLs` field as a list of TransferURL dicts (NOT a
+        # singular lowercase-final-"l" string). The autouse fixture populates
+        # the singular `PSIPHON_REMOTE_SERVER_LIST_URL` env var, which
+        # `_resolve_upstream_credentials` wraps into a 1-elem array.
+        # psiphon-tunnel-core's promoteLegacyTransferURL branch is NOT
+        # triggered (the plural array is non-nil), and the legacy singular
+        # field is NOT emitted anymore.
         cfg = render_config("US", 1080)
-        assert cfg["RemoteServerListUrl"] == _TEST_REMOTE_SERVER_LIST_URL
-        assert isinstance(cfg["RemoteServerListUrl"], str)
-        # And for good measure: the broken plural field is NOT present.
-        assert "RemoteServerListURLs" not in cfg
+        assert "RemoteServerListUrl" not in cfg  # singular field GONE
+        urls = cfg["RemoteServerListURLs"]
+        assert isinstance(urls, list)
+        assert len(urls) == 1
+        assert urls[0]["URL"] == _TEST_REMOTE_SERVER_LIST_URL
+        assert isinstance(urls[0]["OnlyAfterAttempts"], int)
+        assert isinstance(urls[0]["SkipVerify"], bool)
 
 
 # --------------------------------------------------------------------------- #
-# render_config — Hotfix #14 (Phase 23) credential placeholder rejection       #
+# render_config — Phase 24 (post-Hotfix-#14 cleanup) credential placeholder   #
+# rejection (operator-supplied BAD overrides only)                            #
 # --------------------------------------------------------------------------- #
 class TestPsiphonCredentialErrorRegressions:
-    """Hotfix #14 (Phase 23): the four Psiphon-Inc upstream credentials are
-    now read from the operator's env (PSIPHON_PROPAGATION_CHANNEL_ID,
-    PSIPHON_SPONSOR_ID, PSIPHON_REMOTE_SERVER_LIST_URL,
-    PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY). render_config fast-fails
-    with PsiphonCredentialError when any value is missing OR looks like the
-    externally-known placeholder form, instead of silently producing a config
-    that psiphon-tunnel-core will then 5-minute EstablishTunnelTimeout on.
+    """Phase 24 (post-Hotfix-#14 cleanup): the four Psiphon-Inc upstream
+    bootstrap constants are BAKED IN as `_PUBLIC_*` defaults inside
+    panel/psiphon/__init__.py (extracted from the public Psiphon-3 client
+    APK). Per-country tunnels establish out-of-the-box with NO env vars
+    required. The four `PSIPHON_*` env vars are now OPTIONAL OVERRIDES —
+    a commercial sponsor can substitute its own PropChannel / SponsorId /
+    signed server-list URL / sig-pubkey. render_config fast-fails with
+    PsiphonCredentialError ONLY when the operator EXPLICITLY sets an env
+    override that looks like the externally-known placeholder form (all-F's,
+    all-0's, "..." stub, non-base64 sig-pubkey, non-https URL), instead of
+    silently producing a config that psiphon-tunnel-core will then 5-minute
+    EstablishTunnelTimeout on.
     """
 
     @pytest.mark.parametrize(
         ("envname", "bad_value", "expected_reason_fragment"),
         [
-            # Empty / unset — first envname tried is checked first.
-            (
-                "PSIPHON_PROPAGATION_CHANNEL_ID",
-                "",
-                "PropagationChannelId — env var PSIPHON_PROPAGATION_CHANNEL_ID",
-            ),
             # The upstream psiphon.config.sample literal "..." form.
             (
                 "PSIPHON_PROPAGATION_CHANNEL_ID",
@@ -191,22 +232,18 @@ class TestPsiphonCredentialErrorRegressions:
                 "FABRICATED placeholder shipped pre-Hotfix-14",
             ),
             # Non-base64 sig-pubkey (contains '@' — fails the base64 regex).
+            # Phase 24 rewording: dropped the "ed25519" qualifier because the
+            # public-client RemoteServerListSignaturePublicKey is RSA-2048 SPKI.
             (
                 "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
                 "AAA@AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-                "not a valid base64-encoded ed25519 public key",
+                "is not a valid base64-encoded public key",
             ),
             # Non-http(s):// RemoteServerListUrl.
             (
                 "PSIPHON_REMOTE_SERVER_LIST_URL",
                 "ftp://example.invalid/psiphon-list",
                 "is not an http(s):// URL",
-            ),
-            # Missing URL entirely.
-            (
-                "PSIPHON_REMOTE_SERVER_LIST_URL",
-                "",
-                "RemoteServerListUrl — env var PSIPHON_REMOTE_SERVER_LIST_URL",
             ),
         ],
     )
@@ -217,12 +254,16 @@ class TestPsiphonCredentialErrorRegressions:
         bad_value: str,
         expected_reason_fragment: str,
     ) -> None:
-        """As of Hotfix #14 the panel fast-fails with PsiphonCredentialError
-        — carrying an operator-actionable message — when ANY of the four
-        upstream credentials is missing or placeholder-shaped. The autouse
-        fixture set real-shape values for all four, so we explicitly UNSET
-        the one we're testing the rejection of, set the bad value, then assert
-        PsiphonCredentialError is raised with a message naming the env var."""
+        """Phase 24 (was Hotfix #14): the panel fast-fails with
+        PsiphonCredentialError — carrying an operator-actionable message —
+        when ANY of the four upstream credentials is provided via an env
+        override that LOOKS LIKE the externally-known placeholder form.
+        The autouse fixture set real-shape values for all four; we override
+        the one we're testing with a placeholder, then assert the error
+        MESSAGE names the env var. NOTE: Phase 24 changed the contract — a
+        missing env var NO LONGER raises (the baked-in `_PUBLIC_*` default
+        is used). Only the empty-string-fallback path of the parametrize was
+        REMOVED in Phase 24 — placeholder-shaped overrides still raise."""
         monkeypatch.setenv(envname, bad_value)
         with pytest.raises(PsiphonCredentialError) as excinfo:
             render_config("US", 1080)
@@ -239,8 +280,11 @@ class TestPsiphonCredentialErrorRegressions:
 
     def test_render_config_error_message_is_operator_actionable(self, monkeypatch):
         """The fast-fail message must name the env var + panel.env path +
-        the restart command, so the operator knows exactly what to do."""
-        monkeypatch.setenv("PSIPHON_SPONSOR_ID", "")
+        the restart command, so the operator knows exactly what to do. NOTE
+        Phase 24: an EMPTY Sponsor used to raise; now it falls through to
+        the baked-in default (no error). We set Sponsor to the placeholder
+        form ("0000...") so the rejector still fires."""
+        monkeypatch.setenv("PSIPHON_SPONSOR_ID", "0000000000000000")
         with pytest.raises(PsiphonCredentialError) as excinfo:
             render_config("US", 1080)
         msg = str(excinfo.value)
@@ -249,14 +293,22 @@ class TestPsiphonCredentialErrorRegressions:
         assert "systemctl restart psiphon-3x-ui" in msg
         assert "docs/TROUBLESHOOTING.md" in msg
 
-    def test_render_config_rejects_unset_env_entirely(self, monkeypatch):
-        """If the operator never sets PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
-        at all (the realistic installer-skipped-prompt case), the panel must
-        fast-fail on the very first render attempt — NOT silently proceed and
-        let psiphon-tunnel-core enter its 5-minute EstablishTunnelTimeout loop."""
+    def test_render_config_uses_baked_in_default_when_env_unset(self, monkeypatch):
+        """Phase 24 INVERTED the empty-env-var contract: deleting
+        PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY (the realistic
+        installer-skipped-prompt case) NO LONGER raises — the panel uses the
+        baked-in `_PUBLIC_*` default and renders successfully. Pre-Phase-24
+        (Hotfix #14) the panel fast-failed here; that was the root cause of
+        user-reported Issues 2/3/4 (wizard/dashboard enable blocked)."""
         monkeypatch.delenv("PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY", raising=False)
-        with pytest.raises(PsiphonCredentialError, match="RemoteServerListSignaturePublicKey"):
-            render_config("US", 1080)
+        # Should NOT raise — the baked-in `_PUBLIC_*` default kicks in.
+        cfg = render_config("US", 1080)
+        # The baked-in default for the sig-pubkey is the RSA-2048 SPKI (~716 chars).
+        from panel.psiphon import _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
+        assert (
+            cfg["RemoteServerListSignaturePublicKey"]
+            == _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
+        )
 
     def test_psiphon_credential_error_is_runtime_error_subclass(self):
         """PsiphonCredentialError is caught by the panel's general exception
@@ -269,7 +321,10 @@ class TestPsiphonCredentialErrorRegressions:
         their VALUES must remain the literal placeholder forms the panel
         rejects. This locks in the placeholder identity for forward-compatibility:
         if anyone is tempted to set the legacy constant = a real value, this
-        test will fail loudly."""
+        test will fail loudly. NOTE Phase 24: these legacy `_LEGACY_STUB_*`
+        constants are KEPT for source-compat with the placeholder-rejector
+        test cases + the TestHotfix14 static-grep tests; they no longer feed
+        into render_config (the `_PUBLIC_*` defaults do)."""
         from panel.psiphon import (  # noqa: PLC0415
             PSIPHON_PROPAGATION_CHANNEL_ID,
             PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY,
@@ -281,6 +336,161 @@ class TestPsiphonCredentialErrorRegressions:
         assert PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY == (
             "62BFA6DFD5C8C6E2E8F5B9E3C1F9F8A5D6E2B6C9A0F1D2E3B4C5D6F7E8A9B0C"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 24 — TestPublicBootstrapDefaults                                       #
+# --------------------------------------------------------------------------- #
+class TestPublicBootstrapDefaults:
+    """Phase 24 (post-Hotfix-#14 cleanup): the public-bootstrap Psiphon-3
+    constants extracted from the public client APK are baked into
+    panel/psiphon/__init__.py as `_PUBLIC_*`. These tests assert:
+
+      1. The 7 `_PUBLIC_*` constant values match the public APK dump exactly.
+      2. render_config() with all PSIPHON_* env vars UNSET round-trips the
+         `_PUBLIC_*` constants into the output dict.
+      3. The plural `RemoteServerListURLs` array (with no env override) carries
+         the 4-mirror default, each wrapped as a TransferURL dict.
+      4. The non-env-overridable fields (`ServerEntrySignaturePublicKey`,
+         `ExchangeObfuscationKey`, `ObfuscatedServerListRootURLs`) round-trip
+         the baked-in defaults even when the operator tries to override them
+         (the env var is IGNORED for non-overridable fields).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _unset_all_psiphon_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Override the module-level autouse fixture that sets fake-but-real-shape
+        env values — we want NO env vars set so the `_PUBLIC_*` defaults are
+        actually exercised (the module-level autouse would mask them)."""
+        for var in (
+            "PSIPHON_PROPAGATION_CHANNEL_ID",
+            "PSIPHON_SPONSOR_ID",
+            "PSIPHON_REMOTE_SERVER_LIST_URL",
+            "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_public_bootstrap_constants_match_apk_dump(self):
+        """The 7 `_PUBLIC_*` constants must EXACTLY match the values extracted
+        from the public Psiphon-3 Android APK dump. If the panel is rebuilt
+        against a future Psiphon-3 client release these lock-in tests will
+        catch drift."""
+        from panel.psiphon import (  # noqa: PLC0415
+            _PUBLIC_EXCHANGE_OBFUSCATION_KEY,
+            _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS,
+            _PUBLIC_PROPAGATION_CHANNEL_ID,
+            _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY,
+            _PUBLIC_REMOTE_SERVER_LIST_URLS,
+            _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY,
+            _PUBLIC_SPONSOR_ID,
+        )
+
+        assert _PUBLIC_PROPAGATION_CHANNEL_ID == "92AACC5BABE0944C"
+        assert _PUBLIC_SPONSOR_ID == "92AACC5BABE0944C"
+
+        # 4 mirror URLs for the plain server list (compressed).
+        assert _PUBLIC_REMOTE_SERVER_LIST_URLS == (
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+            "https://www.blogsfmcancercitizen.com/web/mjr4-p23r-puwl/server_list_compressed",
+            "https://www.herbxdiiincorporated.com/web/mjr4-p23r-puwl/server_list_compressed",
+            "https://www.xydiamonddbexpert.com/web/mjr4-p23r-puwl/server_list_compressed",
+        )
+        # 4 mirror URLs for the obfuscated server-list root (same 4 hosts, /osl path).
+        assert _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS == (
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/osl",
+            "https://www.blogsfmcancercitizen.com/web/mjr4-p23r-puwl/osl",
+            "https://www.herbxdiiincorporated.com/web/mjr4-p23r-puwl/osl",
+            "https://www.xydiamonddbexpert.com/web/mjr4-p23r-puwl/osl",
+        )
+
+        # RemoteServerListSignaturePublicKey is RSA-2048 SPKI base64 (~716 chars),
+        # NOT Ed25519 (the old Hotfix-#14 comment was wrong). It ends in
+        # "rsCAQM=" after the +agEAQi60pXn7+rsCAQM= suffix — match last 20 chars
+        # to avoid bloating the test file with the full string, while still
+        # catching a real drift.
+        assert _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY.startswith("MIICIDAN")
+        assert _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY.endswith("rsCAQM=")
+        assert len(_PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY) > 700
+
+        # ServerEntrySignaturePublicKey IS Ed25519 (~44 chars base64).
+        assert (
+            _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
+            == "sHuUVTWaRyh5pZwy4UguSgkwmBe0EHtJJkoF5WrxmvA="
+        )
+        # ExchangeObfuscationKey is the ~44-char handshake obfuscation seed.
+        assert (
+            _PUBLIC_EXCHANGE_OBFUSCATION_KEY
+            == "DpXzloJk1Hw6aSzmKKky0xcahsEHubch81Mi6K0XMlU="
+        )
+
+    def test_render_config_no_env_uses_public_bootstrap_defaults(self):
+        """With every PSIPHON_* env var UNSET, render_config() must produce a
+        config carrying the baked-in `_PUBLIC_*` constants (NOT a
+        PsiphonCredentialError). This is the post-Phase-24 happy path —
+        the realistic installer-no-credentials-prompt case."""
+        cfg = render_config("US", 1080)
+        from panel.psiphon import (  # noqa: PLC0415
+            _PUBLIC_EXCHANGE_OBFUSCATION_KEY,
+            _PUBLIC_PROPAGATION_CHANNEL_ID,
+            _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY,
+            _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY,
+            _PUBLIC_SPONSOR_ID,
+        )
+
+        assert cfg["PropagationChannelId"] == _PUBLIC_PROPAGATION_CHANNEL_ID
+        assert cfg["SponsorId"] == _PUBLIC_SPONSOR_ID
+        assert (
+            cfg["RemoteServerListSignaturePublicKey"]
+            == _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
+        )
+        assert cfg["ServerEntrySignaturePublicKey"] == _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
+        assert cfg["ExchangeObfuscationKey"] == _PUBLIC_EXCHANGE_OBFUSCATION_KEY
+
+    def test_render_config_no_env_emits_4_mirror_remote_server_list_urls(self):
+        """With no PSIPHON_REMOTE_SERVER_LIST_URL env override, render_config()
+        must emit the baked-in 4-mirror `RemoteServerListURLs` TransferURL
+        array (NOT a 1-element array). Each entry carries the raw URL +
+        OnlyAfterAttempts=0 + SkipVerify=False."""
+        cfg = render_config("US", 1080)
+        urls = cfg["RemoteServerListURLs"]
+        assert isinstance(urls, list)
+        assert len(urls) == 4
+        from panel.psiphon import _PUBLIC_REMOTE_SERVER_LIST_URLS  # noqa: PLC0415
+        for entry, raw_url in zip(urls, _PUBLIC_REMOTE_SERVER_LIST_URLS, strict=True):
+            assert isinstance(entry, dict)
+            assert entry["URL"] == raw_url
+            assert entry["OnlyAfterAttempts"] == 0
+            assert entry["SkipVerify"] is False
+
+    def test_non_overridable_fields_ignore_env_var(self, monkeypatch):
+        """ServerEntrySignaturePublicKey, ExchangeObfuscationKey, and
+        ObfuscatedServerListRootURLs are NOT env-overridable — the panel
+        always ships the baked-in public-bootstrap values. Setting env
+        vars `PSIPHON_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY` /
+        `PSIPHON_EXCHANGE_OBFUSCATION_KEY` / etc. MUST be IGNORED by
+        _resolve_upstream_credentials."""
+        # Even if the operator sets these env vars, they have NO effect —
+        # the panel doesn't read them.
+        monkeypatch.setenv("PSIPHON_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY", "FAKE-fake-fake-fake=")
+        monkeypatch.setenv("PSIPHON_EXCHANGE_OBFUSCATION_KEY", "FAKE-fake-fake-fake=")
+        monkeypatch.setenv("PSIPHON_OBFUSCATED_SERVER_LIST_ROOT_URL", "https://example.invalid")
+        cfg = render_config("US", 1080)
+        from panel.psiphon import (  # noqa: PLC0415
+            _PUBLIC_EXCHANGE_OBFUSCATION_KEY,
+            _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS,
+            _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY,
+        )
+        assert cfg["ServerEntrySignaturePublicKey"] == _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
+        assert cfg["ExchangeObfuscationKey"] == _PUBLIC_EXCHANGE_OBFUSCATION_KEY
+        # The obfuscated-roots array round-trips as TransferURL dicts wrapped over
+        # the baked-in 4-mirror tuple.
+        roots = cfg["ObfuscatedServerListRootURLs"]
+        assert isinstance(roots, list)
+        assert len(roots) == 4
+        for entry, raw_url in zip(roots, _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS, strict=True):
+            assert entry["URL"] == raw_url
+            assert entry["OnlyAfterAttempts"] == 0
+            assert entry["SkipVerify"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -57,18 +57,29 @@ Then re-run `sudo bash /path/to/install.sh` (idempotent — it will rebuild).
   `systemctl status psiphon-tunnel@<CODE>.service` and
   `journalctl -u psiphon-tunnel@<CODE> -n 200`.
 
-## Psiphon Inc. upstream credentials required (Hotfix #14)
+## Psiphon Inc. upstream credentials — optional overrides (Phase 24)
 
-The four Psiphon-Inc-issued upstream credentials the per-country tunnel units
-authenticate with are **NOT** shipped in this repo — they are commercial
-secrets Psiphon Inc. embeds only inside its own first-party client binaries.
-The hardcoded stub constants the panel was shipping through Hotfix #13
-(`PropagationChannelId = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"`,
-`SponsorId = "0000000000000000"`,
-`RemoteServerListSignaturePublicKey` = a 64-hex placeholder) all pass the
-psiphon-tunnel-core `Config.Commit` `"== \"\"` check but **fail downstream at
-remote server-list signature verification**, with the binary's only outward
-symptom being:
+> **Phase 24 (post-Hotfix-#14 cleanup): the public-bootstrap constants are
+> baked in.** The four Psiphon-Inc upstream credentials the per-country
+> tunnel units authenticate with (`PropagationChannelId`, `SponsorId`,
+> `RemoteServerListUrl`, `RemoteServerListSignaturePublicKey`) — and the
+> additional three modern Psiphon-3 client fields `ServerEntrySignaturePublicKey`,
+> `ExchangeObfuscationKey`, `ObfuscatedServerListRootURLs` — are now baked
+> into [`panel/psiphon/__init__.py`](../panel/psiphon/__init__.py) as
+> `_PUBLIC_*` module constants. These constants are the universal
+> **public-bootstrap** values Psiphon Inc. ships inside every public
+> Psiphon-3 client binary (Play-Store APK, GitHub release binaries); they
+> are NOT commercial secrets and embedding them in this public repo is not
+> a leak. Per-country tunnels establish out-of-the-box with **no env vars
+> required**.
+
+### Background: what the panel ships + why
+
+Pre-Hotfix #14 the panel shipped all-F's / all-0's / 64-hex placeholder
+stubs for these credentials; they passed the psiphon-tunnel-core
+`Config.Commit` empty-string check but failed downstream at remote
+server-list signature verification, with the binary's only outward symptom
+being:
 
 ```
 noticeType=AvailableEgressRegions  data={"regions":[]}
@@ -77,42 +88,34 @@ noticeType=NetworkID              data={"ID":"UNKNOWN"}
 noticeType=EstablishTunnelTimeout  data={"timeout":"5m0s","Tunnels":0}  → Exiting
 ```
 
-The SOCKS5 listener DOES bind on `127.0.0.1:<socks_port>`, but no upstream
-servers can be negotiated, so a panel/internal `health_probe` against it
-ultimately returns ConnectionRefused / no-acceptable-methods, and the unit
-restarts in a 5-minute deathloop.
+Hotfix #14 then pivoted the four credentials to **operator-supplied env-var
+REQUIRED overrides** (the panel fast-failed at `render_config` time with an
+actionable `PsiphonCredentialError` if any env var was missing or
+placeholder-shaped). That installer-blocking gate was the root cause of
+the user-reported Issues 2/3/4 ("add country throws PsiphonCredentialError
+for PSIPHON_PROPAGATION_CHANNEL_ID", "after the wizard the country is not
+active", "installation demands the four params with no clear path to
+obtain them").
 
-Hotfix #14 pivots the four credentials to **operator-supplied env-var
-overrides** that you must place in `/opt/psiphon-3x-ui/panel.env`. The
-panel's [`panel.psiphon.render_config`](../panel/psiphon/__init__.py)
-**fast-fails with an actionable error** instead of letting the per-country
-unit enter that 5-minute deathloop:
+**Phase 24 inverts that gate**: the public-bootstrap constants are baked in
+as defaults, and the four `PSIPHON_*` env vars become **OPTIONAL OVERRIDES**.
+A commercial sponsor with its own PropagationChannelId / SponsorId / signed
+server-list URL / signature public key can still substitute its values into
+`/opt/psiphon-3x-ui/panel.env` and the panel picks them up at
+`render_config` runtime — without forking the panel. The placeholder
+rejector (`_looks_like_placeholder`) still fires on operator-supplied **BAD**
+overrides so the panel fast-fails (instead of silently booting a binary that
+spends 5 minutes in `EstablishTunnelTimeout`), but it does NOT fire on the
+default code path (the baked-in `_PUBLIC_*` constants are pre-validated).
 
-> `STUB credential detected for <Field> — env var PSIPHON_<…> <reason>. Set
-> PSIPHON_<…> in /opt/psiphon-3x-ui/panel.env (then `systemctl restart
-> psiphon-3x-ui`) with your real Psiphon-Inc-issued value.`
+### How to substitute your commercial sponsor values (OPTIONAL)
 
-### Where to obtain the credentials
-
-Psiphon Inc. does **not** publish these values in its open-source repos.
-Reach out to Psiphon Inc. via <https://psiphon.ca/contact.html> for a
-licensing/sponsor relationship — they will issue you:
-
-| Env var (panel.env)                                | JSON field in `<CODE>.json`             | Format note |
-| -------------------------------------------------- | --------------------------------------- | ----------- |
-| `PSIPHON_PROPAGATION_CHANNEL_ID`                   | `PropagationChannelId`                  | 32 hex chars (uppercase; NOT all-`F`'s) |
-| `PSIPHON_SPONSOR_ID`                               | `SponsorId`                             | 16 hex chars (NOT all-`0`'s) |
-| `PSIPHON_REMOTE_SERVER_LIST_URL`                   | `RemoteServerListUrl`                   | must start with `https://` (or `http://`) |
-| `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`  | `RemoteServerListSignaturePublicKey`   | **base64-encoded ed25519 public key** — ~44 chars matching `[A-Za-z0-9+/]{42,}={0,2}` (NOT a bare 64-hex string!) |
-
-### How to set them
-
-The installer's interactive prompt surveys the operator for all four on a
-TTY (see [`installer/prompt.sh`](../installer/prompt.sh)
-`_prompt_psiphon_credentials`); the installer writes them into
-`panel.env` (see [`installer/panel_install.sh`](../installer/panel_install.sh)).
-On a non-interactive (piped) install the prompt is skipped — you must
-instead edit `panel.env` by hand and restart the panel:
+The installer no longer surveys the operator at install time —
+[`installer/prompt.sh`](../installer/prompt.sh)'s `_prompt_psiphon_credentials`
+function was deleted in Phase 24, and
+[`installer/panel_install.sh`](../installer/panel_install.sh)'s heredoc
+emits an empty `${psiphon_creds_block}` by default. To substitute your own
+commercial sponsor values, edit `panel.env` AFTER install + restart:
 
 ```bash
 sudo vi /opt/psiphon-3x-ui/panel.env
@@ -120,30 +123,44 @@ sudo vi /opt/psiphon-3x-ui/panel.env
 #    PSIPHON_PROPAGATION_CHANNEL_ID="<your 32-hex value>"
 #    PSIPHON_SPONSOR_ID="<your 16-hex value>"
 #    PSIPHON_REMOTE_SERVER_LIST_URL="<https://…>"
-#    PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY="<base64 ed25519 pubkey>"
+#    PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY="<base64 RSA-2048 SPKI>"
 sudo systemctl restart psiphon-3x-ui
 ```
 
-Then either re-run the wizard apply step (`POST /api/wizard/apply`) or reach
-for the inline-enable button on the dashboard — the first
-`render_config(...)` call after restart will validate all four and
-fast-fail with the actionable message if any are still placeholder-shaped
-(empty / `"..."` literal / all-`F`'s / all-`0`'s / non-base64 pubkey /
-non-`http(s)://` URL).
+Then either re-run the wizard apply step (`POST /api/wizard/apply`) or hit
+the inline-enable button on the dashboard. The first `render_config(...)`
+call after restart picks up the override (only the four scalar fields
+above can be overridden — `ServerEntrySignaturePublicKey`,
+`ExchangeObfuscationKey`, and the plural `RemoteServerListURLs` /
+`ObfuscatedServerListRootURLs` arrays are not env-overridable; they always
+ship the public-bootstrap defaults).
 
-### Confirming the panel reads them
+| Env var (panel.env)                                | JSON field in `<CODE>.json`             | Format note |
+| -------------------------------------------------- | --------------------------------------- | ----------- |
+| `PSIPHON_PROPAGATION_CHANNEL_ID`                   | `PropagationChannelId`                  | 32 hex chars (uppercase; NOT all-`F`'s) |
+| `PSIPHON_SPONSOR_ID`                               | `SponsorId`                             | 16 hex chars (NOT all-`0`'s) |
+| `PSIPHON_REMOTE_SERVER_LIST_URL`                   | `RemoteServerListURLs`                  | wrapped to a 1-element TransferURL array; must start with `https://` (or `http://`) |
+| `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`  | `RemoteServerListSignaturePublicKey`   | **base64-encoded RSA-2048 SPKI** for the public client — ~716 chars. The base64 regex `[A-Za-z0-9+/]{42,}={0,2}` also tolerates shorter Ed25519 (~44 chars) keys. (NOT a bare 64-hex string.) |
+
+> **Note**: `RemoteServerListSignaturePublicKey` is RSA-2048 (~716 base64
+> chars) for the public Psiphon-3 client, NOT Ed25519. The Ed25519
+> (~44 chars) key lives in the SEPARATE `ServerEntrySignaturePublicKey`
+> field, which signs individual server entries inside the list (and is NOT
+> env-overridable; the panel always ships the public-bootstrap Ed25519 default).
+
+### Confirming the panel reads your override
 
 There's no need to peek at the on-disk config JSON — the panel's
 [`render_config`](../panel/psiphon/__init__.py) raises
-`PsiphonCredentialError` if any value looks like a placeholder, **before**
-any config file is written. So this one-liner is a complete credential
-sanity check after editing `panel.env`:
+`PsiphonCredentialError` if your override value looks like a placeholder,
+**before** any config file is written. So this one-liner is a complete
+credential sanity check after editing `panel.env`:
 
 ```bash
 ${VENV_DIR:-/opt/psiphon-3x-ui/venv}/bin/python -c \
   "from panel.psiphon import render_config; print(render_config('US', 1080).keys())"
-# prints dict_keys([... 7 keys ...])  → all four creds are real
-# raises PsiphonCredentialError(...)   → a stub value is still in panel.env
+# prints dict_keys([... 11 keys ...])  → override accepted / defaults in effect
+# raises PsiphonCredentialError(...)   → your override value looks like a known placeholder
 ```
 
 ## Per-country Psiphon tunnels (`psiphon-tunnel@<CODE>.service`)

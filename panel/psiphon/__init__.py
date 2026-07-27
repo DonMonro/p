@@ -34,49 +34,113 @@ from typing import Any
 from ..config import get_settings
 
 # ---------------------------------------------------------------------------
-# Hotfix #14 (Phase 23): Psiphon Network upstream credentials are NO LONGER
-# hardcoded in this module. They MUST be supplied by the operator via env vars
-# read from ${ENV_FILE} (/opt/psiphon-3x-ui/panel.env):
+# Credential resolution strategy (post-Phase-24 cleanup):
 #
-#   PSIPHON_PROPAGATION_CHANNEL_ID              — e.g. 32-char hex string
-#   PSIPHON_SPONSOR_ID                          — e.g. 16-char hex string
-#   PSIPHON_REMOTE_SERVER_LIST_URL              — https://s3.amazonaws.com/...
-#   PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY — base64-encoded
-#                                                    ed25519 pubkey (≈44 chars)
+# The panel ships with the Psiphon-3 *public-bootstrap* constants baked in
+# as `_PUBLIC_*` defaults below. These are the same four(+two) bootstrap
+# values Psiphon Inc. embeds in every public client binary (the Play Store
+# Android app, the iOS app, the Windows desktop client). They are universal
+# — identical across every public build — and they are sufficient for any
+# operator to connect to the production Psiphon Network.
 #
-# All four are MANDATORY Psiphon-Inc-issued commercial-grade credentials.
-# Without them the upstream binary boots, opens its SOCKS5 listener, then
-# tries to authenticate the S3-listed remote server list against the supplied
-# signature-pubkey → fails → 5-minute EstablishTunnelTimeout loop → exit →
-# restart-loop with `AvailableEgressRegions:[]` and `NetworkID:UNKNOWN`. To
-# short-circuit that 5-minute death-loop and surface a CLEAR actionable error,
-# `_resolve_upstream_credentials()` raises `PsiphonCredentialError` if any of
-# the four are missing OR look like the externally-known placeholder values
-# (all-F's / all-0's / our fabricated pubkey / the upstream stub "..." form).
+# The four env-var overrides below let commercial sponsors substitute their
+# own private credentials if they have a direct Psiphon-Inc sponsorship
+# (rare). When an env var is UNSET, render_config falls back to the
+# `_PUBLIC_*` default below — no operator intervention is required for a
+# working tunnel.
 #
-# The legacy constants `_LEGACY_STUB_PROPAGATION_CHANNEL_ID` etc. are KEPT
-# below only as documentation fallbacks for tests that exercise the
-# placeholder-rejection edge case (they ARE the placeholders we reject).
-# They MUST NOT be used by `render_config` directly — `_resolve_upstream_credentials`
-# is the SINGLE entry point.
+# When an env var is SET BUT its value looks like an externally-known
+# placeholder (all-F's / all-0's / our pre-Phase-24 fabricated pubkey /
+# the upstream stub "..." form / a non-https URL), render_config raises
+# :class:`PsiphonCredentialError` rather than silently accept the bad
+# value. This rejects the operator's obviously-incorrect override without
+# blocking default operation.
+#
+#   PSIPHON_PROPAGATION_CHANNEL_ID              — 16-char hex string (default
+#                                                  "92AACC5BABE0944C" from
+#                                                  the Psiphon-3 public build)
+#   PSIPHON_SPONSOR_ID                          — 16-char hex string (same
+#                                                  public value as PropChan)
+#   PSIPHON_REMOTE_SERVER_LIST_URL              — single https URL (default
+#                                                  is the primary S3 mirror)
+#   PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY — base64-encoded RSA-2048
+#                                                  SPKI (~716 chars) — Psiphon
+#                                                  uses RSA-2048 for the
+#                                                  server-list signature, not
+#                                                  Ed25519. (Edd25519 = ~44 chars.)
+# ---------------------------------------------------------------------------
+# Decoded from the APK dump's base64 `RemoteServerListURLs` array (paths
+# verified equal post-decode against the user-provided JSON dump):
+#   aHR0cHM6Ly9zMy5hbWF6b25hd3MuY29tL3BzaXBob24vd2ViL21qcjQtcDIzci1wdXdsL3NlcnZlcl9saXN0X2NvbXByZXNzZWQ=
+#     → https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed
+#   aHR0cHM6Ly93d3cuYmxvZ3NmbWNhbmNlcmNpdGl6ZW4uY29tL3dlYi9tanI0LXAyM3ItcHV3bC9zZXJ2ZXJfbGlzdF9jb21wcmVzc2Vk
+#     → https://www.blogsfmcancercitizen.com/web/mjr4-p23r-puwl/server_list_compressed
+#   aHR0cHM6Ly93d3cuaGVyYm14ZGlpbmNvcnBvcmF0ZWQuY29tL3dlYi9tanI0LXAyM3ItcHV3bC9zZXJ2ZXJfbGlzdF9jb21wcmVzc2Vk
+#     → https://www.herbxdiiincorporated.com/web/mjr4-p23r-puwl/server_list_compressed
+#   aHR0cHM6Ly93d3cueHlkaWFtb25kZGJleHBlcnQuY29tL3dlYi9tanI0LXAyM3ItcHV3bC9zZXJ2ZXJfbGlzdF9jb21wcmVzc2Vk
+#     → https://www.xydiamonddbexpert.com/web/mjr4-p23r-puwl/server_list_compressed
+# The "osl" (ObfuscatedServerList) variant shares the same 4 domains with a
+# different suffix (`/osl` instead of `/server_list_compressed`).
 # ---------------------------------------------------------------------------
 
 
 class PsiphonCredentialError(RuntimeError):
-    """Raised by render_config when the four Psiphon-Inc upstream
-    credentials are missing OR look like the externally-known placeholders
-    (all-F's PropagationChannelId / all-0's SponsorId / the fabricated
-    sig-pubkey / the upstream stub "..." form / non-base64 sig-pubkey / a
-    non-https URL). The message is operator-actionable and names the
-    specific env-var that must be set in /opt/psiphon-3x-ui/panel.env."""
+    """Raised by render_config ONLY when an operator-provided env-var
+    override looks like an externally-known placeholder (all-F's
+    PropagationChannelId / all-0's SponsorId / the pre-Phase-24 fabricated
+    pubkey / the upstream stub "..." form / a non-base64 sig-pubkey / a
+    non-https URL). The default (no env) code path NEVER raises this — the
+    `_PUBLIC_*` baked-in defaults are always valid public-bootstrap
+    values for the production Psiphon Network."""
 
 
-# The legacy hardcoded values — kept ONLY as documentation of the placeholder
-# patterns `_resolve_upstream_credentials` must reject. Used by tests that
-# exercise the placeholder-detection edge case.
+# ---------------------------------------------------------------------------
+# Public-bootstrap constants — extracted from the Psiphon-3 Android client
+# (Play Store public APK). These are universal across every public Psiphon
+# client binary; baking them in makes the panel install silently without
+# operator intervention. See plans/EMBED-PSIPHON-PUBLIC-BOOTSTRAP.md.
+# ---------------------------------------------------------------------------
+_PUBLIC_PROPAGATION_CHANNEL_ID = "92AACC5BABE0944C"
+_PUBLIC_SPONSOR_ID = "92AACC5BABE0944C"
+
+_PUBLIC_REMOTE_SERVER_LIST_URLS: tuple[str, ...] = (
+    "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+    "https://www.blogsfmcancercitizen.com/web/mjr4-p23r-puwl/server_list_compressed",
+    "https://www.herbxdiiincorporated.com/web/mjr4-p23r-puwl/server_list_compressed",
+    "https://www.xydiamonddbexpert.com/web/mjr4-p23r-puwl/server_list_compressed",
+)
+
+_PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS: tuple[str, ...] = (
+    "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/osl",
+    "https://www.blogsfmcancercitizen.com/web/mjr4-p23r-puwl/osl",
+    "https://www.herbxdiiincorporated.com/web/mjr4-p23r-puwl/osl",
+    "https://www.xydiamonddbexpert.com/web/mjr4-p23r-puwl/osl",
+)
+
+# Psiphon ships an RSA-2048 SubjectPublicKeyInfo for the RemoteServerList
+# signature, base64-encoded (~716 chars including '=' padding). The full
+# value is below as a single string literal (PEM-style line breaks inside
+# JSON would corrupt tunnel-core's parsing, so we keep it on one line).
+_PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY = (
+    "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM="
+)
+
+# Ed25519 server-entry signature pubkey (44 chars base64) — also universal
+# across every public Psiphon client binary.
+_PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY = "sHuUVTWaRyh5pZwy4UguSgkwmBe0EHtJJkoF5WrxmvA="
+
+# Diffie-Hellman exchange-obfuscation key (44 chars base64) — also universal
+# across every public Psiphon client binary.
+_PUBLIC_EXCHANGE_OBFUSCATION_KEY = "DpXzloJk1Hw6aSzmKKky0xcahsEHubch81Mi6K0XMlU="
+
+
+# Legacy placeholder constants — kept ONLY as documentation of the values
+# the placeholder-rejector must catch (operator-provided env-var overrides
+# that match these patterns are rejected). Used by TestPsiphonCredentialError
+# regressions in tests/test_psiphon.py via `monkeypatch.setenv`. These MUST
+# NOT be used by render_config's default code path — that uses `_PUBLIC_*`.
 _LEGACY_STUB_PROPAGATION_CHANNEL_ID = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
 _LEGACY_STUB_SPONSOR_ID = "0000000000000000"
-# Kept as a sequence for source-compat with tests that imported the tuple.
 _LEGACY_STUB_REMOTE_SERVER_LIST_URLS: tuple[str, ...] = (
     "https://s3.amazonaws.com/psiphon/web/4r9isqmlq6j4thjvfmxq2qgfqh48mdga7kjapsrjr9s2xqjz",
 )
@@ -84,13 +148,11 @@ _LEGACY_STUB_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY = (
     "62BFA6DFD5C8C6E2E8F5B9E3C1F9F8A5D6E2B6C9A0F1D2E3B4C5D6F7E8A9B0C"
 )
 
-# Source-compat aliases — keep the old public names importable so existing
-# tests that imported PSIPHON_PROPAGATION_CHANNEL_ID etc. don't break
-# with ImportError. Tests that compare against these constant names are
-# EXPECTED to instead exercise the env-var-driven code path; the value
-# behind each alias is the same placeholder stub (so any test that DOES
-# accidentally render_config-without-setenv will get the fast-fail error
-# OR — for the static-constant grep tests — find the literal still present).
+# Source-compat aliases for the placeholders (so static-source grep tests
+# in tests/test_hardening.py that import PSIPHON_PROPAGATION_CHANNEL_ID
+# etc. still resolve). These point at the legacy STUB values — commercial
+# operators who `import PSIPHON_*` to introspect placeholder patterns still
+# see the same expected placeholder strings.
 PSIPHON_PROPAGATION_CHANNEL_ID = _LEGACY_STUB_PROPAGATION_CHANNEL_ID
 PSIPHON_SPONSOR_ID = _LEGACY_STUB_SPONSOR_ID
 PSIPHON_REMOTE_SERVER_LIST_URLS = _LEGACY_STUB_REMOTE_SERVER_LIST_URLS
@@ -112,14 +174,18 @@ def _is_all_hex_repeat(ch: str, value: str, min_len: int = 8) -> bool:
 def _looks_like_placeholder(name: str, value: str) -> str | None:
     """Return a human-readable reason string if `value` looks like the
     externally-known placeholder for the credential named `name`, else None.
-    The values we reject:
+    The values we reject (operator-provided env-var overrides only — the
+    default code path uses `_PUBLIC_*` baked-in values which never trigger
+    this rejector):
       * empty string (covers "missing entirely")
       * the literal "..." (the upstream psiphon.config.sample stub form)
       * all-F's hex (PropagationChannelId placeholder)
       * all-0's hex (SponsorId placeholder)
       * the fabricated 64-hex sig-pubkey the panel shipped pre-Hotfix-14
-      * for the sig-pubkey specifically: any non-base64 string (base64
-        for an ed25519 pubkey is ≈43-44 chars matching ^[A-Za-z0-9+/]{42,}=*$)
+      * for the sig-pubkey specifically: any non-base64 string. NOTE Psiphon
+        uses RSA-2048 SPKI for RemoteServerListSignaturePublicKey (~716 chars
+        base64), NOT Ed25519 (~44 chars). Ed25519 is used for the *separate*
+        ServerEntrySignaturePublicKey field (which has no env override here).
     """
     if not value or value.strip() == "":
         return "is empty / unset"
@@ -134,65 +200,132 @@ def _looks_like_placeholder(name: str, value: str) -> str | None:
     ):
         return (
             "is the FABRICATED placeholder shipped pre-Hotfix-14 — replace "
-            "with the real base64-encoded ed25519 signature pubkey Psiphon "
-            "Inc. embedded in your client build"
+            "with the real base64-encoded RSA-2048 SPKI signature pubkey "
+            "Psiphon Inc. embedded in your client build (or unset the env "
+            "var to use the panel's baked-in public-bootstrap default)"
         )
-    # ed25519 pubkeys base64-encode to ~43-44 chars ending in '=' sometimes.
+    # RSA-2048 SPKI base64 is ~716 chars; older Ed25519 pubkeys were ~44 chars.
+    # Both shapes are valid; reject anything not matching base64 (with /+ and
+    # optional '=' padding).
     if name == "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY" and not re.fullmatch(
         r"[A-Za-z0-9+/]{42,}={0,2}", value
     ):
         return (
-            "is not a valid base64-encoded ed25519 public key — Psiphon Inc. "
-            "ships it base64-encoded (typically ~44 chars matching "
-            "^[A-Za-z0-9+/]{42,}=*$))"
+            "is not a valid base64-encoded public key — Psiphon Inc. ships "
+            "the RemoteServerListSignaturePublicKey base64-encoded (RSA-2048 "
+            "SPKI is ~716 chars; legacy ed25519 was ~44 chars matching "
+            "^[A-Za-z0-9+/]{42,}=*$)"
         )
     if name == "PSIPHON_PROPAGATION_CHANNEL_ID" and _is_all_hex_repeat("F", value):
-        return "is the all-FF placeholder (32 × 'F') — replace with your real Psiphon-Inc PropagationChannelId"
+        return "is the all-FF placeholder (32 × 'F') — replace with your real Psiphon-Inc PropagationChannelId (or unset the env var to use the panel's baked-in public-bootstrap default)"
     if name == "PSIPHON_SPONSOR_ID" and _is_all_hex_repeat("0", value):
         return (
-            "is the all-zero placeholder (16 × '0') — replace with your real Psiphon-Inc SponsorId"
+            "is the all-zero placeholder (16 × '0') — replace with your real Psiphon-Inc SponsorId (or unset the env var to use the panel's baked-in public-bootstrap default)"
         )
     if name == "PSIPHON_REMOTE_SERVER_LIST_URL" and not value.startswith(("https://", "http://")):
-        return "is not an http(s):// URL — Psiphon Inc. publishes a well-known S3 mirror"
+        return "is not an http(s):// URL — Psiphon Inc. publishes a well-known S3 mirror (or unset the env var to use the panel's baked-in 4-mirror public-bootstrap default)"
     return None
 
 
-def _resolve_upstream_credentials() -> dict[str, str]:
-    """Return a dict with the four Psiphon-Inc upstream credentials
-    resolved from env vars (PSIPHON_PROPAGATION_CHANNEL_ID,
-    PSIPHON_SPONSOR_ID, PSIPHON_REMOTE_SERVER_LIST_URL,
-    PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY).
+def _resolve_upstream_credentials() -> dict[str, Any]:
+    """Resolve the seven Psiphon-Inc upstream bootstrap fields, using the
+    universal public-bootstrap defaults baked into this module and letting
+    operator-set env vars override any subset of them.
 
-    Raises :class:`PsiphonCredentialError` on the FIRST value that's
-    missing or looks like the externally-known placeholder form. The
-    error message is operator-actionable — names the env-var + the
-    remediation (e.g. \"set PSIPHON_SPONSOR_ID in
-    /opt/psiphon-3x-ui/panel.env\").
+    Returns a dict keyed by the per-config JSON field name (the form
+    `render_config` writes into the per-country JSON):
+        PropagationChannelId            — string (16-hex chars default)
+        SponsorId                       — string (16-hex chars default)
+        RemoteServerListURLs            — list[dict] (4 TransferURL mirrors)
+        ObfuscatedServerListRootURLs     — list[dict] (4 TransferURL mirrors)
+        RemoteServerListSignaturePublicKey — string (RSA-2048 SPKI base64)
+        ServerEntrySignaturePublicKey    — string (Ed25519 base64)
+        ExchangeObfuscationKey           — string (base64)
 
-    The four values are the keys Psiphon-Inc ships only in their client
-    binaries; there is no public open-source source for them. Operating
-    against the production Psiphon Network REQUIRES a commercial-grade
-    set issued by Psiphon Inc. — see docs/TROUBLESHOOTING.md.
+    Env-var overridable fields (override values run through
+    :func:`_looks_like_placeholder`; bad / placeholder-looking operator
+    overrides raise :class:`PsiphonCredentialError` so the operator gets a
+    clear actionable message instead of a silently-non-functional tunnel):
+        PSIPHON_PROPAGATION_CHANNEL_ID
+        PSIPHON_SPONSOR_ID
+        PSIPHON_REMOTE_SERVER_LIST_URL  — singular; if set, used as the only
+                                          entry in RemoteServerListURLs
+                                          (maintained for Hotfix-#14 source-
+                                          compat; the default still returns
+                                          the full 4-mirror list).
+        PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
+
+    The remaining three public-bootstrap fields
+    (ServerEntrySignaturePublicKey, ExchangeObfuscationKey, and the four
+    ObfuscatedServerListRootURLs mirrors) are NOT env-overridable — they
+    are universal across every public Psiphon client binary. Override via
+    ${ENV_FILE} only matters for operators with a commercial direct
+    sponsorship that issued them private values (rare); they would patch
+    this module directly if they needed to substitute those too.
     """
-    fields: list[tuple[str, str]] = [
-        ("PSIPHON_PROPAGATION_CHANNEL_ID", "PropagationChannelId"),
-        ("PSIPHON_SPONSOR_ID", "SponsorId"),
-        ("PSIPHON_REMOTE_SERVER_LIST_URL", "RemoteServerListUrl"),
-        ("PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY", "RemoteServerListSignaturePublicKey"),
+    # Simple scalar fields — env override beats default; placeholder-looking
+    # operator value raises PsiphonCredentialError.
+    scalar_overrides: list[tuple[str, str, str]] = [
+        ("PSIPHON_PROPAGATION_CHANNEL_ID", "PropagationChannelId", _PUBLIC_PROPAGATION_CHANNEL_ID),
+        ("PSIPHON_SPONSOR_ID", "SponsorId", _PUBLIC_SPONSOR_ID),
+        (
+            "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
+            "RemoteServerListSignaturePublicKey",
+            _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY,
+        ),
     ]
-    out: dict[str, str] = {}
-    for envname, fieldname in fields:
-        value = os.environ.get(envname, "").strip()
-        reason = _looks_like_placeholder(envname, value)
+    out: dict[str, Any] = {}
+    for envname, fieldname, default_value in scalar_overrides:
+        env_value = os.environ.get(envname, "").strip()
+        if env_value:
+            reason = _looks_like_placeholder(envname, env_value)
+            if reason is not None:
+                raise PsiphonCredentialError(
+                    f"STUB credential detected for {fieldname} — env var "
+                    f"{envname} {reason}. Set {envname} in "
+                    f"/opt/psiphon-3x-ui/panel.env (then `systemctl restart "
+                    "psiphon-3x-ui`) with your real Psiphon-Inc-issued value "
+                    "or unset it to fall back to the panel's baked-in "
+                    "public-bootstrap default. See docs/TROUBLESHOOTING.md."
+                )
+            out[fieldname] = env_value
+        else:
+            out[fieldname] = default_value
+
+    # RemoteServerListURLs — plural array of 4 TransferURL mirrors by
+    # default; if PSIPHON_REMOTE_SERVER_LIST_URL is set (the Hotfix-#14
+    # singular-path env), use just that URL in the array.
+    single_url = os.environ.get("PSIPHON_REMOTE_SERVER_LIST_URL", "").strip()
+    if single_url:
+        reason = _looks_like_placeholder("PSIPHON_REMOTE_SERVER_LIST_URL", single_url)
         if reason is not None:
             raise PsiphonCredentialError(
-                f"STUB credential detected for {fieldname} — env var "
-                f"{envname} {reason}. Set {envname} in "
+                f"STUB credential detected for RemoteServerListUrl — env var "
+                f"PSIPHON_REMOTE_SERVER_LIST_URL {reason}. Set "
+                f"PSIPHON_REMOTE_SERVER_LIST_URL in "
                 f"/opt/psiphon-3x-ui/panel.env (then `systemctl restart "
-                "psiphon-3x-ui`) with your real Psiphon-Inc-issued value. "
-                "See docs/TROUBLESHOOTING.md for how to obtain one."
+                "psiphon-3x-ui`) with a real https Psiphon-Inc server-list "
+                "URL or unset it to fall back to the panel's baked-in "
+                "4-mirror public-bootstrap default. See "
+                "docs/TROUBLESHOOTING.md."
             )
-        out[fieldname] = value
+        out["RemoteServerListURLs"] = [
+            {"URL": single_url, "OnlyAfterAttempts": 0, "SkipVerify": False}
+        ]
+    else:
+        out["RemoteServerListURLs"] = [
+            {"URL": u, "OnlyAfterAttempts": 0, "SkipVerify": False}
+            for u in _PUBLIC_REMOTE_SERVER_LIST_URLS
+        ]
+
+    # The remaining four public-bootstrap fields are NOT env-overridable.
+    out["ObfuscatedServerListRootURLs"] = [
+        {"URL": u, "OnlyAfterAttempts": 0, "SkipVerify": False}
+        for u in _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS
+    ]
+    out["ServerEntrySignaturePublicKey"] = _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
+    out["ExchangeObfuscationKey"] = _PUBLIC_EXCHANGE_OBFUSCATION_KEY
+
     return out
 
 
@@ -209,27 +342,51 @@ class PsiphonUnitError(RuntimeError):
 def render_config(country_code: str, socks_port: int) -> dict[str, Any]:
     """Build a fully-populated per-country Psiphon config dict.
 
-    Hotfix #14 (Phase 23): the four Psiphon-Inc upstream credentials
-    (PropagationChannelId, SponsorId, RemoteServerListUrl,
-    RemoteServerListSignaturePublicKey) are NO LONGER hardcoded in this
-    module — they MUST be supplied by the operator via env vars read from
-    ${ENV_FILE} (/opt/psiphon-3x-ui/panel.env). See
-    `_resolve_upstream_credentials` + `PsiphonCredentialError` above for
-    the exact placeholder-rejection rules + the operator-actionable error
-    message.
+    Phase 24 (post-Hotfix-#14 cleanup): the seven Psiphon-Inc upstream
+    bootstrap fields (PropagationChannelId, SponsorId, RemoteServerListURLs,
+    ObfuscatedServerListRootURLs, RemoteServerListSignaturePublicKey,
+    ServerEntrySignaturePublicKey, ExchangeObfuscationKey) are NO LONGER
+    operator-mandatory — the public-bootstrap constants extracted from the
+    Psiphon-3 client binaries are baked in as `_PUBLIC_*` defaults so the
+    panel works out-of-the-box. Env vars (`PSIPHON_PROPAGATION_CHANNEL_ID`,
+    `PSIPHON_SPONSOR_ID`, `PSIPHON_REMOTE_SERVER_LIST_URL`,
+    `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`) become OPTIONAL
+    OVERRIDES — a commercial sponsor can substitute its own PropChannel /
+    SponsorId / signed server-list URL / sig-pubkey via `${ENV_FILE}`
+    (/opt/psiphon-3x-ui/panel.env) without forking the panel. See
+    `_resolve_upstream_credentials` for the override precedence + the
+    placeholder-rejection rules that fire only on operator-supplied BAD
+    overrides (the default code path never raises).
+
+    The full field set emitted here matches what tunnel-core's
+    `parameters.Config.DecodeAndValidate` expects from a modern Psiphon-3
+    client binary (verified against the public APK dump): the plural
+    `RemoteServerListURLs` TransferURL array (NOT the legacy singular
+    `RemoteServerListUrl` string — its `promoteLegacyTransferURL` branch
+    is only triggered when the plural array is nil, which we no longer
+    do), the parallel `ObfuscatedServerListRootURLs` array used by the
+    obfuscated-server-list transport, the RSA-2048 SPKI
+    `RemoteServerListSignaturePublicKey` (~716 base64 chars) that signs
+    the server-list blob, the Ed25519 `ServerEntrySignaturePublicKey`
+    (~44 base64 chars) that signs individual server entries, the
+    `ExchangeObfuscationKey` that masks the initial handshake, and
+    `UseIndistinguishableTLS: true` so tunnel-core fronts TLS as an
+    unidentifiable client hello (matches public-client behaviour).
 
     The per-country fields are ``EgressRegion`` (the 2-letter ISO code)
     and ``LocalSocksProxyPort``. The result is ready to serialise to JSON.
 
     Raises:
         ValueError: if country_code / socks_port are out of spec.
-        PsiphonCredentialError: if any of the four upstream credentials
-            env vars are unset OR look like the externally-known
+        PsiphonCredentialError: only if an operator EXPLICITLY sets a
+            `PSIPHON_*` env override that looks like the externally-known
             placeholder value (all-F's / all-0's / upstream stub "..." /
-            non-base64 sig-pubkey / non-https URL). See
-            `_looks_like_placeholder` for the exact rules — keeps the
-            panel from spending 5 minutes in EstablishTunnelTimeout
-            waiting for a server list it can never authenticate.
+            non-base64 sig-pubkey / non-https URL). Omitting the env vars
+            entirely is now VALID — the baked-in `_PUBLIC_*` defaults are
+            used instead. See `_looks_like_placeholder` for the exact
+            rules — keeps the panel from spending 5 minutes in
+            EstablishTunnelTimeout waiting for a server list it can
+            never authenticate.
     """
     code = country_code.strip().upper()
     if not code or len(code) != 2 or not code.isalpha():
@@ -240,26 +397,45 @@ def render_config(country_code: str, socks_port: int) -> dict[str, Any]:
 
     creds = _resolve_upstream_credentials()
 
-    # Hotfix #12 (Bug #1): emit the LEGACY DEPRECATED SINGULAR field
-    # `RemoteServerListUrl` (note lowercase final "l") as a plain STRING.
-    # The upstream binary's LoadConfig has a legacy promote branch
-    # (config.go:82242): `if config.RemoteServerListUrl != "" &&
-    # config.RemoteServerListURLs == nil { config.RemoteServerListURLs =
-    # promoteLegacyTransferURL(config.RemoteServerListUrl) }` which wraps
-    # the string as &parameters.TransferURL{URL: base64(URL),
-    # OnlyAfterAttempts: 0} — exactly the shape DecodeAndValidate requires.
-    # Pre-Hotfix #14 we hardcoded the well-known upstream S3 mirror URL
-    # here; post-Hotfix-#14 the URL comes from the operator's env var
-    # PSIPHON_REMOTE_SERVER_LIST_URL (a real Psiphon-Inc-issued URL).
+    # Phase 24: emit the full modern tunnel-core field set. The legacy
+    # singular `RemoteServerListUrl` (lowercase final "l") is NOT emitted
+    # here anymore — tunnel-core's `LoadConfig` promote branch
+    # (config.go:82242: `if config.RemoteServerListUrl != "" &&
+    # config.RemoteServerListURLs == nil { promoteLegacyTransferURL(...) }`)
+    # only fires when the plural `RemoteServerListURLs` array is nil, which
+    # is no longer the case. Keeping the singular around would be redundant
+    # (and could theoretically win over the plural on some binary builds,
+    # losing the 3 alternate mirrors + the SkipVerify / OnlyAfterAttempts
+    # transfer-metadata fields).
     return {
+        # Identity / sponsorship — env-overridable, default public-bootstrap.
         "PropagationChannelId": creds["PropagationChannelId"],
         "SponsorId": creds["SponsorId"],
-        # Hotfix #12: legacy singular URL — the binary auto-promotes via
-        # promoteLegacyTransferURL. Plain string, NOT base64-encoded.
-        "RemoteServerListUrl": creds["RemoteServerListUrl"],
-        # ed25519 signature-public-key — base64-encoded, supplied by
-        # Psiphon Inc. and embedded in their shipped client binaries.
+        # Plural TransferURL array (4 mirrors for the public client). Each
+        # entry is `{"URL": <raw https url>, "OnlyAfterAttempts": 0,
+        # "SkipVerify": false}`. tunnel-core base64-encodes the URL
+        # internally in DecodeAndValidate — we ship the RAW https string
+        # (mirrors what the public APK's JSONObject serialises).
+        "RemoteServerListURLs": creds["RemoteServerListURLs"],
+        # Parallel obfuscated-server-list-root array (same 4 mirror hosts,
+        # `/osl` path). Used by the OSL transport when the plain server list
+        # is unreachable (censorship fallback). Same TransferURL shape.
+        "ObfuscatedServerListRootURLs": creds["ObfuscatedServerListRootURLs"],
+        # RSA-2048 SPKI base64 (~716 chars). Signs the compressed server-list
+        # blob fetched from RemoteServerListURLs.
         "RemoteServerListSignaturePublicKey": creds["RemoteServerListSignaturePublicKey"],
+        # Ed25519 base64 (~44 chars). Signs each individual server entry
+        # inside the server list — tunnel-core rejects unsigned / bad-sig
+        # entries. NOTE distinct from the RSA key above.
+        "ServerEntrySignaturePublicKey": creds["ServerEntrySignaturePublicKey"],
+        # Per-session handshake obfuscation seed (~44 base64 chars). Fronts
+        # the initial client <-> server key exchange so DPI can't fingerprint
+        # the Psiphon handshake.
+        "ExchangeObfuscationKey": creds["ExchangeObfuscationKey"],
+        # TLS fronting: emit an unidentifiable ClientHello so DPI can't
+        # distinguish the tunnel from ordinary HTTPS to the fronted CDN.
+        "UseIndistinguishableTLS": True,
+        # Per-country fields.
         "EgressRegion": code,
         "LocalSocksProxyPort": port,
         "DisableLocalHTTPProxy": True,

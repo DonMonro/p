@@ -2922,81 +2922,105 @@ class TestHotfix12PostReleaseRegressions:
     _DASHBOARD_ROUTER = Path(__file__).resolve().parent.parent / "panel" / "dashboard" / "router.py"
 
     # ---- Bug #1: psiphon config schema — legacy singular URL field -------
-    def test_render_config_uses_legacy_singular_RemoteServerListUrl(self):
+    def test_render_config_uses_plural_RemoteServerListURLs_array(self):
+        """Phase 24 (post-Hotfix-#14 cleanup) — render_config now emits the
+        PLURAL `RemoteServerListURLs` field sourced from
+        `creds["RemoteServerListURLs"]`. The legacy singular `RemoteServerListUrl`
+        (lowercase final 'l') is DROPPED — tunnel-core's `promoteLegacyTransferURL`
+        branch only fires when `RemoteServerListURLs == nil`, which we no longer
+        produce. This is the OPPOSITE of Hotfix-#12 Bug #1's invariant; Hotfix #12
+        chose the singular shape as a workaround; Phase 24 adopts the proper
+        modern TransferURL-array shape directly (extracted from the public APK
+        client's 4-mirror config)."""
         import re  # noqa: PLC0415
 
         text = self._PSIPHON_INIT.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-        # The implemented config dict must emit the LEGACY singular key
-        # `RemoteServerListUrl` (lowercase final 'l') — auto-promoted by the
-        # binary's `promoteLegacyTransferURL` (config.go:202568 +
-        # LoadConfig#82242). Pre-Hotfix-#14 the dict literal referenced the
-        # module-level PSIPHON_REMOTE_SERVER_LIST_URLS[0] constant directly;
-        # Hotfix #14 pivoted the upstream credentials to env-var overrides
-        # so the literal now reads `creds["RemoteServerListUrl"]`. Either
-        # form satisfies the invariant — assert the singular key IS
-        # emitted by the return-dict construction.
+        # The implemented config dict must emit the PLURAL key
+        # `RemoteServerListURLs` sourced from `_resolve_upstream_credentials`.
         assert re.search(
-            r'"RemoteServerListUrl"\s*:\s*'
-            r'(?:PSIPHON_REMOTE_SERVER_LIST_URLS\[0\]|creds\["RemoteServerListUrl"\])',
+            r'"RemoteServerListURLs"\s*:\s*creds\["RemoteServerListURLs"\]',
             no_comments,
         ), (
-            "Bug #1 — render_config must emit the legacy singular "
-            "`RemoteServerListUrl` string field (lowercase final 'l'), "
-            "auto-promoted by the binary's "
-            "`promoteLegacyTransferURL` (config.go:202568 + LoadConfig#82242)."
+            "Phase 24 — render_config must emit the plural "
+            "`RemoteServerListURLs` array (sourced from "
+            "_resolve_upstream_credentials) — NOT the legacy singular "
+            "`RemoteServerListUrl` string that Hotfix-#12 Bug #1 used."
+        )
+        # And the legacy singular key must NOT be emitted in the live code.
+        assert not re.search(
+            r'"RemoteServerListUrl"\s*:\s*',
+            no_comments,
+        ), (
+            "Phase 24 — render_config must NOT emit the legacy singular "
+            "`RemoteServerListUrl` field anymore (the plural TransferURL "
+            "array is the primary path; the legacy promote-branch only "
+            "fires when the plural is nil, which we no longer produce)."
         )
 
-    def test_render_config_does_not_emit_plural_RemoteServerListURLs(self):
-        """The plural-string-array shape is the rejected one — must not."""
+    def test_render_config_does_not_emit_broken_string_array_shape(self):
+        """Hotfix-#12 Bug #1 originally rejected the BROKEN shape:
+        `"RemoteServerListURLs": list(<string tuple>)` — that emitted a
+        JSON array of plain strings, but upstream v2.0.39 declares
+        RemoteServerListURLs as TransferURLs (slice of *TransferURL
+        STRUCTS). Hotfix-#12 dodged the bug by emitting the legacy singular;
+        Phase 24 ships the CORRECT plural shape (list of TransferURL dicts
+        with URL / OnlyAfterAttempts / SkipVerify fields). This test asserts
+        the broken plain-string-array shape is STILL NOT emitted (a
+        regression guard: if someone reverts to the broken shape, both this
+        test AND the Phase-24 contract tests in tests/test_psiphon.py fail)."""
         text = self._PSIPHON_INIT.read_text(encoding="utf-8")
-        # The broken shape was the dict literal `"RemoteServerListURLs": ...`
-        # (plural `URLs`, capital). The fix swaps to `"RemoteServerListUrl":`
-        # (singular `Url`). Both keys appear in the docblock, but the literal
-        # dict assignments must only carry the singular.
         import re  # noqa: PLC0415
 
-        # Strip comments — they're allowed to mention either spelling (the
-        # docblock explains the schema upgrade). Tests only concern the live
-        # code.
+        # Strip comments — they're allowed to mention the rejected shape.
         no_comments = re.sub(r"#[^\n]*", "", text)
         assert not re.search(
-            r'"RemoteServerListURLs"\s*:\s*list\(',
+            # The broken shape: `"RemoteServerListURLs": <some string-tuple
+            # or list of strings>`. The CORRECT Phase-24 shape uses
+            # `creds["RemoteServerListURLs"]` (a list of TransferURL dicts),
+            # which is NOT a plain `list(<tuple-of-strings>)` form.
+            r'"RemoteServerListURLs"\s*:\s*list\([^)]*URLS',
             no_comments,
         ), (
-            "Bug #1 — render_config must NOT render the broken plural "
-            '`"RemoteServerListURLs": list(PSIPHON_REMOTE_SERVER_LIST_URLS)` '
-            "(rejected by upstream v2.0.39 — TransferURLs expects "
-            "`[]*TransferURL`-struct entries, not `[]string`)."
+            "Bug #1 / Phase 24 — render_config must NOT render the broken "
+            "plain-string-tuple shape (`\"RemoteServerListURLs\": "
+            "list(PSIPHON_REMOTE_SERVER_LIST_URLS)`) — that's the rejected "
+            "form. Phase 24 substitutes a list of TransferURL dicts via "
+            "creds['RemoteServerListURLs']."
         )
 
-    def test_render_config_emits_singular_url_at_runtime(self, monkeypatch):
-        """End-to-end: the runtime render_config dict IS the new shape.
+    def test_render_config_emits_plural_url_array_at_runtime(self, monkeypatch):
+        """End-to-end: the runtime render_config dict is the Phase-24 shape.
 
-        Hotfix #14 (Phase 23): render_config now sources the upstream
-        credentials from env (it fast-fails with PsiphonCredentialError if
-        any are missing/placeholder). _set_real_psiphon_creds populates
-        fake-but-real-shape values so the test exercises the happy path."""
+        With `_set_real_psiphon_creds` populating fake-but-real-shape values
+        (including the singular PSIPHON_REMOTE_SERVER_LIST_URL env override),
+        `_resolve_upstream_credentials` wraps the singular env URL into a
+        1-element `RemoteServerListURLs` TransferURL array — exactly the shape
+        tunnel-core DecodeAndValidate expects."""
         _set_real_psiphon_creds(monkeypatch)
         from panel.psiphon import (  # noqa: PLC0415
             render_config,
         )
 
         cfg = render_config("AT", 11000)
-        # Singular field present + correctly valued. The value is whatever
-        # the operator supplied via PSIPHON_REMOTE_SERVER_LIST_URL (the panel
-        # no longer caries a hardcoded well-known URL — Hotfix #14).
-        assert isinstance(cfg["RemoteServerListUrl"], str) and cfg["RemoteServerListUrl"]
-        # And crucially: the plural form is NOT present.
-        assert "RemoteServerListURLs" not in cfg, (
-            "Bug #1 — the plural `RemoteServerListURLs` key must NOT be "
-            "in the rendered dict; the binary's legacy-promote branch only "
-            "fires when `RemoteServerListURLs == nil`, which requires "
-            "omitting the plural key entirely."
+        # Plural field present + correctly shaped. The singular env URL is
+        # wrapped into a 1-element TransferURL array.
+        urls = cfg["RemoteServerListURLs"]
+        assert isinstance(urls, list) and len(urls) == 1
+        entry = urls[0]
+        assert isinstance(entry, dict)
+        assert entry["URL"] == _HF14_FAKE_REMOTE_SERVER_LIST_URL
+        assert entry["OnlyAfterAttempts"] == 0
+        assert entry["SkipVerify"] is False
+        # And crucially: the legacy singular key is NOT present anymore.
+        assert "RemoteServerListUrl" not in cfg, (
+            "Phase 24 — the legacy singular `RemoteServerListUrl` key must "
+            "NOT be in the rendered dict; the plural TransferURL array is "
+            "the primary path."
         )
 
-    def test_write_config_writes_singular_key_to_disk(self, monkeypatch, tmp_path):
-        """``json.dumps(render_config(...))`` round-trips the singular key."""
+    def test_write_config_writes_plural_key_to_disk(self, monkeypatch, tmp_path):
+        """``json.dumps(render_config(...))`` round-trips the PLURAL key."""
         import json  # noqa: PLC0415
 
         _set_real_psiphon_creds(monkeypatch)
@@ -3005,8 +3029,12 @@ class TestHotfix12PostReleaseRegressions:
         cfg = render_config("US", 11080)
         blob = json.dumps(cfg, indent=2, sort_keys=True)
         parsed = json.loads(blob)
-        assert "RemoteServerListUrl" in parsed
-        assert "RemoteServerListURLs" not in parsed
+        # Plural key round-trips through JSON as a list of TransferURL dicts.
+        assert "RemoteServerListURLs" in parsed
+        assert isinstance(parsed["RemoteServerListURLs"], list)
+        assert len(parsed["RemoteServerListURLs"]) == 1
+        # Legacy singular key NOT present anymore.
+        assert "RemoteServerListUrl" not in parsed
 
     # ---- Bug #3: detached systemctl restart -----------------------------
     def test_restart_panel_service_uses_systemd_run_no_block(self):
@@ -3207,21 +3235,44 @@ class TestHotfix13PostReleaseRegressions:
         assert cfg["SponsorId"] == _HF14_FAKE_SPONSOR_ID
         assert isinstance(cfg["SponsorId"], str) and cfg["SponsorId"]
 
-    def test_render_config_has_seven_keys_not_six(self, monkeypatch):
-        """Headlock: the dict has 7 keys (was 6 pre-Hotfix-#13) — the
-        new SponsorId slot.
-
-        Hotfix #14 (Phase 23): render_config now fast-fails with
-        PsiphonCredentialError if PSIPHON_* env vars aren't set, so we
-        _set_real_psiphon_creds to exercise the happy 7-key path."""
+    def test_render_config_has_eleven_keys_not_six(self, monkeypatch):
+        """Headlock: the dict has 11 keys post-Phase-24 (was 7 in
+        Hotfix-#14, 6 pre-Hotfix-#13). Phase 24 added 4 NEW keys:
+        `ObfuscatedServerListRootURLs`, `ServerEntrySignaturePublicKey`,
+        `ExchangeObfuscationKey`, `UseIndistinguishableTLS`. The legacy
+        singular `RemoteServerListUrl` was DROPPED (replaced by the plural
+        `RemoteServerListURLs` array, which was already counted as 1 key).
+        Net delta: +4 (new) -0 (SponsorId was Hotfix #13, counted) -0
+        (RemoteServerListUrl swap is a key-name change, not an add/drop).
+        Also: `RemoteServerListUrl` was 1 of the 7; the new plural
+        `RemoteServerListURLs` is 1 in the new 11-set. So Hotfix-#14 had
+        7 keys -> Phase 24 has 11 keys (added the 4 fields above +
+        dropped RemoteServerListUrl after adding RemoteServerListURLs
+        cancels the singular/plural replace)."""
         _set_real_psiphon_creds(monkeypatch)
         from panel.psiphon import render_config  # noqa: PLC0415
 
         cfg = render_config("US", 11080)
-        assert len(cfg) == 7, (
-            "Hotfix #13 — render_config output must have 7 keys after "
-            "the SponsorId addition (was 6 pre-Hotfix-#13)."
+        assert len(cfg) == 11, (
+            "Phase 24 — render_config output must have 11 keys: "
+            "{PropagationChannelId, SponsorId, RemoteServerListURLs, "
+            "ObfuscatedServerListRootURLs, RemoteServerListSignaturePublicKey, "
+            "ServerEntrySignaturePublicKey, ExchangeObfuscationKey, "
+            "UseIndistinguishableTLS, EgressRegion, LocalSocksProxyPort, "
+            "DisableLocalHTTPProxy}."
         )
+        # And the 4 new Phase-24 keys ARE all present:
+        for key in (
+            "RemoteServerListURLs",
+            "ObfuscatedServerListRootURLs",
+            "ServerEntrySignaturePublicKey",
+            "ExchangeObfuscationKey",
+            "UseIndistinguishableTLS",
+        ):
+            assert key in cfg, (
+                f"Phase 24 — render_config output must include the new "
+                f"{key!r} field (extracted from the public APK dump)."
+            )
 
     # ---- Bug #4 (change-panel-port): env file group-writable -----
     def test_panel_install_sh_chmods_env_file_group_writable(self):
@@ -3267,24 +3318,38 @@ class TestHotfix13PostReleaseRegressions:
 # front with an actionable message.
 # ---------------------------------------------------------------------------
 class TestHotfix14PostReleaseRegressions:
-    """Hotfix #14 (Phase 23) — pivots the four Psiphon-Inc upstream
-    credentials from hardcoded in panel/psiphon/__init__.py to
-    operator-supplied env vars read from /opt/psiphon-3x-ui/panel.env.
+    """Hotfix #14 (Phase 23) + Phase 24 (post-Hotfix-#14 cleanup).
+
+    Hotfix #14 pivoted the four Psiphon-Inc upstream credentials from
+    hardcoded in panel/psiphon/__init__.py to operator-supplied env vars read
+    from /opt/psiphon-3x-ui/panel.env. Phase 24 INVERTED that gate — the
+    Psiphon-3 PUBLIC-BOOTSTRAP constants (extracted from the public APK
+    dump) are now BAKED INTO panel/psiphon/__init__.py as `_PUBLIC_*`, and
+    the four PSIPHON_* env vars become OPTIONAL OVERRIDES (a commercial
+    sponsor can substitute its own PropChannel / SponsorId / signed
+    server-list URL / sig-pubkey via panel.env without forking the panel).
 
     Static-source-grep + runtime tests for the design pivot + the
     placeholder-rejection rules. Companion runtime tests live in
-    tests/test_psiphon.py::TestPsiphonCredentialErrorRegressions; this class
-    locks in:
-    - the production catch routes (apply.py + dashboard/router.py) all
-      swallow PsiphonCredentialError (NOT bubble up as opaque 500s);
-    - the installer's prompt step (installer/prompt.sh) + panel_install.sh
-      heredoc (installer/panel_install.sh) carry the four credential env
-      var names so a fresh install from v1.0.0 sources sets them up;
-    - the four credential env var names are exactly PSIPHON_PROPAGATION_
-      CHANNEL_ID / PSIPHON_SPONSOR_ID / PSIPHON_REMOTE_SERVER_LIST_URL /
+    tests/test_psiphon.py::TestPsiphonCredentialErrorRegressions +
+    tests/test_psiphon.py::TestPublicBootstrapDefaults; this class locks in:
+    - the production catch routes (apply.py + dashboard/router.py) still
+      swallow PsiphonCredentialError (Phase 24 kept Hotfix-14's catch routes
+      — even though the default path no longer raises, a bad operator
+      override can still raise + the catch routes still translate it into
+      actionable ApplyEvents / 502s / failed-append-summary instead of
+      opaque 500s);
+    - the installer's prompt step (installer/prompt.sh) NO LONGER surveys
+      the operator (Phase 24 deleted _prompt_psiphon_credentials — the
+      defaults are baked in), but panel_install.sh's heredoc STILL writes
+      any operator-supplied PSIPHON_* override into panel.env via the
+      ${psiphon_creds_block} interpolation;
+    - the four env var names are EXACTLY PSIPHON_PROPAGATION_CHANNEL_ID /
+      PSIPHON_SPONSOR_ID / PSIPHON_REMOTE_SERVER_LIST_URL /
       PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY (no accidental drift);
-    - docs/TROUBLESHOOTING.md + README.md ship a section explaining the
-      requirement.
+    - docs/TROUBLESHOOTING.md + README.md ship a reframed section explaining
+      the optional-override design (post-Phase-24) instead of the
+      "credentials required" wording (which was Hotfix-#14's framing).
     """
 
     _PSIPHON_INIT = Path(__file__).resolve().parent.parent / "panel" / "psiphon" / "__init__.py"
@@ -3329,8 +3394,10 @@ class TestHotfix14PostReleaseRegressions:
 
     def test_panel_psiphon_render_config_uses_resolve_upstream_credentials(self):
         """render_config must invoke `_resolve_upstream_credentials()` rather
-        than referencing the legacy hardcoded constants directly in the
-        returned dict literal."""
+        than referencing the baked-in `_PUBLIC_*` constants directly in the
+        returned dict literal. Phase 24 kept this indirection so that an
+        operator-supplied env override beats the `_PUBLIC_*` default at
+        runtime."""
         import re  # noqa: PLC0415
 
         text = self._PSIPHON_INIT.read_text(encoding="utf-8")
@@ -3339,15 +3406,22 @@ class TestHotfix14PostReleaseRegressions:
             r"creds\s*=\s*_resolve_upstream_credentials\(\)",
             no_comments,
         ), (
-            "Hotfix #14 — render_config must call _resolve_upstream_credentials "
-            "to fetch the four upstream constants, NOT reference the legacy "
-            "module constants directly."
+            "Hotfix #14 + Phase 24 — render_config must call "
+            "_resolve_upstream_credentials to fetch the seven upstream "
+            "constants (the four env-overridable ones default to the baked-in "
+            "`_PUBLIC_*` constants if no env override is set)."
         )
         # And the return dict must source each value from creds[<field>].
+        # Phase 24: register the new fields. The legacy singular
+        # `RemoteServerListUrl` was DROPPED in favor of the plural
+        # `RemoteServerListURLs` array.
         assert 'creds["PropagationChannelId"]' in text
         assert 'creds["SponsorId"]' in text
-        assert 'creds["RemoteServerListUrl"]' in text
+        assert 'creds["RemoteServerListURLs"]' in text  # plural — Phase 24
         assert 'creds["RemoteServerListSignaturePublicKey"]' in text
+        assert 'creds["ServerEntrySignaturePublicKey"]' in text  # Phase 24
+        assert 'creds["ExchangeObfuscationKey"]' in text  # Phase 24
+        assert 'creds["ObfuscatedServerListRootURLs"]' in text  # Phase 24
 
     # ---- production catch-all routes -------------------------------------
     def test_wizard_apply_imports_PsiphonCredentialError(self):
@@ -3431,44 +3505,63 @@ class TestHotfix14PostReleaseRegressions:
         )
 
     # ---- installer prompt step + env-file wire-in -------------------------
-    def test_prompt_sh_defines_psiphon_credentials_prompt(self):
-        """installer/prompt.sh MUST define `_prompt_psiphon_credentials()`
-        that surveys the operator for the four credentials on a TTY."""
+    def test_prompt_sh_no_longer_defines_psiphon_credentials_prompt(self):
+        """Phase 24 (post-Hotfix-#14 cleanup): installer/prompt.sh MUST NOT
+        define `_prompt_psiphon_credentials()` anymore — the public-bootstrap
+        constants are baked into the panel wheel, so there is no install-time
+        survey step. The placeholder grep ensures we don't accidentally
+        re-introduce the interactive prompt later (a regression that re-broke
+        Issue #2's user-reported install-blocking behaviour)."""
         text = self._PROMPT_SH.read_text(encoding="utf-8")
-        assert "_prompt_psiphon_credentials" in text, (
-            "Hotfix #14 — installer/prompt.sh must define "
-            "_prompt_psiphon_credentials (the installer interactive prompt "
-            "step that surveys the operator for the four Psiphon-Inc creds)."
+        # The survey function name MUST be absent from installer/prompt.sh.
+        assert "_prompt_psiphon_credentials" not in text, (
+            "Phase 24 — installer/prompt.sh MUST NOT define "
+            "_prompt_psiphon_credentials anymore. The Psiphon-Inc "
+            "public-bootstrap credentials are baked into the panel wheel; "
+            "no interactive survey is needed."
         )
+        # The read-prompts for the four env-var names MUST also be absent
+        # (Hotfix #14 surveyed them via `read -r PSIPHON_PROPAGATION_CHANNEL_ID`
+        # etc. — Phase 24 removed all four). We over-check by asserting the
+        # specific `read -r PSIPHON_*` survey form is GONE.
         for envname in (
             "PSIPHON_PROPAGATION_CHANNEL_ID",
             "PSIPHON_SPONSOR_ID",
             "PSIPHON_REMOTE_SERVER_LIST_URL",
             "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
         ):
-            assert envname in text, (
-                f"Hotfix #14 — installer/prompt.sh must reference env var "
-                f"{envname} (so it `read -r <NAME>`'d into the same name the "
-                "_resolve_upstream_credentials resolver will look for)."
+            assert f"read -r {envname}" not in text, (
+                f"Phase 24 — installer/prompt.sh MUST NOT read -r {envname}"
+                " (the survey prompts were removed when the public-bootstrap "
+                "constants were baked in)."
             )
 
     def test_panel_install_sh_interpolates_creds_block_into_heredoc(self):
-        """installer/panel_install.sh's `panel.env` heredoc MUST interpolate
-        a `${psiphon_creds_block}` block that emits each non-empty
-        credential env var into the file the panel systemd unit loads."""
+        """Phase 24 (was Hotfix #14): installer/panel_install.sh's `panel.env`
+        heredoc MUST STILL interpolate a `${psiphon_creds_block}` block —
+        but now the block is OPTIONAL (empty when no override is supplied).
+        The builder var appends each non-empty operator-supplied PSIPHON_*
+        override into the env file; if none are supplied, the block is empty
+        and the panel boots with the baked-in `_PUBLIC_*` defaults. The four
+        env var names must still appear in the builder (so an operator who
+        DOES supply overrides sees them written into panel.env)."""
         import re  # noqa: PLC0415
 
         text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
-        # The builder var + the heredoc interpolation BOTH must be present.
+        # The builder var + the heredoc interpolation BOTH must still be present
+        # (Phase 24 kept the override-forwarding plumbing; it only removed the
+        # empty-fallback header that Hotfix-14 emitted when nothing was set).
         assert re.search(r"(?:local\s+)?psiphon_creds_block\s*=", text), (
-            "Hotfix #14 — installer/panel_install.sh must declare a local "
-            "`psiphon_creds_block` builder var that the heredoc interpolates."
+            "Phase 24 — installer/panel_install.sh must declare a local "
+            "`psiphon_creds_block` builder var (now an optional-override "
+            "plumbing step — empty when no PSIPHON_* env var is set)."
         )
         assert "${psiphon_creds_block}" in text, (
-            "Hotfix #14 — installer/panel_install.sh's heredoc body MUST "
-            "interpolate ${psiphon_creds_block} so the four credentials end "
-            "up in the written panel.env file (the panel systemd unit "
-            "EnvironmentFile loads)."
+            "Phase 24 — installer/panel_install.sh's heredoc body MUST still "
+            "interpolate ${psiphon_creds_block} so any operator-supplied "
+            "overrides land in panel.env (the panel systemd unit's "
+            "EnvironmentFile). Empty block = no overrides = use baked-in "
+            "public-bootstrap defaults."
         )
         for envname in (
             "PSIPHON_PROPAGATION_CHANNEL_ID",
@@ -3477,21 +3570,26 @@ class TestHotfix14PostReleaseRegressions:
             "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
         ):
             assert envname in text, (
-                f"Hotfix #14 — installer/panel_install.sh must reference env "
-                f"var {envname} in the psiphon_creds_block builder."
+                f"Phase 24 — installer/panel_install.sh must still reference "
+                f"env var {envname} in the psiphon_creds_block builder (the "
+                "four optional override names)."
             )
 
     # ---- docs section shipped --------------------------------------------
-    def test_troubleshooting_md_documents_credentials_requirement(self):
-        """docs/TROUBLESHOOTING.md MUST ship a section about the Psiphon Inc.
-        commercial-credential requirement — so an operator hitting the
-        fast-fail messages has a doc page to follow."""
+    def test_troubleshooting_md_documents_credentials_optional_overrides(self):
+        """Phase 24 (was Hotfix #14): docs/TROUBLESHOOTING.md MUST ship a
+        section reframing the four PSIPHON_* upstream credentials as OPTIONAL
+        OVERRIDES (the public-bootstrap defaults are baked in). The old
+        'credentials required' framing is OBSOLETE — an operator hitting a
+        placeholder-rejector fast-fail (which only fires on bad overrides)
+        should land on this section."""
         text = self._TROUBLESHOOTING_MD.read_text(encoding="utf-8")
-        assert "Psiphon Inc. upstream credentials required (Hotfix #14)" in text, (
-            "Hotfix #14 — docs/TROUBLESHOOTING.md must ship a "
-            "'## Psiphon Inc. upstream credentials required' section "
-            "documenting where to obtain the colossid four credentials + "
-            "how to set them in panel.env."
+        # New Phase-24 heading replaces the old Hotfix-#14 "required" heading.
+        assert "Psiphon Inc. upstream credentials — optional overrides (Phase 24)" in text, (
+            "Phase 24 — docs/TROUBLESHOOTING.md must ship a "
+            "'Psiphon Inc. upstream credentials — optional overrides (Phase 24)' "
+            "section replacing Hotfix-14's 'required' framing. The "
+            "public-bootstrap defaults are baked into the panel wheel."
         )
         for envname in (
             "PSIPHON_PROPAGATION_CHANNEL_ID",
@@ -3500,20 +3598,30 @@ class TestHotfix14PostReleaseRegressions:
             "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
         ):
             assert envname in text, (
-                f"Hotfix #14 — docs/TROUBLESHOOTING.md must name env var "
+                f"Phase 24 — docs/TROUBLESHOOTING.md must name env var "
                 f"{envname} in the credentials section (operator copy-paste "
-                "fix-path)."
+                "fix-path for setting a commercial sponsor override)."
             )
 
-    def test_readme_md_warns_operator_about_credentials_requirement(self):
-        """README.md must surface the credentials requirement near the
-        install one-liner so a fresh operator doesn't install + run with
-        empty/stub values only to hit the fast-fail later."""
+    def test_readme_md_documents_credentials_optional_overrides(self):
+        """Phase 24 (was Hotfix #14): README.md MUST NOT say credentials are
+        'required' (the public-bootstrap defaults are baked in). Instead it
+        must surface the four PSIPHON_* env var names under an
+        'OPTIONAL OVERRIDES' framing so a commercial sponsor customising
+        panel.env sees them in the canonical env-var reference. The
+        'credentials required' string must NOT appear (replaced by softer
+        optional-override wording)."""
         text = self._README_MD.read_text(encoding="utf-8")
-        assert "Psiphon Inc. upstream credentials required" in text
-        # The README's Configuration reference table must include the four
-        # credential env var names so an operator customising panel.env sees
-        # them in the canonical env-var reference.
+        # The Hotfix-#14 'required' framing MUST be GONE (Phase 24 removed it).
+        assert "Psiphon Inc. upstream credentials required" not in text, (
+            "Phase 24 — README.md must NOT carry Hotfix-14's "
+            "'Psiphon Inc. upstream credentials required' wording anymore. "
+            "The public-bootstrap defaults are baked into the panel wheel; "
+            "credentials are NOT required for a fresh install."
+        )
+        # The four env var names must still appear (under the new optional-
+        # overrides framing) so a commercial sponsor customising panel.env
+        # sees them in the canonical env-var reference.
         for envname in (
             "PSIPHON_PROPAGATION_CHANNEL_ID",
             "PSIPHON_SPONSOR_ID",
@@ -3521,7 +3629,7 @@ class TestHotfix14PostReleaseRegressions:
             "PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY",
         ):
             assert envname in text, (
-                f"Hotfix #14 — README.md's Configuration reference must "
-                f"include env var {envname} (so a fresh operator's "
-                "panel.env customisation covers all four)."
+                f"Phase 24 — README.md's Configuration reference must still "
+                f"include env var {envname} (so a commercial sponsor's "
+                "panel.env customisation can override the baked-in default)."
             )
