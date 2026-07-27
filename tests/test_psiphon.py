@@ -14,6 +14,7 @@ Covers the three concerns in ``panel/psiphon/__init__.py``:
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 from dataclasses import FrozenInstanceError
@@ -123,13 +124,16 @@ class TestRenderConfig:
             cfg["RemoteServerListSignaturePublicKey"]
             == _TEST_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
         )
-        # The env var is WRAPPED: 1-element TransferURL array carrying the
-        # raw URL + OnlyAfterAttempts=0 + SkipVerify=False.
+        # Phase 24 Hotfix #1: the env var URL is WRAPPED into a 1-element
+        # TransferURL array, with the raw URL base64-encoded (tunnel-core's
+        # DecodeAndValidate#90 base64-decodes the URL field — raw `https:`
+        # would crash with "illegal base64 data at input byte 5").
         urls = cfg["RemoteServerListURLs"]
         assert isinstance(urls, list)
         assert len(urls) == 1
         entry = urls[0]
-        assert entry["URL"] == _TEST_REMOTE_SERVER_LIST_URL
+        assert entry["URL"] == base64.b64encode(_TEST_REMOTE_SERVER_LIST_URL.encode()).decode()
+        assert base64.b64decode(entry["URL"]).decode() == _TEST_REMOTE_SERVER_LIST_URL
         assert entry["OnlyAfterAttempts"] == 0
         assert entry["SkipVerify"] is False
 
@@ -180,7 +184,10 @@ class TestRenderConfig:
         urls = cfg["RemoteServerListURLs"]
         assert isinstance(urls, list)
         assert len(urls) == 1
-        assert urls[0]["URL"] == _TEST_REMOTE_SERVER_LIST_URL
+        # Phase 24 Hotfix #1: URL field is base64-encoded (tunnel-core
+        # decodes inside TransferURLs.DecodeAndValidate#90).
+        assert urls[0]["URL"] == base64.b64encode(_TEST_REMOTE_SERVER_LIST_URL.encode()).decode()
+        assert base64.b64decode(urls[0]["URL"]).decode() == _TEST_REMOTE_SERVER_LIST_URL
         assert isinstance(urls[0]["OnlyAfterAttempts"], int)
         assert isinstance(urls[0]["SkipVerify"], bool)
 
@@ -386,7 +393,11 @@ class TestPublicBootstrapDefaults:
         )
 
         assert _PUBLIC_PROPAGATION_CHANNEL_ID == "92AACC5BABE0944C"
-        assert _PUBLIC_SPONSOR_ID == "92AACC5BABE0944C"
+        # Phase 24 Hotfix #1: SponsorId extracted from the public Psiphon-3
+        # APK dump (operator-confirmed value — 1BC527D3D09985CF, distinct
+        # from the PropChannel ID; the original Phase-24 implementation had
+        # mistakenly copied the PropChannel value into the SponsorId slot).
+        assert _PUBLIC_SPONSOR_ID == "1BC527D3D09985CF"
 
         # 4 mirror URLs for the plain server list (compressed).
         assert _PUBLIC_REMOTE_SERVER_LIST_URLS == (
@@ -449,8 +460,10 @@ class TestPublicBootstrapDefaults:
     def test_render_config_no_env_emits_4_mirror_remote_server_list_urls(self):
         """With no PSIPHON_REMOTE_SERVER_LIST_URL env override, render_config()
         must emit the baked-in 4-mirror `RemoteServerListURLs` TransferURL
-        array (NOT a 1-element array). Each entry carries the raw URL +
-        OnlyAfterAttempts=0 + SkipVerify=False."""
+        array (NOT a 1-element array). Each entry carries the
+        base64-encoded raw URL + OnlyAfterAttempts=0 + SkipVerify=False
+        (Phase 24 Hotfix #1: tunnel-core's DecodeAndValidate#90 base64-decodes
+        the URL field, so the raw https URL is base64-encoded here)."""
         cfg = render_config("US", 1080)
         urls = cfg["RemoteServerListURLs"]
         assert isinstance(urls, list)
@@ -458,7 +471,8 @@ class TestPublicBootstrapDefaults:
         from panel.psiphon import _PUBLIC_REMOTE_SERVER_LIST_URLS  # noqa: PLC0415
         for entry, raw_url in zip(urls, _PUBLIC_REMOTE_SERVER_LIST_URLS, strict=True):
             assert isinstance(entry, dict)
-            assert entry["URL"] == raw_url
+            assert entry["URL"] == base64.b64encode(raw_url.encode()).decode()
+            assert base64.b64decode(entry["URL"]).decode() == raw_url
             assert entry["OnlyAfterAttempts"] == 0
             assert entry["SkipVerify"] is False
 
@@ -488,7 +502,10 @@ class TestPublicBootstrapDefaults:
         assert isinstance(roots, list)
         assert len(roots) == 4
         for entry, raw_url in zip(roots, _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS, strict=True):
-            assert entry["URL"] == raw_url
+            # Phase 24 Hotfix #1: URL is base64-encoded (tunnel-core decodes
+            # inside TransferURLs.DecodeAndValidate#90).
+            assert entry["URL"] == base64.b64encode(raw_url.encode()).decode()
+            assert base64.b64decode(entry["URL"]).decode() == raw_url
             assert entry["OnlyAfterAttempts"] == 0
             assert entry["SkipVerify"] is False
 

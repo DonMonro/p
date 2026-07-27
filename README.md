@@ -317,9 +317,9 @@ for the override-format details + the placeholder-rejector rules.
 
 | Env var (panel.env)                                  | Default              | Purpose                                                                  |
 | ---------------------------------------------------- | -------------------- | ------------------------------------------------------------------------ |
-| `PSIPHON_PROPAGATION_CHANNEL_ID`                     | `92AACC5BABE0944C`  | 32 hex chars override; rejected if your value looks like all-`F`'s       |
-| `PSIPHON_SPONSOR_ID`                                 | `92AACC5BABE0944C`  | 16 hex chars override; rejected if your value looks like all-`0`'s       |
-| `PSIPHON_REMOTE_SERVER_LIST_URL`                     | (4-mirror S3 set)   | singular override → wrapped to a 1-element `RemoteServerListURLs` array; must start with `https://`/`http://` |
+| `PSIPHON_PROPAGATION_CHANNEL_ID`                     | `92AACC5BABE0944C`  | 16 hex chars override; rejected if your value looks like all-`F`'s       |
+| `PSIPHON_SPONSOR_ID`                                 | `1BC527D3D09985CF`  | 16 hex chars override (distinct from PropChannel); rejected if your value looks like all-`0`'s |
+| `PSIPHON_REMOTE_SERVER_LIST_URL`                     | (4-mirror S3 set)   | singular override → wrapped to a 1-element `RemoteServerListURLs` array with the URL base64-encoded (per tunnel-core's `TransferURLs.DecodeAndValidate`); must start with `https://`/`http://` |
 | `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`    | RSA-2048 SPKI ~716 chars | base64-encoded public key override. The public value is RSA-2048 SPKI (NOT Ed25519); the regex `[A-Za-z0-9+/]{42,}={0,2}` also tolerates shorter Ed25519 (~44 chars) forms. Rejected if your override value is the shipped pre-Hotfix-14 stub. |
 
 ---

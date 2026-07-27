@@ -137,9 +137,9 @@ ship the public-bootstrap defaults).
 
 | Env var (panel.env)                                | JSON field in `<CODE>.json`             | Format note |
 | -------------------------------------------------- | --------------------------------------- | ----------- |
-| `PSIPHON_PROPAGATION_CHANNEL_ID`                   | `PropagationChannelId`                  | 32 hex chars (uppercase; NOT all-`F`'s) |
-| `PSIPHON_SPONSOR_ID`                               | `SponsorId`                             | 16 hex chars (NOT all-`0`'s) |
-| `PSIPHON_REMOTE_SERVER_LIST_URL`                   | `RemoteServerListURLs`                  | wrapped to a 1-element TransferURL array; must start with `https://` (or `http://`) |
+| `PSIPHON_PROPAGATION_CHANNEL_ID`                   | `PropagationChannelId`                  | 16 hex chars (uppercase; NOT all-`F`'s) |
+| `PSIPHON_SPONSOR_ID`                               | `SponsorId`                             | 16 hex chars (distinct from PropChannel; NOT all-`0`'s) |
+| `PSIPHON_REMOTE_SERVER_LIST_URL`                   | `RemoteServerListURLs`                  | wrapped to a 1-element TransferURL array with the URL **base64-encoded** (tunnel-core's `TransferURLs.DecodeAndValidate#90` decodes the URL field); must start with `https://` (or `http://`) |
 | `PSIPHON_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY`  | `RemoteServerListSignaturePublicKey`   | **base64-encoded RSA-2048 SPKI** for the public client — ~716 chars. The base64 regex `[A-Za-z0-9+/]{42,}={0,2}` also tolerates shorter Ed25519 (~44 chars) keys. (NOT a bare 64-hex string.) |
 
 > **Note**: `RemoteServerListSignaturePublicKey` is RSA-2048 (~716 base64
