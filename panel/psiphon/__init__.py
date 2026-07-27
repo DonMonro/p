@@ -21,6 +21,7 @@ This module contains three concerns:
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -59,6 +60,10 @@ from ..config import get_settings
 #   PSIPHON_PROPAGATION_CHANNEL_ID              — 16-char hex string (default
 #                                                  "92AACC5BABE0944C" from
 #                                                  the Psiphon-3 public build)
+#   PSIPHON_SPONSOR_ID                          — 16-char hex string (default
+#                                                  "1BC527D3D09985CF" from
+#                                                  the Psiphon-3 public build —
+#                                                  distinct from PropChannel ID)
 #   PSIPHON_SPONSOR_ID                          — 16-char hex string (same
 #                                                  public value as PropChan)
 #   PSIPHON_REMOTE_SERVER_LIST_URL              — single https URL (default
@@ -101,7 +106,7 @@ class PsiphonCredentialError(RuntimeError):
 # operator intervention. See plans/EMBED-PSIPHON-PUBLIC-BOOTSTRAP.md.
 # ---------------------------------------------------------------------------
 _PUBLIC_PROPAGATION_CHANNEL_ID = "92AACC5BABE0944C"
-_PUBLIC_SPONSOR_ID = "92AACC5BABE0944C"
+_PUBLIC_SPONSOR_ID = "1BC527D3D09985CF"
 
 _PUBLIC_REMOTE_SERVER_LIST_URLS: tuple[str, ...] = (
     "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
@@ -309,18 +314,40 @@ def _resolve_upstream_credentials() -> dict[str, Any]:
                 "4-mirror public-bootstrap default. See "
                 "docs/TROUBLESHOOTING.md."
             )
+        # Phase 24 Hotfix #1: tunnel-core's `parameters.TransferURLs.
+        # DecodeAndValidate#90` tries to base64-decode each `URL` field,
+        # so the RAW https URL must be base64-encoded here (per the
+        # public APK dump JSON shape + psiphon.config.sample precedent —
+        # see plans/EMBED-PSIPHON-PUBLIC-BOOTSTRAP.md:94-96).
+        # Confirmed against the operator's journal: tunnel-core dies
+        # with "illegal base64 data at input byte 5" on `https:` when
+        # the URL field contains a raw URL string.
         out["RemoteServerListURLs"] = [
-            {"URL": single_url, "OnlyAfterAttempts": 0, "SkipVerify": False}
+            {
+                "URL": base64.b64encode(single_url.encode("utf-8")).decode("ascii"),
+                "OnlyAfterAttempts": 0,
+                "SkipVerify": False,
+            }
         ]
     else:
         out["RemoteServerListURLs"] = [
-            {"URL": u, "OnlyAfterAttempts": 0, "SkipVerify": False}
+            {
+                "URL": base64.b64encode(u.encode("utf-8")).decode("ascii"),
+                "OnlyAfterAttempts": 0,
+                "SkipVerify": False,
+            }
             for u in _PUBLIC_REMOTE_SERVER_LIST_URLS
         ]
 
     # The remaining four public-bootstrap fields are NOT env-overridable.
+    # Same base64-encoding rule applies (the OSL-root URLs go through the
+    # same TransferURLs.DecodeAndValidate path).
     out["ObfuscatedServerListRootURLs"] = [
-        {"URL": u, "OnlyAfterAttempts": 0, "SkipVerify": False}
+        {
+            "URL": base64.b64encode(u.encode("utf-8")).decode("ascii"),
+            "OnlyAfterAttempts": 0,
+            "SkipVerify": False,
+        }
         for u in _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS
     ]
     out["ServerEntrySignaturePublicKey"] = _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
@@ -412,14 +439,20 @@ def render_config(country_code: str, socks_port: int) -> dict[str, Any]:
         "PropagationChannelId": creds["PropagationChannelId"],
         "SponsorId": creds["SponsorId"],
         # Plural TransferURL array (4 mirrors for the public client). Each
-        # entry is `{"URL": <raw https url>, "OnlyAfterAttempts": 0,
-        # "SkipVerify": false}`. tunnel-core base64-encodes the URL
-        # internally in DecodeAndValidate — we ship the RAW https string
-        # (mirrors what the public APK's JSONObject serialises).
+        # entry is `{"URL": <base64-encoded https url>, "OnlyAfterAttempts":
+        # 0, "SkipVerify": false}` — tunnel-core's
+        # `parameters.TransferURLs.DecodeAndValidate#90` base64-DECODES the
+        # URL field, so we ship the BASE64-encoded raw URL (per the public
+        # APK dump JSON shape + psiphon.config.sample precedent, see
+        # plans/EMBED-PSIPHON-PUBLIC-BOOTSTRAP.md:94-96). Phase 24 Hotfix #1
+        # fixed an implementation error where the RAW URL was emitted here
+        # (tunnel-core dies with "illegal base64 data at input byte 5" on
+        # the `:` after `https`).
         "RemoteServerListURLs": creds["RemoteServerListURLs"],
         # Parallel obfuscated-server-list-root array (same 4 mirror hosts,
         # `/osl` path). Used by the OSL transport when the plain server list
-        # is unreachable (censorship fallback). Same TransferURL shape.
+        # is unreachable (censorship fallback). Same TransferURL shape +
+        # same base64-URL encoding.
         "ObfuscatedServerListRootURLs": creds["ObfuscatedServerListRootURLs"],
         # RSA-2048 SPKI base64 (~716 chars). Signs the compressed server-list
         # blob fetched from RemoteServerListURLs.

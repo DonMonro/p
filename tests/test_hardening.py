@@ -3003,13 +3003,21 @@ class TestHotfix12PostReleaseRegressions:
         )
 
         cfg = render_config("AT", 11000)
-        # Plural field present + correctly shaped. The singular env URL is
-        # wrapped into a 1-element TransferURL array.
+        # Phase 24 Hotfix #1: the singular env URL is wrapped into a
+        # 1-element TransferURL array carrying the BASE64-ENCODED raw URL
+        # (tunnel-core's TransferURLs.DecodeAndValidate#90 base64-decodes
+        # the URL field — raw `https:` would crash with "illegal base64
+        # data at input byte 5"; operator confirmed via journalctl).
+        import base64  # noqa: PLC0415
+
         urls = cfg["RemoteServerListURLs"]
         assert isinstance(urls, list) and len(urls) == 1
         entry = urls[0]
         assert isinstance(entry, dict)
-        assert entry["URL"] == _HF14_FAKE_REMOTE_SERVER_LIST_URL
+        assert entry["URL"] == base64.b64encode(
+            _HF14_FAKE_REMOTE_SERVER_LIST_URL.encode()
+        ).decode()
+        assert base64.b64decode(entry["URL"]).decode() == _HF14_FAKE_REMOTE_SERVER_LIST_URL
         assert entry["OnlyAfterAttempts"] == 0
         assert entry["SkipVerify"] is False
         # And crucially: the legacy singular key is NOT present anymore.
