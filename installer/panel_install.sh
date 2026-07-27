@@ -324,38 +324,66 @@ EOF
         warn "Missing ${POLKIT_RULE_SRC} — the panel user will not be able to start tunnels (Bug #2 will persist)."
     fi
 
-    # ── 8. Pre-flight: ensure PANEL_PORT isn't already held by a foreign ──
-    # The single most common post-install failure is `EADDRINUSE`: a stale
-    # Python/uvicorn process from a previous (failed) install is still
-    # bound to PANEL_PORT and the new systemd unit can't bind → it loops
-    # `Activating → failed → status=3` forever. We detect this early and
-    # offer an automatic fix, then either stop the old unit or kill the
-    # foreign listener before starting ours.
+    # ── 8. Pre-flight: ensure PANEL_PORT is free for the new unit ──
+    # Phase 24 Hotfix #2 (Bug: "Failed to restart psiphon-3x-ui.service:
+    # Unit psiphon-3x-ui.service not found." + downstream "SOCKS5 health
+    # probe on 127.0.0.1:11000 failed after retry: Connection refused"
+    # when adding a country): the prior pre-flight trusted
+    # `systemctl is-active --quiet psiphon-3x-ui.service` to decide whether
+    # to look up the live unit's MainPID and exclude its PID from the
+    # foreign-kill set. On a re-install AFTER a previous `install.sh
+    # --uninstall` that did NOT actually kill the running orphan Python
+    # process (uninstall's `systemctl stop` returns 0 the moment the stop
+    # signal is issued, NOT when the SIGKILL propagates; and `rm -rf
+    # ${INSTALL_PREFIX}` unlinks the venv files but the orphan's open file
+    # descriptors keep the python interpreter in memory serving port
+    # PANEL_PORT with the OLD wheel's panel.psiphon module loaded), the
+    # stale orphaned PID can be STILL registered as MainPID in systemd's
+    # transient state — so the exclude-test treated the orphan as "the
+    # live unit's PID; don't kill it" → the orphan survived → `wait_for_
+    # panel_socket` connected to the ORPHAN's TCP listener (not the new
+    # systemd launch) and returned 0 immediately → installer printed the
+    # success banner even though the new panel never came up → operator's
+    # subsequent "Add UA" button kept talking to the OLD wheel that still
+    # emits RAW https URLs → base64 Hotfix never actually took effect.
+    #
+    # The robust ordering: STOP any panel unit FIRST (we're about to
+    # restart it anyway), THEN kill everything left on PANEL_PORT
+    # (post-stop orphans are by definition foreign), THEN start the new
+    # unit. `systemctl stop` is fire-and-forget, so we also sleep 1 to
+    # let the SIGTERM propagate before snapshotting listeners.
+    info "Pre-flight: stopping any prior psiphon-3x-ui.service unit …"
+    systemctl stop psiphon-3x-ui.service 2>/dev/null \
+        || true   # OK to fail on a fresh install
+    sleep 1   # let the STOP signal propagate before snapshotting listeners
+
     info "Pre-flight: checking TCP/${PANEL_PORT} for stale listeners …"
     if port_listeners "${PANEL_PORT}" | grep -q .; then
         local listening_summary
         listening_summary="$(port_listeners "${PANEL_PORT}")"
-        warn "Another process is already listening on TCP/${PANEL_PORT}:"
+        warn "A stale process is still listening on TCP/${PANEL_PORT} after stop:"
         warn "${listening_summary}"
+        warn "This is almost certainly an orphaned python/uvicorn from a prior"
+        warn "install that survived `install.sh --uninstall` (rm -rf deletes"
+        warn "files but not running processes); killing it now."
 
-        # If the stale listener is this very service unit, `systemctl stop`
-        # cleans it up; otherwise it is a foreign process we must kill.
+        # Phase 24 Hotfix #2 — post-stop, every pid on PANEL_PORT is by
+        # definition an orphan: we just issued `systemctl stop`, so any
+        # legitimate systemd MainPID has been reaped. Do NOT exclude
+        # anything based on `systemctl is-active` / `systemctl show -p
+        # MainPID` — those calls are unreliable in the post-stop transient
+        # window and may report the stale orphan's PID as the "live
+        # MainPID", which would re-introduce the original bug.
         local foreign_pids=""
-        local systemd_unit_pid=""
-        if systemctl is-active --quiet psiphon-3x-ui.service 2>/dev/null; then
-            systemd_unit_pid="$(systemctl show -p MainPID --value psiphon-3x-ui.service 2>/dev/null || true)"
-        fi
         while IFS= read -r line; do
-            # Format: "PID COMMAND USER"
+            # Format: "PID COMMAND"
             local pid="${line%% *}"
-            if [[ -n "${systemd_unit_pid}" && "${pid}" == "${systemd_unit_pid}" ]]; then
-                continue   # don't kill the live unit's PID; systemctl restart handles it
-            fi
+            [[ -n "${pid}" ]] || continue
             foreign_pids="${foreign_pids:+${foreign_pids} }${pid}"
         done < <(port_listeners "${PANEL_PORT}")
 
         if [[ -n "${foreign_pids}" ]]; then
-            warn "Killing foreign process(es) on TCP/${PANEL_PORT} (PIDs: ${foreign_pids}) …"
+            warn "Killing orphan process(es) holding TCP/${PANEL_PORT} (PIDs: ${foreign_pids}) …"
             # shellcheck disable=SC2086  # intentional word-splitting of pid list
             kill -9 ${foreign_pids} 2>/dev/null || true
             sleep 1
@@ -364,21 +392,14 @@ EOF
 Identify and free it manually: 'sudo ss -tlnp | grep :${PANEL_PORT}' \
 then re-run 'sudo bash install.sh'."
             fi
-            ok "Foreign listener cleared."
+            ok "Orphan listener on TCP/${PANEL_PORT} cleared."
         fi
     fi
 
-    # Stop the unit FIRST (so a previously-started-but-crashing unit's
-    # children are reaped by systemd) before issuing start/restart.
-    if systemctl is-active --quiet psiphon-3x-ui.service 2>/dev/null; then
-        info "Restarting psiphon-3x-ui.service (was already running) …"
-        systemctl restart psiphon-3x-ui.service \
-            || warn "systemctl restart psiphon-3x-ui failed."
-    else
-        info "Starting psiphon-3x-ui.service …"
-        systemctl start psiphon-3x-ui.service \
-            || warn "systemctl start psiphon-3x-ui failed."
-    fi
+    # Start the unit fresh (we stopped it above, never restart).
+    info "Starting psiphon-3x-ui.service …"
+    systemctl start psiphon-3x-ui.service \
+        || warn "systemctl start psiphon-3x-ui failed."
 
     # ── 9. Wait for the listening socket — fatal on failure ──────────────
     # Early Phase 2 builds emitted only a `warn` here, so a port collision
