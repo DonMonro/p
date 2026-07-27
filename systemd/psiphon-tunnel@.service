@@ -1,4 +1,4 @@
-[Unit]
+﻿[Unit]
 Description=Psiphon tunnel instance for region %i
 Documentation=https://github.com/Psiphon-Labs/psiphon-tunnel-core
 After=network-online.target
@@ -9,8 +9,44 @@ Type=simple
 # %i is the country code (e.g. US). The wizard (Phase 4) writes the matching
 # per-country config JSON to /opt/psiphon-3x-ui/config/<CODE>.json, then starts
 # this templated unit (systemctl start psiphon-tunnel@US.service).
+#
+# Phase 24 Hotfix #3 (Bug: per-country tunnel unit dies with exit 1 silently
+# because the default datastore directory path resolves to a location the
+# sandboxed service cannot mkdir):
+#
+#   binary stdout when started under the OLD ExecStart (which omitted this
+#   flag) read EXACTLY:
+#     {"data":{"message":"error loading configuration file:
+#     psiphon.(*Config).Commit#1514: failed to create datastore directory
+#     with error: mkdir [redacted]: no such file or
+#     directory"},"noticeType":"Error",...}
+#
+# Without `-dataRootDirectory`, ConsoleClient computes a default datastore
+# path that, under `ProtectSystem=strict` + `PrivateTmp=true` + `User=psiphon3xui`,
+# cannot be mkdir'd (the binary's default path resolves to under
+# `/opt/psiphon-3x-ui/<some-prefix>` that requires intermediate-parent writes
+# the sandbox denies, OR under `/root`/`$HOME` blocked by `ProtectHome=true`).
+# It then exits 1 before the SOCKS5 listener is bound — so the dashboard's
+# `health_probe` sees `connect 127.0.0.1:11000 failed: ConnectionRefusedError`
+# and the operator reads "inline enable for UA failed".
+#
+# Fix: pass `-dataRootDirectory /opt/psiphon-3x-ui/data/%i` so ConsoleClient
+# writes its per-country datastore (server list cache, obfuscated-server-list
+# registry, key material, etc.) into a psiphon3xui-owned writable directory.
+# The installer (panel_install.sh) pre-creates `/opt/psiphon-3x-ui/data/`
+# with ownership `psiphon3xui:psiphon3xui` and mode 0700. Each `systemctl
+# start psiphon-tunnel@<CODE>` invocation creates its own per-country
+# `data/<CODE>/` subdirectory under the root on first run (WriteBits are
+# within `ReadWritePaths=/opt/psiphon-3x-ui` which covers `data/`, so the
+# mkdir succeeds). Confirmed live: with the flag pointing at a writable
+# pre-created directory, the binary's strace shows
+# `openat(... "/opt/psiphon-3x-ui/data/UA/ca.psiphon.PsiphonTunnel.tunnel-core/osl/osl-registry.cached")`
+# (ENOENT on first run — acceptable), then binds
+# `{"data":{"port":11000},"noticeType":"ListeningSocksProxyPort"}` ✓ and
+# exits 0 on shutdown (vs exit 1 without the flag).
 ExecStart=/opt/psiphon-3x-ui/bin/psiphon-tunnel-core \
-    -config /opt/psiphon-3x-ui/config/%i.json
+    -config /opt/psiphon-3x-ui/config/%i.json \
+    -dataRootDirectory /opt/psiphon-3x-ui/data/%i
 WorkingDirectory=/opt/psiphon-3x-ui
 Restart=on-failure
 RestartSec=10

@@ -25,6 +25,15 @@
 *.json             text eol=lf
 install.sh         text eol=lf
 release-artifacts.sha256  text eol=lf
+# Phase 24 Hotfix #3: the templated per-country tunnel unit
+# (systemd/psiphon-tunnel@.service) is shipped to operators via the installer
+# (installer/panel_install.sh copies it to /etc/systemd/system/) and is a
+# tracked release artefact in release-artifacts.sha256. Pin it LF so the
+# working-tree SHA matches the git-blob SHA served by raw.githubusercontent.com
+# (otherwise operators running `sha256sum -c release-artifacts.sha256` after a
+# fresh `git clone` would see a mismatch on hosts where core.autocrlf=true
+# silently CRLF-converted the file on checkout).
+*.service          text eol=lf
 
 # ── Python source (default text = LF on commit) ─────────────────────────
 *.py               text

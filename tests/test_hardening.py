@@ -3909,3 +3909,206 @@ class TestHotfix15PostReleaseRegressions:
             "`systemctl start psiphon-3x-ui.service` (stop-then-start, "
             "never restart)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 24 Hotfix #3 — per-country tunnel unit dies with exit 1 silently
+# (psiphon-tunnel-core cannot mkdir its default datastore directory under the
+# unit's `ProtectSystem=strict` + `PrivateTmp=true` + `ProtectHome=true`
+# sandbox). The dashboard then reports "inline enable for UA failed: SOCKS5
+# health probe on 127.0.0.1:11000 failed after retry: connect ... failed:
+# ConnectionRefusedError" because the SOCKS5 listener was never bound.
+# ---------------------------------------------------------------------------
+class TestHotfix16PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #3 — the per-country
+    tunnel unit ``systemd/psiphon-tunnel@.service`` silently exited 1 within
+    3 seconds of ``systemctl start`` (494 restart-attempts observed in the
+    field) because ``psiphon-tunnel-core`` could not ``mkdir`` its default
+    datastore directory under the unit's hardening sandbox. The panel's
+    ``health_probe`` saw ``ConnectionRefusedError`` on
+    ``127.0.0.1:11000`` (the configured ``LocalSocksProxyPort``) because the
+    binary died BEFORE binding the SOCKS5 listener. The operator reported:
+
+    ``inline enable for UA failed: SOCKS5 health probe on 127.0.0.1:11000
+    failed after retry: connect 127.0.0.1:11000 failed:
+    ConnectionRefusedError: [Errno 111] Connection refused``
+
+    Live root-cause confirmation (operator captured the binary's own error
+    notice verbatim):
+
+    ``{"data":{"message":"error loading configuration file:
+    psiphon.(*Config).Commit#1514: failed to create datastore directory
+    with error: mkdir [redacted]: no such file or
+    directory"},"noticeType":"Error",...}``
+
+    The inverse test (passing ``-dataRootDirectory
+    /opt/psiphon-3x-ui/data/UA`` to the binary directly) produced a clean
+    run: ``ListeningSocksProxyPort: 11000`` notice emitted, then clean
+    ``exit 0`` after Ctrl-C (no exit 1, no error notice).
+
+    Fix — the unit's ``ExecStart`` now passes
+    ``-dataRootDirectory /opt/psiphon-3x-ui/data/%i`` so each per-country
+    invocation writes its server-list cache + OSL registry + key material
+    under ``/opt/psiphon-3x-ui/data/<CODE>/``. The installer
+    (``installer/panel_install.sh``) pre-creates the parent ``/opt/
+    psiphon-3x-ui/data`` directory owned by ``psiphon3xui:psiphon3xui``
+    (mode 0700) so each unit's per-country ``mkdir`` on first start
+    succeeds. ``install.sh`` exposes ``DATA_DIR`` (sibling of ``CONFIG_DIR``
+    + ``BIN_DIR`` + ``VENV_DIR``) so the installer references a single
+    constant.
+
+    The regression tests below pin both halves of the fix so accidental
+    reverts of either piece surface immediately.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
+    _INSTALL_SH = _REPO_ROOT / "install.sh"
+    _PANEL_INSTALL_SH = _REPO_ROOT / "installer" / "panel_install.sh"
+    _TUNNEL_UNIT_SH = _REPO_ROOT / "systemd" / "psiphon-tunnel@.service"
+
+    # ─── Unit half: ExecStart includes -dataRootDirectory flag ──────────────
+    def test_tunnel_unit_execstart_includes_dataRootDirectory_flag(self):
+        """``ExecStart=`` of ``psiphon-tunnel@.service`` MUST include
+        ``-dataRootDirectory /opt/psiphon-3x-ui/data/%i``. Without it the
+        binary dies with ``failed to create datastore directory`` before
+        the SOCKS5 listener is bound."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert re.search(
+            r"-dataRootDirectory\s+/opt/psiphon-3x-ui/data/%i\b",
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #3 — systemd/psiphon-tunnel@.service ExecStart "
+            "MUST include `-dataRootDirectory /opt/psiphon-3x-ui/data/%i` "
+            "(Bug: without it the binary cannot mkdir its default datastore "
+            "under the unit's ProtectSystem=strict / PrivateTmp / ProtectHome "
+            "sandbox → exit 1 → SOCKS5 listener never bound → dashboard "
+            "'Connection refused on 11000' on Add UA)."
+        )
+
+    def test_tunnel_unit_execstart_still_has_config_flag(self):
+        """``ExecStart=`` must STILL pass ``-config
+        /opt/psiphon-3x-ui/config/%i.json`` so the binary loads the
+        per-country JSON. The Hotfix #3 addition must not have removed
+        the pre-existing ``-config`` line."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert re.search(
+            r"-config\s+/opt/psiphon-3x-ui/config/%i\.json\b",
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #3 — ExecStart must STILL pass `-config /opt/"
+            "psiphon-3x-ui/config/%i.json`. The -dataRootDirectory addition "
+            "must not have removed the -config flag."
+        )
+
+    def test_tunnel_unit_execstart_data_root_after_config(self):
+        """Defensive-ordering invariant: ``-dataRootDirectory`` must appear
+        AFTER ``-config`` on the (possibly multi-line) ``ExecStart=`` block.
+        Keeping the stable order avoids confusing future readers versed in
+        the historical shape."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        config_match = re.search(
+            r"-config\s+/opt/psiphon-3x-ui/config/%i\.json",
+            no_comments,
+        )
+        data_root_match = re.search(
+            r"-dataRootDirectory\s+/opt/psiphon-3x-ui/data/%i",
+            no_comments,
+        )
+        assert config_match is not None and data_root_match is not None
+        assert config_match.start() < data_root_match.start(), (
+            "Phase 24 Hotfix #3 — ExecStart must list `-config` before "
+            "`-dataRootDirectory` (stable historical order preserved)."
+        )
+
+    # ─── Installer half: panel_install.sh pre-creates ${DATA_DIR} ──────────
+    def test_install_sh_defines_DATA_DIR_constant(self):
+        """``install.sh`` must define ``DATA_DIR`` (sibling of CONFIG_DIR /
+        BIN_DIR / VENV_DIR / DB_PATH / ENV_FILE) so the installer half of
+        Hotfix #3 uses a single canonical constant instead of repeating the
+        abs path literal."""
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        # Match the assignment, allowing the SC2034 disable-comment line to
+        # immediately precede or follow (we don't strip comments here so the
+        # plain `DATA_DIR=` persistent substring is what we look for).
+        assert "DATA_DIR=" in text and "/data" in text, (
+            "Phase 24 Hotfix #3 — install.sh must define `DATA_DIR` pointing "
+            "at `/opt/psiphon-3x-ui/data` (canonical sibling of CONFIG_DIR)."
+        )
+
+    def test_panel_install_creates_data_dir_with_service_owner(self):
+        """``installer/panel_install.sh`` MUST ``install -d`` the
+        ``${DATA_DIR}`` directory owned by
+        ``${PSIPHON3XUI_USER}:${PSIPHON3XUI_GROUP}`` so each per-country
+        ``systemctl start psiphon-tunnel@<CODE>`` invocation can ``mkdir``
+        its ``${DATA_DIR}/<CODE>`` subdirectory at first start."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # Look for `install -d ... -o ${PSIPHON3XUI_USER} -g
+        # ${PSIPHON3XUI_GROUP} ${DATA_DIR}` (allowing any flags ordering).
+        assert "install -d" in no_comments and "DATA_DIR" in no_comments, (
+            "Phase 24 Hotfix #3 — installer/panel_install.sh MUST use "
+            "`install -d` with `DATA_DIR` to pre-create the per-country "
+            "tunnel datastore parent directory. Without this the binary's "
+            "first-run mkdir fails under the unit's hardening sandbox."
+        )
+        # Verify the ownership flags target the service identity.
+        assert (
+            "${PSIPHON3XUI_USER}" in no_comments
+            and "${PSIPHON3XUI_GROUP}" in no_comments
+        ), (
+            "Phase 24 Hotfix #3 — the install command for DATA_DIR must pass "
+            "`-o ${PSIPHON3XUI_USER} -g ${PSIPHON3XUI_GROUP}` so the per-"
+            "country psiphon-tunnel-core process (running as "
+            "PSIPHON3XUI_USER) can create its own per-country subdir."
+        )
+
+    def test_panel_install_invokes_install_minus_d_after_unit_install(self):
+        """Ordering invariant: the ``install -d ${DATA_DIR}`` invocation
+        must occur AFTER the templated tunnel unit file is installed into
+        ``/etc/systemd/system/`` — so the directory is pre-created only on
+        the path that successfully installed the unit (and only when the
+        operator has the templated unit installed)."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # Find the line where the tunnel unit file is installed.
+        unit_install_idx = no_comments.find(
+            'install -m 0644 "${TUNNEL_UNIT_SRC}" "${TUNNEL_UNIT_DST}"'
+        )
+        # The FIRST `install -d` in the file may not be our DATA_DIR one
+        # (other `install -d` invocations exist e.g. for the polkit dir).
+        # So we constrain the search: find the `install -d` line that contains
+        # "DATA_DIR" specifically (we already asserted the basic existence in
+        # test_panel_install_creates_data_dir_with_service_owner).
+        data_dir_line_match = re.search(
+            r"install\s+-d\b[^\n]*\$\{DATA_DIR\}",
+            no_comments,
+        )
+        assert unit_install_idx >= 0, (
+            "Phase 24 Hotfix #3 — precondition: tunnel unit install line "
+            "(install -m 0644 ${TUNNEL_UNIT_SRC} ${TUNNEL_UNIT_DST}) must "
+            "exist in panel_install.sh."
+        )
+        assert data_dir_line_match is not None, (
+            "Phase 24 Hotfix #3 — panel_install.sh must contain "
+            "`install -d ... ${DATA_DIR}` (the pre-create of the per-country "
+            "tunnel datastore parent)."
+        )
+        assert data_dir_line_match.start() > unit_install_idx, (
+            "Phase 24 Hotfix #3 — the `install -d ${DATA_DIR}` must occur "
+            "AFTER the templated tunnel unit is installed into /etc/systemd/"
+            "system/. Pre-creating the directory before the unit file exists "
+            "would be wasted work if the install of the unit file failed."
+        )

@@ -34,6 +34,19 @@ shopt -s inherit_errexit 2>/dev/null || true
 INSTALL_PREFIX="/opt/psiphon-3x-ui"
 CONFIG_DIR="${INSTALL_PREFIX}/config"
 BIN_DIR="${INSTALL_PREFIX}/bin"
+# Phase 24 Hotfix #3 (Bug: per-country tunnel unit exit 1 — binary cannot mkdir
+# its default datastore dir under the systemd sandbox). The templated unit
+# system/psiphon-tunnel@.service's ExecStart now passes
+# `-dataRootDirectory ${DATA_DIR}/%i` so each country's psiphon-tunnel-core
+# process writes its server-list cache / OSL registry / key material under
+# ${DATA_DIR}/<CODE>/. The installer (installer/panel_install.sh
+# run_panel_install) pre-creates ${DATA_DIR} owned by the service user/group
+# so the unit's per-country `mkdir` on first start succeeds (otherwise the
+# binary dies with "failed to create datastore directory" → exit 1 → SOCKS5
+# listener never bound → dashboard reports "Connection refused on 11000" on
+# Add UA).
+# shellcheck disable=SC2034  # used by installer/panel_install.sh (per-country psiphon-tunnel-core datastore root)
+DATA_DIR="${INSTALL_PREFIX}/data"
 REPO_URL="https://github.com/DonMonro/p.git"
 LOG_FILE="${INSTALL_PREFIX}/install.log"
 PSIPHON3XUI_USER="${PSIPHON3XUI_USER:-psiphon3xui}"
