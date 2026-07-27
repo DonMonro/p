@@ -3641,3 +3641,271 @@ class TestHotfix14PostReleaseRegressions:
                 f"include env var {envname} (so a commercial sponsor's "
                 "panel.env customisation can override the baked-in default)."
             )
+
+# ---------------------------------------------------------------------------
+# Hotfix #15 — Phase 24 Hotfix #2: orphan panel process survives uninstall
+# AND survives panel_install.sh's pre-flight → panel keeps serving the OLD
+# wheel → "Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+# not found." + downstream "SOCKS5 health probe on 127.0.0.1:11000 failed
+# after retry: Connection refused" when adding a country.
+# ---------------------------------------------------------------------------
+class TestHotfix15PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #2 — two post-Hotfix-#1 bugs.
+
+    Bug #1 — ``install.sh --uninstall`` did NOT kill the orphaned
+    python/uvicorn process holding ``${PANEL_PORT}`` open. ``systemctl stop``
+    is fire-and-forget (returns 0 the moment SIGTERM is issued), and
+    ``rm -rf ${INSTALL_PREFIX}`` deletes the venv files from disk but the
+    orphan keeps running (Linux preserves the inode while file descriptors
+    are open). The subsequent fresh ``install.sh`` re-install builds the
+    new wheel in the venv and `pip install`s it — but its pre-flight
+    TCP probe connects to the orphan (still listening), ``wait_for_panel_
+    socket`` returns 0 early, the success banner prints, and the operator
+    keeps talking to the OLD process serving the OLD wheel code → the
+    Hotfix #1 base64 fix never actually takes effect → "Add UA" button
+    dies with the same SOCKS5 ``Connection refused`` symptom.
+
+    Bug #2 — ``installer/panel_install.sh`` pre-flight consulted
+    ``systemctl is-active --quiet psiphon-3x-ui.service`` to decide whether
+    to look up the live unit's ``MainPID`` and exclude it from the
+    foreign-kill set. In the post-uninstall transient state the orphan's
+    PID could STILL be registered as ``MainPID`` even though the unit file
+    was ``rm -f``'d by uninstall → pre-flight excluded the orphan from
+    the foreign-kill set → the orphan survived → ``systemctl restart
+    psiphon-3x-ui.service`` then failed with "Unit psiphon-3x-ui.service
+    not found" because the unit file write at panel_install.sh:254 was
+    not yet reloaded (or worse: the OLD `rm -f`'d unit was poorly
+    reloaded by `daemon-reload`).
+
+    Fix #1 — ``install.sh --uninstall`` adds an explicit orphan-kill
+    block via two new helpers, ``_purge_orphan_panel_listeners`` (kills
+    every PID listening on ``${PANEL_PORT}`` after `systemctl stop`
+    returns) + ``_purge_orphan_panel_user_processes`` (kills every
+    python/uvicorn process running as ``${PSIPHON3XUI_USER}``), called
+    AFTER ``systemctl stop`` and BEFORE ``rm -rf ${INSTALL_PREFIX}``.
+
+    Fix #2 — ``installer/panel_install.sh``'s pre-flight re-orders to
+    STOP the unit FIRST (we're about to start it anyway), sleep 1 to let
+    SIGTERM propagate, snapshot listeners and classify EVERY pid on
+    ``${PANEL_PORT}`` as foreign (NO MainPID lookup / NO exclusion
+    based on ``systemctl is-active``), ``kill -9`` them, verify the
+    port is free, then ``systemctl start`` (not restart).
+
+    Each regression test below pins one of those invariants against
+    accidental reverts.
+    """
+
+    _INSTALLER_DIR = Path(__file__).resolve().parent.parent / "installer"
+    _INSTALL_SH = Path(__file__).resolve().parent.parent / "install.sh"
+    _PANEL_INSTALL_SH = Path(__file__).resolve().parent.parent / "installer" / "panel_install.sh"
+
+    # ─── Bug #3: install.sh --uninstall orphan-kill block ──────────────────
+    def test_uninstall_run_uninstalls_calls_purge_orphan_listeners(self):
+        """``run_uninstall`` must invoke the new
+        ``_purge_orphan_panel_listeners`` helper after ``systemctl stop``
+        + before ``rm -rf ${INSTALL_PREFIX}``."""
+        import re  # noqa: PLC0415
+
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert "_purge_orphan_panel_listeners" in no_comments, (
+            "Phase 24 Hotfix #2 — install.sh --uninstall must call the "
+            "_purge_orphan_panel_listeners helper (Bug: orphan panel "
+            "process survived uninstall because systemctl stop is "
+            "fire-and-forget and rm -rf doesn't kill running processes)."
+        )
+
+    def test_uninstall_run_uninstalls_calls_purge_orphan_user_processes(self):
+        """``run_uninstall`` must invoke
+        ``_purge_orphan_panel_user_processes`` so orphans running under
+        the panel service user (no longer bound to PANEL_PORT — e.g.,
+        the prior install's panel.env port differed) are also caught."""
+        import re  # noqa: PLC0415
+
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert "_purge_orphan_panel_user_processes" in no_comments, (
+            "Phase 24 Hotfix #2 — install.sh --uninstall must call the "
+            "_purge_orphan_panel_user_processes helper (covers orphans "
+            "not bound to PANEL_PORT)."
+        )
+
+    def test_uninstall_purge_helpers_are_defined(self):
+        """Both helpers' function definitions must exist in install.sh."""
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        assert "_purge_orphan_panel_listeners()" in text, (
+            "_purge_orphan_panel_listeners() must be DEFINED in install.sh "
+            "(not just invoked). Hotfix #2 Bug #3."
+        )
+        assert "_purge_orphan_panel_user_processes()" in text, (
+            "_purge_orphan_panel_user_processes() must be DEFINED in "
+            "install.sh (not just invoked). Hotfix #2 Bug #3."
+        )
+
+    def test_uninstall_purge_uses_kill_minus_9(self):
+        """The purge helpers MUST ``kill -9`` (SIGKILL) the orphan —
+        SIGTERM is insufficient because the orphan's parent (systemd)
+        is gone, so no-one would handle a SIGTERM and propagate it."""
+        import re  # noqa: PLC0415
+
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        # The kill line is non-commented runtime code. Bash's
+        # `${pids}` is NOT regex-escaped in the source — ruff would
+        # mis-flag a literal `$\{...\}` escape, so we just match the
+        # raw `kill -9 ${pids}` text shape.
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert re.search(r"kill\s+-9\s+\$\{pids\}", no_comments), (
+            "_purge_orphan_panel_user_processes must `kill -9 ${pids}` "
+            "the orphans (SIGKILL — SIGTERM is insufficient for an "
+            "orphan with no parent to propagate it)."
+        )
+
+    def test_uninstall_purge_runs_between_systemctl_stop_and_rm_rf(self):
+        """Ordering check — purge helpers must run AFTER the
+        ``systemctl stop psiphon-3x-ui.service`` line returns AND BEFORE
+        the ``rm -rf ${INSTALL_PREFIX}`` line. The purge calls are
+        useless if they run before stop (they'd target the live unit's
+        PID unnecessarily) or after rm -rf (rm deletes the venv files but
+        the orphan's open fds keep the inode alive — so purge would
+        still work, but we want to surface the orphan's own PID-blob
+        via `pgrep -u <user>` BEFORE we delete the user, which is what
+        userdel --force (after purge) does)."""
+        import re  # noqa: PLC0415
+
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
+        # Strip comments so docblock prose ordering doesn't match.
+        no_comments_lines = [
+            ln for ln in re.sub(r"#[^\n]*", "", text).splitlines() if ln.strip()
+        ]
+        # Walk and find: systemctl stop ... + _purge_orphan_panel_listeners
+        # + _purge_orphan_panel_user_processes + userdel + rm -rf — in order.
+
+        idx_stop = next(
+            (i for i, ln in enumerate(no_comments_lines)
+             if "systemctl stop psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_purge_listen = next(
+            (i for i, ln in enumerate(no_comments_lines)
+             if "_purge_orphan_panel_listeners" in ln),
+            None,
+        )
+        idx_purge_user = next(
+            (i for i, ln in enumerate(no_comments_lines)
+             if "_purge_orphan_panel_user_processes" in ln and "()" not in ln),
+            None,
+        )
+        idx_rmrf = next(
+            (i for i, ln in enumerate(no_comments_lines)
+             if 'rm -rf "${INSTALL_PREFIX}"' in ln),
+            None,
+        )
+        assert all(
+            v is not None for v in (idx_stop, idx_purge_listen, idx_purge_user, idx_rmrf)
+        ), (
+            "Phase 24 Hotfix #2 — install.sh --uninstall ordering broken: "
+            "expected systemctl stop → _purge_orphan_panel_listeners → "
+            "_purge_orphan_panel_user_processes → rm -rf, in that order."
+        )
+        assert idx_stop < idx_purge_listen < idx_purge_user < idx_rmrf, (
+            "Phase 24 Hotfix #2 — install.sh --uninstall must run the "
+            "orphan purge helpers AFTER systemctl stop + BEFORE rm -rf "
+            "(pgrep -u must see the still-existing service user)."
+        )
+
+    # ─── Bug #1: panel_install.sh pre-flight ordering + classifier strength ─
+    def test_panel_install_pre_flight_stops_unit_before_listener_check(self):
+        """panel_install.sh pre-flight must STOP the prior unit BEFORE
+        snapshotting the port listeners (Hotfix #2 re-orders so the
+        stop is unconditional and precedes the orphan-kill)."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        nonblank = [ln for ln in no_comments.splitlines() if ln.strip()]
+        idx_stop = next(
+            (i for i, ln in enumerate(nonblank)
+             if "systemctl stop psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_prelight = next(
+            (i for i, ln in enumerate(nonblank)
+             if 'Pre-flight: checking TCP/${PANEL_PORT}' in ln),
+            None,
+        )
+        assert idx_stop is not None, (
+            "Phase 24 Hotfix #2 — panel_install.sh pre-flight must "
+            "begin with `systemctl stop psiphon-3x-ui.service` to reap "
+            "any prior unit (Bug: prior pre-flight consulted is-active + "
+            "MainPID exclusion which let the orphan survive)."
+        )
+        assert idx_prelight is not None, (
+            "Pre-flight listener check missing from panel_install.sh."
+        )
+        assert idx_stop < idx_prelight, (
+            "Phase 24 Hotfix #2 — `systemctl stop psiphon-3x-ui.service` "
+            "must run BEFORE the port_listeners check (so the live unit is "
+            "reaped before we decide which pids to kill)."
+        )
+
+    def test_panel_install_pre_flight_no_longer_excludes_mainpid(self):
+        """The buggy classifier that consulted
+        ``systemctl is-active --quiet`` + ``systemctl show -p MainPID
+        --value`` to exclude the orphan (treating it as the live unit's
+        own PID) MUST be GONE — every PID on PANEL_PORT is by definition
+        foreign after the explicit `systemctl stop`."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # The Hotfix #1 pre-flight had this exact buggy exclusion:
+        #   if [[ -n "${systemd_unit_pid}" && "${pid}" == "${systemd_unit_pid}" ]]; then
+        #       continue   # don't kill the live unit's PID; systemctl restart handles it
+        #   fi
+        # This MUST be gone in Hotfix #2 (the unit was stopped upstream, so
+        # every pid still on the port is by-definition an orphan).
+        assert not re.search(
+            r'"\$\{systemd_unit_pid\}"\s*&&\s*"\$\{pid\}"\s*==\s*"\$\{systemd_unit_pid\}"',
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #2 — panel_install.sh's pre-flight must NOT "
+            "exclude any PID via the systemd_unit_pid comparison anymore "
+            "(the buggy classifier let the orphan survive). Every pid on "
+            "PANEL_PORT post-stop is foreign → kill it."
+        )
+        # The MainPID lookup line must be GONE too (it was the source of
+        # the false-true classification).
+        assert not re.search(
+            r"systemctl show -p MainPID --value psiphon-3x-ui\.service",
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #2 — panel_install.sh pre-flight must NOT "
+            "consult `systemctl show -p MainPID --value` anymore. The "
+            "post-stop transient state may report the orphan's PID as "
+            "MainPID, falsely protecting the orphan."
+        )
+
+    def test_panel_install_pre_flight_uses_start_not_restart(self):
+        """The buggy pre-flight's “was already running” restart branch must
+        be GONE — we always stop first then start, so there's never a
+        case where ``systemctl restart`` is the right call. The docblock
+        ``info`` line ``Restarting psiphon-3x-ui.service (was already running)``
+        must NOT appear anymore."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert not re.search(
+            r'Restarting psiphon-3x-ui\.service \(was already running\)',
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #2 — panel_install.sh must NOT print the "
+            "'Restarting psiphon-3x-ui.service (was already running) …' "
+            "info line anymore. The pre-flight unconditionally STOPS "
+            "first and then STARTS the new unit (never restart)."
+        )
+        assert "systemctl start psiphon-3x-ui.service" in no_comments, (
+            "Phase 24 Hotfix #2 — panel_install.sh must end with "
+            "`systemctl start psiphon-3x-ui.service` (stop-then-start, "
+            "never restart)."
+        )

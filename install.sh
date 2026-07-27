@@ -198,6 +198,34 @@ run_uninstall() {
     systemctl reload polkit.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
 
+    # ── Phase 24 Hotfix #2 (Bug: orphan panel process survives uninstall) ──
+    # `systemctl stop` is fire-and-forget — it issues SIGTERM and returns 0
+    # immediately, NOT after the child has reaped. Worse: `rm -rf
+    # ${INSTALL_PREFIX}` below unlinks the venv + wheel files from disk but
+    # the orphaned python/uvicorn process keeps running on PANEL_PORT with
+    # the OLD wheel code fully loaded in memory (the inodes are kept alive
+    # by the open file descriptors — exactly how Linux lets you delete a
+    # file that's still being executed). The orphan then keeps serving
+    # panel/api/dashboard HTTP requests with whatever code was baked into
+    # the wheel at the moment of its launch — including the OLD raw-https
+    # RemoteServerListURLs / wrong SponsorId from a prior commit — so when
+    # the operator re-runs `install.sh` after this uninstall, the new
+    # installer's wait_for_panel_socket connects to the orphan (not the
+    # new systemd launch), prints "Psiphon-3X-UI installed", but the
+    # subsequent "Add UA" button keeps dying because the orphan serves
+    # the OLD code. Symptom in the operator's journalctl:
+    #   Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service not found.
+    # + (downstream) SOCKS5 health probe on 127.0.0.1:11000 failed after retry: Connection refused.
+    #
+    # Fix: BEFORE the rm -rf over INSTALL_PREFIX, snapshot every PID
+    # listening on PANEL_PORT + every python/uvicorn process running as
+    # the panel service user, and `kill -9` them. We do this AFTER
+    # `systemctl stop` so any legitimately-tracked MainPID has been reaped
+    # by systemd — anything left is by definition an orphan.
+    sleep 1   # let systemctl stop's SIGTERM propagate
+    _purge_orphan_panel_listeners
+    _purge_orphan_panel_user_processes
+
     if id "${PSIPHON3XUI_USER}" >/dev/null 2>&1; then
         userdel --force "${PSIPHON3XUI_USER}" 2>/dev/null || true
     fi
@@ -208,6 +236,73 @@ run_uninstall() {
     rm -rf "${INSTALL_PREFIX}"
     ok "Psiphon-3X-UI uninstalled (3x-ui itself is untouched)."
     exit 0
+}
+
+# --- Phase 24 Hotfix #2 helpers (orphan-process purge) ---------------------
+# Both helpers are best-effort: they print a `warn` if the snapshot fails
+# (e.g., `ss` missing on minimal distros) and proceed. They are safe to
+# call without sourcing panel_install.sh's port_listeners() — they use a
+# cheap inline `ss -tlnp | awk` snapshot plus `pgrep -u <user>`.
+_purge_orphan_panel_listeners() {
+    local pids=""
+    # Same shape as panel_install.sh's port_listeners(): "PID COMMAND"
+    if ! command -v ss >/dev/null 2>&1; then
+        warn "ss not found — orphan listener purge skipped (install iproute2)."
+        return 0
+    fi
+    while IFS= read -r pidcmd; do
+        local pid="${pidcmd%% *}"
+        [[ -n "${pid}" ]] || continue
+        pids="${pids:+${pids} }${pid}"
+    done < <(ss -tlnp 2>/dev/null | awk -v port=":${PANEL_PORT}" '
+        $1 == "LISTEN" && $4 == port {
+            line = $0
+            sub(/.*users:\(\("/, "", line)
+            prog = line; sub(/".*/, "", prog)
+            pid  = line; sub(/.*pid=/, "", pid); sub(/[,) ].*/, "", pid)
+            if (pid != "") print pid " " prog
+        }
+    ')
+    if [[ -n "${pids}" ]]; then
+        warn "Killing orphan panel listener(s) holding TCP/${PANEL_PORT} (PIDs: ${pids}) …"
+        # shellcheck disable=SC2086  # intentional word-splitting of pid list
+        kill -9 ${pids} 2>/dev/null || true
+        sleep 1
+        if ss -tlnp 2>/dev/null | awk -v port=":${PANEL_PORT}" '
+            $1 == "LISTEN" && $4 == port { found=1 } END { exit !found }
+        '; then
+            warn "TCP/${PANEL_PORT} is STILL held after kill -9; the next install's \
+pre-flight will retry — or free it manually with 'sudo fuser -k ${PANEL_PORT}/tcp'."
+        else
+            ok "Orphan panel listener(s) on TCP/${PANEL_PORT} cleared."
+        fi
+    fi
+}
+
+_purge_orphan_panel_user_processes() {
+    # Catch orphans that are no longer bound to PANEL_PORT (maybe a
+    # different panel port from the prior install's panel.env) but ARE
+    # running under the panel service user as a python process — these
+    # would also survive `rm -rf ${INSTALL_PREFIX}` and could re-grab the
+    # port on the next install.
+    if ! id "${PSIPHON3XUI_USER}" >/dev/null 2>&1; then
+        return 0   # user already deleted (or never existed) — nothing to purge
+    fi
+    if ! command -v pgrep >/dev/null 2>&1; then
+        warn "pgrep not found — orphan-user purge skipped (install procps)."
+        return 0
+    fi
+    local pids
+    # Match: any process whose COMM is `python` or `python3` or `uvicorn`
+    # or whose command-line contains `python -m panel` (the panel's
+    # systemd ExecStart shape).
+    pids="$(pgrep -u "${PSIPHON3XUI_USER}" -f 'python|uvicorn' 2>/dev/null || true)"
+    if [[ -n "${pids}" ]]; then
+        warn "Killing orphan panel-user process(es): ${pids}"
+        # shellcheck disable=SC2086  # intentional word-splitting of pid list
+        kill -9 ${pids} 2>/dev/null || true
+        sleep 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
