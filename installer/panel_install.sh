@@ -290,6 +290,31 @@ EOF
                 "${TUNNEL_UNIT_DST}" 2>/dev/null || true
         fi
         ok "Installed templated tunnel unit: ${TUNNEL_UNIT_DST}"
+
+        # Phase 24 Hotfix #3 (Bug: per-country tunnel unit dies with exit 1
+        # silently because the default datastore directory cannot be mkdir'd
+        # under the unit's `ProtectSystem=strict` + `PrivateTmp=true` +
+        # `ProtectHome=true` sandbox). The unit's ExecStart passes
+        # `-dataRootDirectory ${DATA_DIR}/%i` so each per-country
+        # psiphon-tunnel-core process writes its server-list cache, obfuscated-
+        # server-list registry, key material, etc. under
+        # `/opt/psiphon-3x-ui/data/<CODE>/`. Without this pre-create, the
+        # binary's first-run mkdir of `${DATA_DIR}/<CODE>` fails with
+        # "failed to create datastore directory" → exit 1 → SOCKS5 listener
+        # never bound → dashboard reports `connect 127.0.0.1:11000 failed:
+        # ConnectionRefusedError` on the operator's first "Add UA" attempt.
+        # We pre-create ONLY the root `${DATA_DIR}` (mode 0700, ownership
+        # ${PSIPHON3XUI_USER}:${PSIPHON3XUI_GROUP}); each `systemctl start
+        # psiphon-tunnel@<CODE>` then creates its own per-country subdirectory
+        # at first run (it has writeBits under `ReadWritePaths=${INSTALL_PREFIX}`
+        # which covers `${DATA_DIR}`).
+        if [[ -n "${DATA_DIR:-}" ]]; then
+            install -d -m 0700 -o "${PSIPHON3XUI_USER}" -g "${PSIPHON3XUI_GROUP}" "${DATA_DIR}" \
+                || warn "Failed to pre-create ${DATA_DIR} (per-country tunnels may not start)."
+            ok "Per-country tunnel datastore root ready: ${DATA_DIR} (owner ${PSIPHON3XUI_USER}:${PSIPHON3XUI_GROUP})"
+        else
+            warn "DATA_DIR unset — per-country tunnel datastore root NOT pre-created (re-run install.sh)."
+        fi
     else
         warn "Missing ${TUNNEL_UNIT_SRC} — per-country tunnels will not start (re-clone the repo)."
     fi
