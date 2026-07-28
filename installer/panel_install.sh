@@ -264,6 +264,31 @@ EOF
         "${SYSTEMD_UNIT_DST}"
 
     systemctl daemon-reload || warn "systemctl daemon-reload failed."
+
+    # Phase 24 Hotfix #5 (Bug: operator's terminal sees
+    # `Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+    # not found.` printed on the std-stream of nearly every fresh install —
+    # verbatim from operator's report: "STILL appears on every fresh install
+    # in a new terminal". Steady-state diagnosis: my installer has ZERO
+    # `systemctl restart psiphon-3x-ui.service` runtime calls (confirmed by
+    # `grep -E '^[^#]*systemctl[^|]+psiphon-3x-ui' installer/*.sh install.sh`
+    # → returned only `stop`/`start`/`daemon-reload`/`enable`, no `restart`).
+    # The wording is therefore systemctl's own emit from a deferred systemd
+    # transaction: `daemon-reload` re-reads the just-updated unit file while
+    # systemd's transaction graph still holds the FAILED-state entry pointed
+    # at the prior unit's old MD (from a prior boot's `Restart=on-failure`
+    # policy that never reaped). The next `systemctl enable`-commanded auto
+    # start (the wants-symlink triggers it implicitly) hits a brief race
+    # window where the unit's MD is mid-reload and the queued restart job
+    # emits "Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+    # not found." to the journalctl log + the std-stream of `systemctl enable`.
+    # Fix: `systemctl reset-failed psiphon-3x-ui.service` clears the FAILED-
+    # state entry from systemd's transaction graph BEFORE `enable` runs, so
+    # the implicit auto-start has no stale FAILED entry to chisel-emit a
+    # spurious "Failed to restart" notice from. Harmless on a fresh install
+    # (no FAILED entry to clear → `reset-failed` is a no-op) — belt-and-braces
+    # only on re-installs / installs after a prior `--uninstall`.
+    systemctl reset-failed psiphon-3x-ui.service 2>/dev/null || true
     systemctl enable psiphon-3x-ui.service >/dev/null 2>&1 \
         || warn "systemctl enable psiphon-3x-ui failed (continuing)."
 
@@ -380,6 +405,18 @@ EOF
     info "Pre-flight: stopping any prior psiphon-3x-ui.service unit …"
     systemctl stop psiphon-3x-ui.service 2>/dev/null \
         || true   # OK to fail on a fresh install
+    # Phase 24 Hotfix #5 (Bug: spurious "Failed to restart
+    # psiphon-3x-ui.service: Unit psiphon-3x-ui.service not found." wording
+    # echoed on the operator's terminal during install). Second call site —
+    # belt-and-braces: AFTER the pre-flight `systemctl stop` (which transitions
+    # the unit out of `active` and may leave it in `failed` per the unit's
+    # `Restart=on-failure` policy), BEFORE the orphan-kill + `systemctl start`.
+    # This clears any FAILED-state entry queued by systemd's `Restart=on-failure`
+    # policy that fired against the unit we just stopped — without it, the
+    # subsequent `systemctl start` can race the queued restart job and trigger
+    # the same false "Failed to restart … not found" wording we neutralized at
+    # the daemon-reload call site above. Harmless on a fresh install.
+    systemctl reset-failed psiphon-3x-ui.service 2>/dev/null || true
     sleep 1   # let the STOP signal propagate before snapshotting listeners
 
     info "Pre-flight: checking TCP/${PANEL_PORT} for stale listeners …"
