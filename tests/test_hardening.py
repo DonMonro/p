@@ -4375,3 +4375,215 @@ class TestHotfix17PostReleaseRegressions:
             "writeBits. Accidentally removing the flag would re-introduce "
             "the Hotfix #3 bug."
         )
+
+
+class TestHotfix18PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #5 — the spurious
+    "Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+    not found." wording the operator reported as STILL appearing on every
+    fresh install in a new terminal, even after Hotfixes #1-#4 landed.
+
+    Root cause (per Hotfix #5 docblock in installer/panel_install.sh):
+    my installer has ZERO runtime `systemctl restart psiphon-3x-ui.service`
+    calls — the wording is systemctl's own emit from a deferred systemd
+    transaction, triggered when `daemon-reload` / `enable` / `start` race
+    against a stale FAILED-state entry the unit's `Restart=on-failure` policy
+    left queued from the prior boot. The fix is `systemctl reset-failed
+    psiphon-3x-ui.service` at TWO call sites in panel_install.sh:
+
+      (1) between `systemctl daemon-reload` and `systemctl enable` — flush
+          the FAILED entry before `enable`'s implicit auto-start trips the
+          queued restart job;
+      (2) between the pre-flight `systemctl stop` and the orphan-kill + new
+          `systemctl start` — flush any FAILED entry the just-issued stop +
+          `Restart=on-failure` policy just queued.
+
+    These tests pin both call sites exist + both orderings hold + the exact
+    `reset-failed psiphon-3x-ui.service 2>/dev/null || true` shape (no
+    regression to a bare `reset-failed` that would spam on a fresh install).
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    _PANEL_INSTALL_SH = _REPO_ROOT / "installer" / "panel_install.sh"
+
+    def _no_comment_nonblank_lines(self) -> list[str]:
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        return [ln for ln in no_comments.splitlines() if ln.strip()]
+
+    def test_panel_install_has_two_reset_failed_call_sites(self):
+        """There MUST be TWO ``systemctl reset-failed psiphon-3x-ui.service``
+        lines after Hotfix #5. One would still leave the pre-flight stop +
+        `Restart=on-failure` race window open; we need both call sites."""
+        lines = self._no_comment_nonblank_lines()
+        reset_failed_lines = [
+            ln for ln in lines
+            if "systemctl reset-failed psiphon-3x-ui.service" in ln
+        ]
+        assert (
+            len(reset_failed_lines) == 2
+        ), (
+            "Phase 24 Hotfix #5 — expected exactly 2 "
+            "`systemctl reset-failed psiphon-3x-ui.service` call sites in "
+            "panel_install.sh (between daemon-reload+enable AND between the "
+            f"pre-flight stop+start). Found {len(reset_failed_lines)}: "
+            f"{reset_failed_lines!r}."
+        )
+
+    def test_reset_failed_uses_stderr_redirect_and_or_true(self):
+        """Every ``reset-failed`` call MUST use the
+        ``2>/dev/null || true`` form so a fresh install (with no FAILED
+        entry to clear, where `reset-failed` returns non-zero) doesn't
+        trip the installer's `warn`/`die` paths or print to the operator's
+        terminal. Belt-and-braces on re-installs, silent on fresh installs."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        reset_failed_calls = re.findall(
+            r"systemctl reset-failed psiphon-3x-ui\.service[^\n]*",
+            no_comments,
+        )
+        assert len(reset_failed_calls) == 2, (
+            "Phase 24 Hotfix #5 — sanity guard: expected exactly 2 "
+            "`systemctl reset-failed psiphon-3x-ui.service` calls "
+            f"(see test_panel_install_has_two_reset_failed_call_sites); "
+            f"found {len(reset_failed_calls)}."
+        )
+        for call in reset_failed_calls:
+            assert "2>/dev/null" in call, (
+                "Phase 24 Hotfix #5 — every `reset-failed` call must "
+                f"suppress stderr (`2>/dev/null`) so systemctl's "
+                f"'Unit not loaded.' chatter doesn't print on a fresh "
+                f"install. Offending call: {call!r}."
+            )
+            assert "|| true" in call, (
+                "Phase 24 Hotfix #5 — every `reset-failed` call must "
+                f"end with `|| true` (reset-failed returns non-zero on a "
+                f"fresh install where there is no FAILED entry to clear; "
+                f"without `|| true` the `set -e`-style guards in some "
+                f"shells would abort). Offending call: {call!r}."
+            )
+
+    def test_reset_failed_site_1_runs_between_daemon_reload_and_enable(self):
+        """Call site #1 — between ``systemctl daemon-reload`` and
+        ``systemctl enable psiphon-3x-ui.service`` — flushes the FAILED
+        entry that survives a re-install between the just-reloaded MD and
+        the implicit auto-start `enable` triggers via the wants-symlink."""
+        lines = self._no_comment_nonblank_lines()
+        idx_daemon_reload = next(
+            (i for i, ln in enumerate(lines)
+             if "systemctl daemon-reload" in ln),
+            None,
+        )
+        idx_enable = next(
+            (i for i, ln in enumerate(lines)
+             if "systemctl enable psiphon-3x-ui.service" in ln),
+            None,
+        )
+        reset_failed_indices = [
+            i for i, ln in enumerate(lines)
+            if "systemctl reset-failed psiphon-3x-ui.service" in ln
+        ]
+        assert (
+            idx_daemon_reload is not None
+            and idx_enable is not None
+            and len(reset_failed_indices) >= 1
+        ), (
+            "Phase 24 Hotfix #5 — pre-condition: panel_install.sh must have "
+            "`systemctl daemon-reload`, `systemctl enable psiphon-3x-ui.service`, "
+            "and at least one `reset-failed` call site."
+        )
+        # The reset-failed site 1 is the EARLIEST reset-failed call.
+        site_1 = min(reset_failed_indices)
+        assert idx_daemon_reload < site_1 < idx_enable, (
+            "Phase 24 Hotfix #5 — call site #1 (the first "
+            "`systemctl reset-failed psiphon-3x-ui.service`) MUST sit "
+            "strictly BETWEEN `systemctl daemon-reload` and "
+            "`systemctl enable psiphon-3x-ui.service`. Without this "
+            "ordering, `enable`'s implicit auto-start races against the "
+            "stale FAILED entry the daemon-reload just re-read."
+        )
+
+    def test_reset_failed_site_2_runs_between_pre_flight_stop_and_start(self):
+        """Call site #2 — between the pre-flight ``systemctl stop
+        psiphon-3x-ui.service`` and the subsequent ``systemctl start`` of
+        the same unit — flushes the FAILED entry that the just-issued
+        stop + the unit's `Restart=on-failure` policy just queued."""
+        lines = self._no_comment_nonblank_lines()
+        # The pre-flight STOP is the second `systemctl stop psiphon-3x-ui.service`
+        # in the file (the first one is inside the `--uninstall` branch early
+        # in install.sh; panel_install.sh has only ONE pre-flight stop). Pin it
+        # by the 'Pre-flight' info() that precedes it.
+        nonblank_with_indices = list(enumerate(lines))
+        idx_preflight_info = next(
+            (i for i, ln in nonblank_with_indices
+             if "Pre-flight: stopping any prior psiphon-3x-ui.service unit" in ln),
+            None,
+        )
+        assert idx_preflight_info is not None, (
+            "Phase 24 Hotfix #5 — pre-condition: panel_install.sh must still "
+            "have the Phase 24 Hotfix #2 pre-flight `info` banner preceding "
+            "the pre-flight stop."
+        )
+        idx_preflight_stop = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_preflight_info and "systemctl stop psiphon-3x-ui.service" in ln),
+            None,
+        )
+        # The START of the unit comes after the orphan-kill block, identified
+        # by 'Start the unit fresh' comment stripped to its body.
+        idx_start_unit = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_preflight_stop
+             and "systemctl start psiphon-3x-ui.service" in ln
+             and "2>/dev/null" not in ln),
+            None,
+        )
+        reset_failed_indices = [
+            i for i, ln in nonblank_with_indices
+            if "systemctl reset-failed psiphon-3x-ui.service" in ln
+        ]
+        assert (
+            idx_preflight_stop is not None
+            and idx_start_unit is not None
+            and len(reset_failed_indices) >= 2
+        ), (
+            "Phase 24 Hotfix #5 — pre-condition: panel_install.sh must have "
+            "the pre-flight stop + the new start + at least two reset-failed "
+            "call sites."
+        )
+        # The reset-failed call that bounds the pre-flight site is the one
+        # strictly AFTER idx_preflight_stop and strictly BEFORE idx_start_unit.
+        site_2_candidates = [
+            i for i in reset_failed_indices
+            if idx_preflight_stop < i < idx_start_unit
+        ]
+        assert site_2_candidates, (
+            "Phase 24 Hotfix #5 — call site #2 MUST run strictly BETWEEN the "
+            "pre-flight `systemctl stop psiphon-3x-ui.service` and the "
+            "`systemctl start psiphon-3x-ui.service` that follows. Without "
+            "this ordering, the new start races against the queued restart "
+            "job the just-issued stop + `Restart=on-failure` policy minted."
+        )
+
+    def test_panel_install_has_no_bare_reset_failed_calls(self):
+        """A bare ``systemctl reset-failed`` (no ``2>/dev/null || true``)
+        would emit `Unit not loaded.` to the operator's terminal on a
+        fresh install — the very noise this Hotfix is supposed to silence.
+        The grep must find ZERO bare calls."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        bare_calls = re.findall(
+            r"systemctl reset-failed psiphon-3x-ui\.service(?!\s*2>/dev/null\s*\|\|\s*true)[^\n]*",
+            no_comments,
+        )
+        assert not bare_calls, (
+            "Phase 24 Hotfix #5 — found a bare `reset-failed` call without "
+            "the required `2>/dev/null || true` suffix; this would print "
+            f"chatter to the operator's terminal: {bare_calls!r}."
+        )
