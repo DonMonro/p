@@ -43,6 +43,52 @@ run_panel_install() {
         die "User '${PSIPHON3XUI_USER}' not found. Run installer/prepare_user.sh first."
     fi
 
+    # ── 1b. Phase 24 Hotfix #6 — PRE-BUILD UNIT QUIESCE ────────────────────
+    # Bug (operator's 7th install): the panel was in a `Restart=on-failure`
+    # boot loop with `ImportError: cannot import name 'BaseModel' from
+    # 'pydantic'` while panel_install.sh was STILL installing the wheel +
+    # runtime deps into the venv. Root cause: a PRIOR install had already
+    # installed `/etc/systemd/system/psiphon-3x-ui.service` and `systemctl
+    # enable`'d it (`WantedBy=multi-user.target` → wants-symlink is in
+    # `/etc/systemd/system/multi-user.target.wants/`). Between installs
+    # systemd's `Restart=on-failure` policy keeps restart-lopping the panel
+    # against the OLD pydantic (or the wheel just removed by
+    # `--force-reinstall`). When the NEXT install's `pip install
+    # --force-reinstall --no-deps "${wheel_path}"` (line ~91) UNLINKS the
+    # old panel's package files AND the runtime-deps `pip install pydantic
+    # >=2.6` step is mid-resolving pydantic v1→v2, the queued systemd
+    # `Restart=on-failure` jobs fire against the half-broken venv → 14
+    # restart cycles of `ImportError: cannot import name 'BaseModel'`
+    # (each cycle: import pydantic → midway through pip's atomic swap →
+    # import fails → exit 1 → systemd reschedules). The operator sees
+    # `Failed to restart psiphon-3x-ui.service: Unit not found.` printed
+    # when the queued start job's stale FAILED entry momentarily can't
+    # see the now-reloading unit MD, plus the 80-line `ImportError` spam.
+    #
+    # Fix: STOP + DISABLE + RESET-FAILED the unit AT THE VERY TOP of
+    # `run_panel_install`, BEFORE touching the venv / wheel / deps. With
+    # the unit disabled + FAILED state cleared there's no wants-symlink
+    # to reschedule autostarts, no queued restart job to race the wheel
+    # reinstall, no spurious "Failed to restart …" wording on stdout. The
+    # subsequent `systemctl start psiphon-3x-ui.service` at line ~463 (the
+    # post-wait_for_panel_socket explicit start) is the FIRST start
+    # issued against the freshly-installed venv. Belt-and-braces: at the
+    # bottom of this function (the existing daemon-reload + enable block,
+    # line ~266) we re-enable + start it explicitly.
+    info "Pre-build quiesce: stopping + disabling any prior psiphon-3x-ui.service unit …"
+    systemctl stop psiphon-3x-ui.service 2>/dev/null || true
+    systemctl disable psiphon-3x-ui.service 2>/dev/null || true
+    systemctl reset-failed psiphon-3x-ui.service 2>/dev/null || true
+    # `systemctl disable` removes the wants-symlink; `reset-failed`
+    # zeroes the FAILED-state entry. No queued Restart=on-failure job
+    # can fire against the unit between now and our explicit start below.
+    # `daemon-reload` here is defensive (no unit file change yet on a
+    # fresh install; on a re-install the unit was already re-installed
+    # by a prior aborted run — re-read to ensure systemd forgets any
+    # leftover MD that might re-arm a queued restart job during the
+    # 10-20 seconds the wheel reinstall takes).
+    systemctl daemon-reload 2>/dev/null || true
+
     # ── 2. venv + pip build tooling ───────────────────────────────────────
     if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
         info "Creating Python venv at ${VENV_DIR} …"
