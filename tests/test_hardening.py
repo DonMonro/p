@@ -4413,23 +4413,43 @@ class TestHotfix18PostReleaseRegressions:
         no_comments = re.sub(r"#[^\n]*", "", text)
         return [ln for ln in no_comments.splitlines() if ln.strip()]
 
-    def test_panel_install_has_two_reset_failed_call_sites(self):
-        """There MUST be TWO ``systemctl reset-failed psiphon-3x-ui.service``
-        lines after Hotfix #5. One would still leave the pre-flight stop +
-        `Restart=on-failure` race window open; we need both call sites."""
+    def test_panel_install_has_three_reset_failed_call_sites(self):
+        """After Phase 24 Hotfix #6 there are THREE
+        ``systemctl reset-failed psiphon-3x-ui.service`` call sites in
+        panel_install.sh:
+
+        (1) HOTFIX #6 — the pre-build quiesce block at the TOP of
+            ``run_panel_install``, BEFORE the venv/wheel/deps install —
+            forwards the unit's FAILED-state entry from a PRIOR install
+            before the wheel reinstall touches pydantic.
+        (2) HOTFIX #5 — between ``systemctl daemon-reload`` and
+            ``systemctl enable psiphon-3x-ui.service`` — flushes the
+            FAILED entry that survives a re-install between the just-
+            reloaded MD and the implicit auto-start `enable` triggers
+            via the wants-symlink.
+        (3) HOTFIX #5 — between the pre-flight ``systemctl stop`` and the
+            subsequent ``systemctl start`` of the new installed unit —
+            flushes the FAILED entry that the just-issued stop + the
+            unit's `Restart=on-failure` policy just queued.
+
+        Hotfix #5 originally pinned ``== 2``; Hotfix #6 added the pre-
+        build quiesce site and so this count rose to 3. Pinning the exact
+        count guards against an accidental drop back to 2 (which would
+        silently re-open the Hotfix #6 boot-loop race) or a stray 4th
+        call (which would suggest a copy-paste duplication)."""
         lines = self._no_comment_nonblank_lines()
         reset_failed_lines = [
             ln for ln in lines
             if "systemctl reset-failed psiphon-3x-ui.service" in ln
         ]
         assert (
-            len(reset_failed_lines) == 2
+            len(reset_failed_lines) == 3
         ), (
-            "Phase 24 Hotfix #5 — expected exactly 2 "
+            "Phase 24 Hotfix #5 + Hotfix #6 — expected exactly 3 "
             "`systemctl reset-failed psiphon-3x-ui.service` call sites in "
-            "panel_install.sh (between daemon-reload+enable AND between the "
-            f"pre-flight stop+start). Found {len(reset_failed_lines)}: "
-            f"{reset_failed_lines!r}."
+            "panel_install.sh: (H6) pre-build quiesce, (H5) between "
+            "daemon-reload+enable, (H5) between the pre-flight stop+start. "
+            f"Found {len(reset_failed_lines)}: {reset_failed_lines!r}."
         )
 
     def test_reset_failed_uses_stderr_redirect_and_or_true(self):
@@ -4437,7 +4457,11 @@ class TestHotfix18PostReleaseRegressions:
         ``2>/dev/null || true`` form so a fresh install (with no FAILED
         entry to clear, where `reset-failed` returns non-zero) doesn't
         trip the installer's `warn`/`die` paths or print to the operator's
-        terminal. Belt-and-braces on re-installs, silent on fresh installs."""
+        terminal. Belt-and-braces on re-installs, silent on fresh installs.
+
+        After Phase 24 Hotfix #6 added the pre-build quiesce site
+        (see ``test_panel_install_has_three_reset_failed_call_sites``)
+        there are 3 calls — pin the count + per-call shape."""
         import re  # noqa: PLC0415
 
         text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
@@ -4446,10 +4470,10 @@ class TestHotfix18PostReleaseRegressions:
             r"systemctl reset-failed psiphon-3x-ui\.service[^\n]*",
             no_comments,
         )
-        assert len(reset_failed_calls) == 2, (
-            "Phase 24 Hotfix #5 — sanity guard: expected exactly 2 "
+        assert len(reset_failed_calls) == 3, (
+            "Phase 24 Hotfix #5 + Hotfix #6 — sanity guard: expected exactly 3 "
             "`systemctl reset-failed psiphon-3x-ui.service` calls "
-            f"(see test_panel_install_has_two_reset_failed_call_sites); "
+            f"(see test_panel_install_has_three_reset_failed_call_sites); "
             f"found {len(reset_failed_calls)}."
         )
         for call in reset_failed_calls:
@@ -4496,15 +4520,36 @@ class TestHotfix18PostReleaseRegressions:
             "`systemctl daemon-reload`, `systemctl enable psiphon-3x-ui.service`, "
             "and at least one `reset-failed` call site."
         )
-        # The reset-failed site 1 is the EARLIEST reset-failed call.
-        site_1 = min(reset_failed_indices)
-        assert idx_daemon_reload < site_1 < idx_enable, (
-            "Phase 24 Hotfix #5 — call site #1 (the first "
-            "`systemctl reset-failed psiphon-3x-ui.service`) MUST sit "
-            "strictly BETWEEN `systemctl daemon-reload` and "
-            "`systemctl enable psiphon-3x-ui.service`. Without this "
-            "ordering, `enable`'s implicit auto-start races against the "
-            "stale FAILED entry the daemon-reload just re-read."
+        # Hotfix #6 added a reset-failed call at the TOP of `run_panel_install`
+        # (the pre-build quiesce block) — that site is EARLIER than the
+        # systemd-unit-install daemon-reload. It's pinned separately by
+        # ``test_pre_build_quiesce_runs_before_venv_create`` in
+        # ``TestHotfix19PostReleaseRegressions``. Hotfix #5's site #1 is the
+        # reset-failed call strictly BETWEEN daemon-reload and enable (it can
+        # no longer be the lexicographically-FIRST reset-failed call, so
+        # ``min(reset_failed_indices)`` would now wrongly grab the
+        # pre-build site).
+        site_1_candidates = [
+            i for i in reset_failed_indices
+            if idx_daemon_reload < i < idx_enable
+        ]
+        assert site_1_candidates, (
+            "Phase 24 Hotfix #5 — call site #1 MUST sit strictly BETWEEN "
+            "`systemctl daemon-reload` and `systemctl enable "
+            "psiphon-3x-ui.service`. Without this ordering, `enable`'s "
+            "implicit auto-start races against the stale FAILED entry the "
+            "daemon-reload just re-read. (Hotfix #6 added an extra "
+            "reset-failed call at the very top — that one is pinned by "
+            "TestHotfix19PostReleaseRegressions and is INTENTIONALLY "
+            "earlier than this daemon-reload.)"
+        )
+        # Defensive guard: there must be EXACTLY ONE such straddling call
+        # (not two — that would suggest the pre-build site accidentally
+        # slipped down past the daemon-reload).
+        assert len(site_1_candidates) == 1, (
+            "Phase 24 Hotfix #5 — site #1 should be a SINGLE reset-failed "
+            "call strictly between daemon-reload and enable; found "
+            f"{len(site_1_candidates)} candidates: {site_1_candidates!r}."
         )
 
     def test_reset_failed_site_2_runs_between_pre_flight_stop_and_start(self):
@@ -4586,4 +4631,349 @@ class TestHotfix18PostReleaseRegressions:
             "Phase 24 Hotfix #5 — found a bare `reset-failed` call without "
             "the required `2>/dev/null || true` suffix; this would print "
             f"chatter to the operator's terminal: {bare_calls!r}."
+        )
+
+
+class TestHotfix19PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #6 — the
+    `Restart=on-failure` boot-loop the operator reported STILL occurring
+    on the 7th fresh install (after Hotfixes #1-#5 had all landed).
+
+    Real root cause (settled via operator-provided journalctl + pydantic
+    diagnostic — see Hotfix #6 docblock in installer/panel_install.sh):
+    a PRIOR install had already `systemctl enable`'d the panel unit
+    (`WantedBy=multi-user.target` → wants-symlink in
+    `/etc/systemd/system/multi-user.target.wants/`). On the NEXT install,
+    `pip install --force-reinstall --no-deps "${wheel_path}"` (line ~137)
+    atomically UNLINKS the old panel's package files and
+    `pip install "pydantic>=2.6"` (line ~145) atomically SWAPS pydantic
+    v1→v2. systemd's `Restart=on-failure` policy — armed against the
+    STILL-ENABLED prior unit — flags the panel's mid-import crash as a
+    failure and reschedules a fresh autostart that fires against a venv
+    whose pydantic wheels aren't fully exposed yet, crashing again with
+    `ImportError: cannot import name 'BaseModel'`. The journal showed 14
+    such restart cycles between 14:30:38 and 14:31:11 before the install
+    finished and the panel came up. The operator's terminalised symptom
+    was `Failed to restart psiphon-3x-ui.service: Unit not found.` plus
+    an 80-line `ImportError` traceback per cycle.
+
+    Fix: STOP + DISABLE + RESET-FAILED + DAEMON-RELOAD the unit AT THE
+    VERY TOP of `run_panel_install`, BEFORE touching the venv / wheel /
+    runtime deps. `disable` removes the wants-symlink (no autostart slot
+    can fire while the wheel reinstall is in progress); `reset-failed`
+    zeroes the FAILED-state entry (no queued restart job can be minted
+    by the policy against a unit with no MD). These tests pin the
+    pre-build quiesce block exists with the exact `stop` < `disable` <
+    `reset-failed` < `daemon-reload` ordering and the exact
+    `2>/dev/null || true` shape, AND that all four calls sit strictly
+    before the venv-create section.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    _PANEL_INSTALL_SH = _REPO_ROOT / "installer" / "panel_install.sh"
+
+    def _no_comment_nonblank_lines(self) -> list[str]:
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        return [ln for ln in no_comments.splitlines() if ln.strip()]
+
+    def test_panel_install_has_pre_build_quiesce_info_banner(self):
+        """The Human-readable ``info`` banner MUST announce the pre-build
+        quiesce so an operator tailing the install log can correlate the
+        four systemctl no-ops that follow with intentional hygiene, rather
+        than mistaking them for stray installer chatter."""
+        lines = self._no_comment_nonblank_lines()
+        banner = [
+            ln for ln in lines
+            if "Pre-build quiesce" in ln and "disabling" in ln
+        ]
+        assert len(banner) == 1, (
+            "Phase 24 Hotfix #6 — panel_install.sh must have EXACTLY ONE "
+            "`info \"Pre-build quiesce: ... disabling ...` banner that "
+            "precedes the four systemctl quiesce calls. Without it the "
+            "no-op calls look like noise to a tailing operator (who can't "
+            "tell them from stray installer chatter). "
+            f"Found {len(banner)} matches: {banner!r}."
+        )
+
+    def test_pre_build_quiesce_has_four_systemctl_calls(self):
+        """There MUST be FOUR systemctl quiesce calls — ``stop``,
+        ``disable``, ``reset-failed``, ``daemon-reload`` — at the top of
+        ``run_panel_install``. Missing any one re-opens the race window
+        Hotfix #6 closes (e.g. omitting `disable` leaves the wants-symlink
+        armed and systemd can re-arm an autostart from the policy between
+        the wheel unlink and the explicit start at the bottom of the
+        function)."""
+        lines = self._no_comment_nonblank_lines()
+        # The pre-build quiesce block is the FIRST four systemctl-stop/
+        # disable/reset-failed/daemon-reload lines in the function body.
+        # We can't just grep for any stop/disable/... because the file has
+        # SEVERAL other systemctl stop/disable/restart call sites lower
+        # down (the Hotfix #2 pre-flight block, the Hotfix #5 reset-failed
+        # sites, the daemon-reload+enable+start block, etc.). So we
+        # anchor on the Pre-build quiesce banner and walk forward.
+        idx_banner = next(
+            (i for i, ln in enumerate(lines)
+             if "Pre-build quiesce" in ln),
+            None,
+        )
+        assert idx_banner is not None, (
+            "Phase 24 Hotfix #6 — pre-condition: "
+            "`Pre-build quiesce` info banner not found "
+            "(see test_pre_build_quiesce_info_banner)."
+        )
+        # Walk forward from the banner and collect the FIRST lines matching
+        # each of the four systemctl operations. The block should end at the
+        # first `systemctl daemon-reload` line; the venv-create
+        # `if [[ ! -x "${VENV_DIR}/bin/python" ]]` line follows.
+        quiesce_block = []
+        for ln in lines[idx_banner + 1:]:
+            if "systemctl" in ln and "psiphon-3x-ui.service" in ln:
+                quiesce_block.append(ln)
+                if "daemon-reload" in ln:
+                    break
+            elif "daemon-reload" in ln:
+                quiesce_block.append(ln)
+                break
+            elif "${VENV_DIR}/bin/python" in ln:
+                # We hit venv-create before seeing a daemon-reload — the
+                # block is incomplete.
+                break
+        # Expect stop + disable + reset-failed + daemon-reload.
+        joined = "\n".join(quiesce_block)
+        assert "systemctl stop psiphon-3x-ui.service" in joined, (
+            "Phase 24 Hotfix #6 — pre-build quiesce block missing the "
+            f"`systemctl stop psiphon-3x-ui.service` call. Block: {quiesce_block!r}."
+        )
+        assert "systemctl disable psiphon-3x-ui.service" in joined, (
+            "Phase 24 Hotfix #6 — pre-build quiesce block missing the "
+            f"`systemctl disable psiphon-3x-ui.service` call. Block: {quiesce_block!r}."
+        )
+        assert "systemctl reset-failed psiphon-3x-ui.service" in joined, (
+            "Phase 24 Hotfix #6 — pre-build quiesce block missing the "
+            f"`systemctl reset-failed psiphon-3x-ui.service` call. Block: {quiesce_block!r}."
+        )
+        assert "systemctl daemon-reload" in joined, (
+            "Phase 24 Hotfix #6 — pre-build quiesce block missing the "
+            f"`systemctl daemon-reload` call. Block: {quiesce_block!r}."
+        )
+
+    def test_pre_build_quiesce_runs_before_venv_create(self):
+        """All four quiesce calls MUST appear strictly BEFORE the venv-
+        create ``if [[ ! -x "${VENV_DIR}/bin/python" ]]`` line — otherwise
+        the wheel reinstall could begin while systemd still has a queued
+        autostart armed against the prior failed-and-enabled unit, which
+        is exactly the boot-loop Hotfix #6 is meant to prevent."""
+        lines = self._no_comment_nonblank_lines()
+        idx_banner = next(
+            (i for i, ln in enumerate(lines)
+             if "Pre-build quiesce" in ln),
+            None,
+        )
+        idx_venv = next(
+            (i for i, ln in enumerate(lines)
+             if "${VENV_DIR}/bin/python" in ln
+             and ("! -x" in ln or "venv" in ln.lower())),
+            None,
+        )
+        assert idx_banner is not None and idx_venv is not None, (
+            "Phase 24 Hotfix #6 — pre-condition: panel_install.sh must have "
+            "both the `Pre-build quiesce` banner and the venv-create "
+            "`if [[ ! -x \"${VENV_DIR}/bin/python\" ]]` block."
+        )
+        # Collect all four systemctl quiesce operations between banner and
+        # venv-create and assert they ALL sit strictly before venv-create.
+        quiesce_indices = [
+            i for i, ln in enumerate(lines)
+            if idx_banner < i < idx_venv
+            and "systemctl" in ln
+            and ("psiphon-3x-ui.service" in ln or "daemon-reload" in ln)
+        ]
+        assert quiesce_indices, (
+            "Phase 24 Hotfix #6 — NO systemctl quiesce calls between the "
+            "`Pre-build quiesce` banner and the venv-create block. The "
+            "venv/wheel reinstall would race systemd's still-armed "
+            "wants-symlink."
+        )
+        # And specifically each of the four ops must appear in that span.
+        span = [lines[i] for i in quiesce_indices]
+        joined = "\n".join(span)
+        for op in (
+            "systemctl stop psiphon-3x-ui.service",
+            "systemctl disable psiphon-3x-ui.service",
+            "systemctl reset-failed psiphon-3x-ui.service",
+            "systemctl daemon-reload",
+        ):
+            assert op in joined, (
+                f"Phase 24 Hotfix #6 — `{op}` must sit strictly BEFORE the "
+                f"venv-create block (between the `Pre-build quiesce` banner "
+                f"and `${{VENV_DIR}}/bin/python`). Found span: {span!r}."
+            )
+        # All four calls are BEFORE venv-create (the idx span already
+        # enforces this, but assert explicitly for clarity).
+        assert max(quiesce_indices) < idx_venv, (
+            "Phase 24 Hotfix #6 — at least one of the four quiesce systemctl "
+            "calls appears AT or AFTER the venv-create block; they must all "
+            "BE strictly before it."
+        )
+
+    def test_pre_build_quiesce_strict_ordering(self):
+        """The four quiesce calls MUST appear in the order
+        ``stop`` < ``disable`` < ``reset-failed`` < ``daemon-reload``.
+        Any other ordering re-opens or short-circuits part of the race:
+
+        * ``disable`` before ``stop`` would yank the wants-symlink while
+          the panel is still running, leaving it as an orphan until the
+          explicit re-enable+start at the bottom — meaning the proxy
+          clients upstream of the panel see a silent drop mid-session.
+        * ``reset-failed`` before ``disable``/``stop`` would zero the
+          failed-state entry before the policy has had a chance to mint
+          the final one for the just-stopped unit — re-arming a freshly
+          queued autostart between the two calls.
+        * ``daemon-reload`` before ``reset-failed`` would re-read the unit
+          MD while the FAILED entry is still alive, re-arming the
+          ``Restart=on-failure`` policy's view of the unit before the
+          entry gets cleared.
+        """
+        lines = self._no_comment_nonblank_lines()
+        idx_banner = next(
+            (i for i, ln in enumerate(lines)
+             if "Pre-build quiesce" in ln),
+            None,
+        )
+        idx_venv = next(
+            (i for i, ln in enumerate(lines)
+             if "${VENV_DIR}/bin/python" in ln
+             and ("! -x" in ln or "venv" in ln.lower())),
+            None,
+        )
+        assert idx_banner is not None and idx_venv is not None, (
+            "Phase 24 Hotfix #6 — pre-condition (see "
+            "test_pre_build_quiesce_runs_before_venv_create)."
+        )
+        # Within the [banner, venv) span, find the FIRST index of each op.
+        idx_stop = next(
+            (i for i, ln in enumerate(lines)
+             if idx_banner < i < idx_venv
+             and "systemctl stop psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_disable = next(
+            (i for i, ln in enumerate(lines)
+             if idx_banner < i < idx_venv
+             and "systemctl disable psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_reset = next(
+            (i for i, ln in enumerate(lines)
+             if idx_banner < i < idx_venv
+             and "systemctl reset-failed psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_reload = next(
+            (i for i, ln in enumerate(lines)
+             if idx_banner < i < idx_venv
+             and "systemctl daemon-reload" in ln),
+            None,
+        )
+        assert (
+            idx_stop is not None
+            and idx_disable is not None
+            and idx_reset is not None
+            and idx_reload is not None
+        ), (
+            "Phase 24 Hotfix #6 — pre-build quiesce block missing one or more "
+            f"of the four required calls in the [banner, venv) span: "
+            f"stop={idx_stop} disable={idx_disable} reset={idx_reset} "
+            f"reload={idx_reload}."
+        )
+        assert idx_stop < idx_disable < idx_reset < idx_reload, (
+            "Phase 24 Hotfix #6 — pre-build quiesce calls MUST appear in the "
+            "order `stop` < `disable` < `reset-failed` < `daemon-reload`. "
+            f"Found: stop={idx_stop} disable={idx_disable} reset={idx_reset} "
+            f"reload={idx_reload}."
+        )
+
+    def test_pre_build_quiesce_uses_stderr_redirect_and_or_true(self):
+        """All four pre-build quiesce calls MUST use the
+        ``2>/dev/null || true`` form — on a FRESH install (no prior unit,
+        no wants-symlink, no FAILED entry to clear) each call is a no-op
+        that returns non-zero, and without the `|| true` belt a
+        ``set -e``-shell would abort the whole installer mid-quiesce."""
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # We restrict the regex scope to the pre-build quiesce block by
+        # anchoring on the `Pre-build quiesce` info() banner and walking
+        # to the subsequent `systemctl daemon-reload` line.
+        block_start = no_comments.find("Pre-build quiesce")
+        assert block_start != -1, (
+            "Phase 24 Hotfix #6 — pre-condition: `Pre-build quiesce` banner "
+            "not found in panel_install.sh (see test_pre_build_quiesce_info_banner)."
+        )
+        # The block ends at the first `systemctl daemon-reload` after the banner.
+        block_end_rel = no_comments.find("systemctl daemon-reload", block_start)
+        assert block_end_rel != -1, (
+            "Phase 24 Hotfix #6 — `systemctl daemon-reload` not found after the "
+            "`Pre-build quiesce` banner (should be the LAST of the four calls)."
+        )
+        block_end = no_comments.find("\n", block_end_rel)
+        block = no_comments[block_start:block_end]
+        # Each of the four systemctl ops within the block must end with
+        # `2>/dev/null || true` (allowing flexible spaces).
+        for op_line in re.findall(
+            r"systemctl (?:stop|disable|reset-failed) psiphon-3x-ui\.service[^\n]*|"
+            r"systemctl daemon-reload[^\n]*",
+            block,
+        ):
+            assert "2>/dev/null" in op_line, (
+                "Phase 24 Hotfix #6 — pre-build quiesce call MUST redirect "
+                f"stderr (`2>/dev/null`) so systemctl's chatter doesn't print "
+                f"on a fresh install. Offending call: {op_line!r}."
+            )
+            assert "|| true" in op_line, (
+                "Phase 24 Hotfix #6 — pre-build quiesce call MUST end with "
+                f"`|| true` (returns non-zero on a fresh install where there "
+                f"is no unit to stop/disable/reset-failed; without it a "
+                f"set -e shell aborts). Offending call: {op_line!r}."
+            )
+        # Sanity: we found exactly 4 such qualified calls (the block has 4
+        # systemctl ops; daemon-reload with no unit-name arg still matches the
+        # second alternative of the regex).
+        qualified = re.findall(
+            r"systemctl (?:stop|disable|reset-failed) psiphon-3x-ui\.service[^\n]*|"
+            r"systemctl daemon-reload[^\n]*",
+            block,
+        )
+        assert len(qualified) == 4, (
+            "Phase 24 Hotfix #6 — pre-build quiesce block must contain EXACTLY "
+            f"4 systemctl calls (stop, disable, reset-failed, daemon-reload), "
+            f"all with `2>/dev/null || true`. Found {len(qualified)}: "
+            f"{qualified!r}."
+        )
+
+    def test_pre_build_quiesce_disables_unit_to_remove_wants_symlink(self):
+        """The ``systemctl disable`` call is the load-bearing fix: it
+        removes the ``/etc/systemd/system/multi-user.target.wants/
+        psiphon-3x-ui.service`` wants-symlink the prior
+        ``systemctl enable`` left. Without that symlink gone, systemd's
+        ``multi-user.target`` could re-arm an autostart while
+        ``pip install --force-reinstall`` is mid-swap of the wheel /
+        pydantic — re-opening the boot loop Hotfix #6 closes."""
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        # The `disable` line MUST be present (not just `enable` somewhere
+        # later). Anchored to the psiphon-3x-ui.service unit.
+        assert (
+            "systemctl disable psiphon-3x-ui.service 2>/dev/null || true"
+            in text
+        ), (
+            "Phase 24 Hotfix #6 — panel_install.sh must call "
+            "`systemctl disable psiphon-3x-ui.service 2>/dev/null || true` "
+            "in the pre-build quiesce block. Without `disable`, the prior "
+            "install's `WantedBy=multi-user.target` wants-symlink stays "
+            "armed and systemd can re-arm a mid-install autostart against "
+            "the half-broken venv."
         )
