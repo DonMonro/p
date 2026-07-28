@@ -44,6 +44,41 @@ Type=simple
 # (ENOENT on first run — acceptable), then binds
 # `{"data":{"port":11000},"noticeType":"ListeningSocksProxyPort"}` ✓ and
 # exits 0 on shutdown (vs exit 1 without the flag).
+#
+# Phase 24 Hotfix #4 (follow-up to Hotfix #3 — post-deploy field report
+# 2026-07-28): the operator's fresh install landed Hotfix #3's ExecStart
+# (`/etc/systemd/system/psiphon-tunnel@.service` confirmed via `systemctl
+# cat` to carry `-dataRootDirectory /opt/psiphon-3x-ui/data/%i`) BUT the
+# installer-side `install -d -m 0700 -o ${PSIPHON3XUI_USER} -g
+# ${PSIPHON3XUI_GROUP} ${DATA_DIR}` block in
+# `installer/panel_install.sh` did NOT fire — verifiable: `ls -ld
+# /opt/psiphon-3x-ui/data` returned "No such file or directory", and
+# `systemctl status psiphon-tunnel@US.service` showed the unit in an
+# `activating (auto-restart) (Result: exit-code)` restart loop with
+# `Main process exited, code=exited, status=1/FAILURE` because
+# psiphon-tunnel-core's mkdir of `/opt/psiphon-3x-ui/data/US` failed — its
+# PARENT `/opt/psiphon-3x-ui/data` did not exist. Same ConnectionRefused
+# surface symptom as before Hotfix #3 ("inline enable for US failed:
+# SOCKS5 health probe on 127.0.0.1:11000 failed after retry").
+#
+# Root cause for the missed pre-create was non-deterministic from the
+# captured diagnostics (likely a CDN edge cache served a stale
+# `installer/panel_install.sh`, OR `DATA_DIR` was undefined in the
+# installer shell env, OR the `install -d` exited non-zero). Regardless,
+# relying on the installer to pre-create a directory the systemd unit
+# ALSO needs is fragile. This Hotfix #4 makes the unit SELF-SUFFICIENT:
+# `ExecStartPre=` is a privileged pre-flight (it runs as the unit's `User=`
+# — here `psiphon3xui` — and `ReadWritePaths=/opt/psiphon-3x-ui` grants the
+# service writeBits there, so `install -d -m 0700 -o psiphon3xui -g
+# psiphon3xui` can recursively create the per-country dir + its parent).
+# This works with or without Hotfix #3's installer-side pre-create (which
+# still acts as belt-and-braces for first-time race tolerance). Idempotent:
+# `install -d` is a no-op on a pre-existing dir, so subsequent restarts
+# keep working. After this, the operator's previously-failing US tunnel
+# starts cleanly once the new unit file is dropped in +
+# `systemctl daemon-reload` runs — without re-running the installer or
+# having to `mkdir -p /opt/psiphon-3x-ui/data` by hand.
+ExecStartPre=/usr/bin/install -d -m 0700 -o psiphon3xui -g psiphon3xui /opt/psiphon-3x-ui/data/%i
 ExecStart=/opt/psiphon-3x-ui/bin/psiphon-tunnel-core \
     -config /opt/psiphon-3x-ui/config/%i.json \
     -dataRootDirectory /opt/psiphon-3x-ui/data/%i

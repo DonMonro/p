@@ -4112,3 +4112,266 @@ class TestHotfix16PostReleaseRegressions:
             "system/. Pre-creating the directory before the unit file exists "
             "would be wasted work if the install of the unit file failed."
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 24 Hotfix #4 — make the per-country tunnel unit SELF-SUFFICIENT so it
+# no longer depends on the installer-side `install -d ${DATA_DIR}` block in
+# `installer/panel_install.sh` (which Hotfix #3 added but did NOT fire on the
+# operator's machine in the field — `ls -ld /opt/psiphon-3x-ui/data` returned
+# "No such file or directory" while the Hotfix #3 unit file was confirmed
+# installed at `/etc/systemd/system/psiphon-tunnel@.service` with the new
+# `-dataRootDirectory /opt/psiphon-3x-ui/data/%i` ExecStart). The unit now ships
+# an `ExecStartPre=` that replicates the pre-create on every per-country
+# `systemctl start psiphon-tunnel@<CODE>` (idempotent via `install -d`). This
+# closes the failure path where the binary tries to `mkdir .../data/US` but
+# its PARENT `/opt/psiphon-3x-ui/data` doesn't exist → exit 1 → restart loop
+# → SOCKS5 listener never bound → dashboard ConnectionRefused on 11000.
+# ---------------------------------------------------------------------------
+class TestHotfix17PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #4 — the
+    per-country tunnel unit ``systemd/psiphon-tunnel@.service`` gained an
+    ``ExecStartPre=`` so it no longer needs the installer to pre-create
+    ``/opt/psiphon-3x-ui/data``. The operator's post-Hotfix-#3 field report
+    proved Hotfix #3's installer-side pre-create was unreliable (the data
+    dir was missing on a fresh install even though the new unit file landed),
+    leaving the unit in an ``activating (auto-restart)`` restart loop with
+    ``status=1/FAILURE`` because the binary's ``mkdir`` of
+    ``/opt/psiphon-3x-ui/data/<CODE>`` failed — its PARENT didn't exist.
+    Same ConnectionRefused surface symptom as before Hotfix #3.
+
+    The regression tests below pin the new ``ExecStartPre`` directive and
+    the ordering invariants so an accidental revert of either piece surfaces
+    immediately. The installer-side pre-create from Hotfix #3 is left in
+    place (belt-and-braces); it has its own regression tests in
+    :class:`TestHotfix16PostReleaseRegressions` and is NOT removed by
+    Hotfix #4.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
+    _TUNNEL_UNIT_SH = _REPO_ROOT / "systemd" / "psiphon-tunnel@.service"
+
+    # ─── Unit half: ExecStartPre pre-creates data dir per instance ──────────
+    def test_tunnel_unit_has_execstartpre_directive(self):
+        """``ExecStartPre=`` of ``psiphon-tunnel@.service`` MUST exist so
+        each per-country ``systemctl start psiphon-tunnel@<CODE>`` self-
+        creates its datastore directory (and the parent ``data/``). This is
+        the central piece of Hotfix #4 — without it the unit depends on
+        the installer-side pre-create which proved unreliable in the
+        field."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert re.search(r"^ExecStartPre\s*=", no_comments, re.M), (
+            "Phase 24 Hotfix #4 — systemd/psiphon-tunnel@.service MUST ship "
+            "an `ExecStartPre=` directive so each per-country tunnel instance "
+            "self-creates its /opt/psiphon-3x-ui/data/<CODE> directory on "
+            "startup. The Hotfix #3 installer-side pre-create was unreliable "
+            "in the field (operator's fresh install landed the new unit file "
+            "but /opt/psiphon-3x-ui/data was missing → binary mkdir failed → "
+            "exit 1 → restart loop → ConnectionRefused on 11000)."
+        )
+
+    def test_execstartpre_uses_install_minus_d(self):
+        """The ``ExecStartPre`` must use ``/usr/bin/install -d`` (recursive
+        mkdir) so BOTH the per-country subdir AND its parent
+        ``/opt/psiphon-3x-ui/data`` get created on first start. Plain
+        ``mkdir /opt/psiphon-3x-ui/data/<CODE>`` would fail when the parent
+        ``data`` dir is missing — which is exactly the failure mode that
+        Hotfix #4 was authored to close."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # The Hotfix-#4 ExecStartPre line:
+        #   ExecStartPre=/usr/bin/install -d -m 0700 -o psiphon3xui -g psiphon3xui /opt/psiphon-3x-ui/data/%i
+        execstartpre_match = re.search(
+            r"^ExecStartPre\s*=\s*(\S.*)$",
+            no_comments,
+            re.M,
+        )
+        assert execstartpre_match is not None, (
+            "Phase 24 Hotfix #4 — ExecStartPre line not found in the unit "
+            "file (test_tunnel_unit_has_execstartpre_directive guards the "
+            "directive presence; this test pins its specific shape)."
+        )
+        execstartpre_cmd = execstartpre_match.group(1)
+        assert re.search(r"\binstall\s+-d\b", execstartpre_cmd), (
+            "Phase 24 Hotfix #4 — ExecStartPre must use `install -d` so BOTH "
+            "the per-country dir AND its (possibly-missing) parent `/opt/"
+            "psiphon-3x-ui/data` get created. Plain `mkdir` would fail when "
+            "the parent is missing — exactly the failure mode that surfaced "
+            "in the operator's post-Hotfix-#3 field report."
+        )
+
+    def test_execstartpre_targets_per_country_data_dir_with_percent_i(self):
+        """The ``ExecStartPre`` path MUST include ``%i`` (the templated
+        country-code instance parameter) so each per-country instance
+        pre-creates its OWN data dir (NOT a shared parent that other
+        instances would race to create)."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        execstartpre_match = re.search(
+            r"^ExecStartPre\s*=\s*(\S.*)$",
+            no_comments,
+            re.M,
+        )
+        assert execstartpre_match is not None
+        execstartpre_cmd = execstartpre_match.group(1)
+        assert re.search(
+            r"/opt/psiphon-3x-ui/data/%i\b",
+            execstartpre_cmd,
+        ), (
+            "Phase 24 Hotfix #4 — ExecStartPre path MUST include `%i` so "
+            "each per-country tunnel instance pre-creates its OWN data "
+            "dir, e.g. `/opt/psiphon-3x-ui/data/US` — not a single shared "
+            "parent that other instances would race against."
+        )
+
+    def test_execstartpre_uses_mode_0700(self):
+        """The pre-created data dir MUST have strict mode ``0700``
+        (owner-only RWX) so the tunnel-core's per-country key material,
+        server-list cache, and OSL registry stay private to the
+        ``psiphon3xui`` service identity. World- or group-readable would
+        leak tunnel state to other system users."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        execstartpre_match = re.search(
+            r"^ExecStartPre\s*=\s*(\S.*)$",
+            no_comments,
+            re.M,
+        )
+        assert execstartpre_match is not None
+        execstartpre_cmd = execstartpre_match.group(1)
+        assert re.search(r"-m\s+0700\b", execstartpre_cmd), (
+            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
+            "`-m 0700` so the per-country tunnel datastore dir is "
+            "owner-only (psiphon3xui). Group- or world-readable would leak "
+            "tunnel-core state (key material, server-list cache, OSL "
+            "registry) to other system users."
+        )
+
+    def test_execstartpre_owns_to_psiphon3xui_user_and_group(self):
+        """The pre-created dir MUST be owned by ``psiphon3xui:psiphon3xui``
+        (the service's ``User=``/``Group=``) so the subsequent ExecStart,
+        which runs as the SAME ``psiphon3xui`` identity, can write into it.
+        A mismatch would make the binary's first-run mkdir of its own
+        per-country subdirs fail with EACCES."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        execstartpre_match = re.search(
+            r"^ExecStartPre\s*=\s*(\S.*)$",
+            no_comments,
+            re.M,
+        )
+        assert execstartpre_match is not None
+        execstartpre_cmd = execstartpre_match.group(1)
+        # The unit's User=/Group= are literal `psiphon3xui` (no env vars in
+        # a systemd unit), so ExecStartPre must reference the same literal.
+        assert "-o psiphon3xui" in execstartpre_cmd, (
+            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
+            "`-o psiphon3xui` so the pre-created dir belongs to the service "
+            "identity (the unit's `User=psiphon3xui` is the same literal)."
+        )
+        assert "-g psiphon3xui" in execstartpre_cmd, (
+            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
+            "`-g psiphon3xui` so the pre-created dir's group belongs to "
+            "the service identity (the unit's `Group=psiphon3xui` is the "
+            "same literal)."
+        )
+
+    def test_execstartpre_runs_before_execstart(self):
+        """Ordering invariant: ``ExecStartPre`` must appear BEFORE
+        ``ExecStart`` in the unit file. systemd gurantees this in its own
+        exec lifecycle, but pinning the source-order invariant surfaces any
+        accidental swap (e.g. a copy-paste that places the pre-create
+        below the binary invocation)."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        execstartpre_match = re.search(
+            r"^ExecStartPre\s*=", no_comments, re.M,
+        )
+        execstart_match = re.search(
+            r"^ExecStart\s*=", no_comments, re.M,
+        )
+        assert execstartpre_match is not None and execstart_match is not None
+        assert execstartpre_match.start() < execstart_match.start(), (
+            "Phase 24 Hotfix #4 — `ExecStartPre` MUST appear BEFORE `ExecStart` "
+            "in the unit file. systemd executes them in that order by spec; "
+            "keeping the source order consistent avoids future reader confusion."
+        )
+
+    def test_execstartpre_path_matches_execstart_dataRootDirectory(self):
+        """The ``ExecStartPre`` pre-create path MUST equal the ``-dataRootDirectory``
+        argument passed to ``ExecStart`` (both ``/opt/psiphon-3x-ui/data/%i``),
+        otherwise the pre-create would not actually unblock the binary's
+        mkdir of its own data dir."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # Extract the ExecStartPre command line (everything after `ExecStartPre=`).
+        execstartpre_line_match = re.search(
+            r"^ExecStartPre\s*=\s*(.+)$",
+            no_comments,
+            re.M,
+        )
+        execstart_datapath_match = re.search(
+            r"-dataRootDirectory\s+(/opt/psiphon-3x-ui/data/%i)",
+            no_comments,
+        )
+        assert execstartpre_line_match is not None, (
+            "Phase 24 Hotfix #4 — ExecStartPre line not found in the unit "
+            "file (test_tunnel_unit_has_execstartpre_directive guards the "
+            "directive presence; this test pins the path equality)."
+        )
+        assert execstart_datapath_match is not None, (
+            "Phase 24 Hotfix #4 — ExecStart still must pass "
+            "`-dataRootDirectory /opt/psiphon-3x-ui/data/%i`."
+        )
+        pre_path_match = re.search(
+            r"(/opt/psiphon-3x-ui/data/%i)",
+            execstartpre_line_match.group(1),
+        )
+        assert pre_path_match is not None, (
+            "Phase 24 Hotfix #4 — ExecStartPre path must contain "
+            "`/opt/psiphon-3x-ui/data/%i`."
+        )
+        assert (
+            pre_path_match.group(1) == execstart_datapath_match.group(1)
+        ), (
+            "Phase 24 Hotfix #4 — ExecStartPre pre-create path MUST equal "
+            "ExecStart's -dataRootDirectory argument so the pre-create "
+            "actually unblocks the binary's subsequent mkdir of its own "
+            "data subdir under the same root."
+        )
+
+    def test_execstart_still_has_dataRootDirectory_after_hotfix4(self):
+        """Hotfix #4 adds ``ExecStartPre`` but MUST NOT remove the
+        ``-dataRootDirectory`` argument from ``ExecStart`` — the pre-create
+        only builds the dir, the binary STILL needs the flag to know where
+        to write its server-list cache + OSL registry + key material."""
+        import re  # noqa: PLC0415
+
+        text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert re.search(
+            r"-dataRootDirectory\s+/opt/psiphon-3x-ui/data/%i\b",
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #4 — ExecStart MUST STILL pass "
+            "`-dataRootDirectory /opt/psiphon-3x-ui/data/%i`. The Hotfix #4 "
+            "ExecStartPre only pre-creates the directory; the binary STILL "
+            "needs the flag itself to point at that directory for its "
+            "writeBits. Accidentally removing the flag would re-introduce "
+            "the Hotfix #3 bug."
+        )
