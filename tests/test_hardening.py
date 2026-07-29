@@ -4578,13 +4578,32 @@ class TestHotfix18PostReleaseRegressions:
              if i > idx_preflight_info and "systemctl stop psiphon-3x-ui.service" in ln),
             None,
         )
-        # The START of the unit comes after the orphan-kill block, identified
-        # by 'Start the unit fresh' comment stripped to its body.
-        idx_start_unit = next(
+        # The START of the unit comes after the orphan-kill block. Phase 24
+        # Hotfix #7 added `2>/dev/null` to the `systemctl start` line (to
+        # silence systemd's transient "Failed to restart ... Unit not
+        # found" emit that leaked to the operator's terminal between seed
+        # and print_summary); the old `and "2>/dev/null" not in ln`
+        # predicate here is now stale and would return `None`. Anchor on
+        # the `info "Starting psiphon-3x-ui.service …"` banner, which is
+        # the line directly above the `if ! systemctl start ...` block and
+        # is unchanged by Hotfix #7.
+        idx_start_info = next(
             (i for i, ln in nonblank_with_indices
              if i > idx_preflight_stop
-             and "systemctl start psiphon-3x-ui.service" in ln
-             and "2>/dev/null" not in ln),
+             and "Starting psiphon-3x-ui.service" in ln),
+            None,
+        )
+        assert idx_start_info is not None, (
+            "Phase 24 Hotfix #7 — pre-condition: the `info \"Starting "
+            "psiphon-3x-ui.service …\"` banner that precedes the post-pre-"
+            "flight `systemctl start` MUST still be present (Hotfix #7 "
+            "only added a `2>/dev/null` redirect + `if ! ...; then warn; fi` "
+            "wrapper around the start — it did NOT touch this banner)."
+        )
+        idx_start_unit = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_start_info
+             and "systemctl start psiphon-3x-ui.service" in ln),
             None,
         )
         reset_failed_indices = [
@@ -4976,4 +4995,404 @@ class TestHotfix19PostReleaseRegressions:
             "install's `WantedBy=multi-user.target` wants-symlink stays "
             "armed and systemd can re-arm a mid-install autostart against "
             "the half-broken venv."
+        )
+
+
+class TestHotfix20PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #7 — the operator-side
+    stdout noise the operator reported STILL occurring on the 8th fresh
+    install (after Hotfix #6 had silenced the `Restart=on-failure` boot
+    loop).
+
+    Operator's terminal transcript (8th install, Hotfix #6 confirmed
+    deployed via `grep "Pre-build quiesce" panel_install.sh`):
+
+        Successfully installed psiphon-3x-ui-panel-1.0.0
+        [seed] inserted new Settings(id=1) row
+        [seed] country table synced (33 entries)
+        Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service not found.
+        ── Psiphon-3X-UI installed ──
+        ...
+
+    Smoking-gun diagnostic (operator-provided):
+
+      * `wc -l install.log`  →  ``4``   (only the "Fetching installer
+        modules" banner block writes via `info`/`ok`/`warn`/`err` →
+        `tee -a LOG_FILE`).
+      * `grep "Failed to restart" install.log`  →  ZERO matches.
+      * `journalctl -u psiphon-3x-ui --no-pager -n 30`  →  a CLEAN boot
+        (Line `systemd[1]: Started psiphon-3x-ui.service` then
+        `Uvicorn running on http://0.0.0.0:11199`) — NO ImportError cycle,
+        NO `Restart=on-failure` reschedules. Hotfix #6 SUCCEEDED.
+
+    All three together rule out an installer helper call (`info`/`ok`/
+    `warn`/`err` all funnel through `_log` → `tee -a LOG_FILE` → they ALL
+    appear in install.log) and rule out a journal-side emit. The wording
+    must come from a child process whose stderr inherits install.sh's
+    stderr pipe (bypassing the `_log`/`tee -a LOG_FILE` funnel).
+
+    The only two `systemctl` calls in panel_install.sh's seed→print_summary
+    path that lacked `2>/dev/null` were:
+
+      * `systemctl daemon-reload || warn "systemctl daemon-reload failed."`
+        (post-seed systemd-unit-install; Hotfix #5/#6 left it unredirected).
+      * `systemctl start psiphon-3x-ui.service` (followed by a
+        backslash line-continuation splitting the `|| warn` onto the
+        next line; the post-pre-flight start; Hotfix #2/#5 left it
+        unredirected).
+
+    Mechanism: `systemctl daemon-reload` re-reads the just-updated unit's
+    MD while systemd's transaction graph STILL holds a queued restart
+    transaction from a prior `enable` (Hotfix #5/#6's `reset-failed` only
+    flushed the FAILED-state entry, not the pending restart job minted by
+    `WantedBy=multi-user.target`'s autostart slot). daemon-reload re-arms
+    the queued transaction; systemd attempts to dispatch it against a unit
+    whose MD is mid-reload → emits
+    `"Failed to restart psiphon-3x-ui.service: Unit ... not found."` to
+    stderr → that stderr is install.sh's stderr (inherited) → prints on
+    the operator's terminal in the exact `[seed] ── Psiphon-3X-UI
+    installed ──` bracket. daemon-reload ITSELF exits 0, so the `|| warn`
+    arm was never taken — which is why the warn text NEVER reached
+    install.log (smoking gun that the source is systemctl's stderr, not
+    the installer's warn helper).
+
+    Fix: redirect BOTH calls' stderr to /dev/null. daemon-reload's
+    `|| warn` becomes `|| true` (a non-fatal reload-only failure should
+    not abort a fresh install; the subsequent `enable` will reprise any
+    real systemic breakage loudly). `systemctl start` keeps the warn
+    funnel (genuine start failures ARE operator-actionable and DO belong
+    in install.log) but wraps the call in `if ! ... 2>/dev/null; then
+    warn "..."; fi` so systemd's transient JobResult chatter cannot leak
+    to the terminal.
+
+    These tests pin the new redirect shape at BOTH call sites, pin neither
+    site regressed back to a bare emit, and pin both sit strictly between
+    the seed invocation and `print_summary`.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    _PANEL_INSTALL_SH = _REPO_ROOT / "installer" / "panel_install.sh"
+
+    def _no_comment_nonblank_lines(self) -> list[str]:
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        return [ln for ln in no_comments.splitlines() if ln.strip()]
+
+    def test_post_seed_daemon_reload_redirects_stderr(self):
+        """The post-seed `systemctl daemon-reload` (AFTER the unit file
+        is installed and BEFORE `systemctl enable psiphon-3x-ui.service`)
+        must end with `2>/dev/null || true`. The `|| warn` form is no
+        longer correct here: daemon-reload ENTIRELY swallows the queued
+        restart job's dispatch failure and exits 0, so the `|| warn` arm
+        was dead AND its `warn` message would (paradoxically) double-write
+        to install.log while the actual chatter that the operator sees
+        (the bare `Failed to restart ... Unit not found.` emit on stderr)
+        BYPASSES `_log` and never appears in install.log — which is why
+        Hotfix #6's `wc -l install.log` came back as 4.
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # The post-seed daemon-reload is the LAST `systemctl daemon-reload`
+        # in non-comment source that is NOT preceded by the Hotfix #6
+        # "Pre-build quiesce" banner. (Both Hotfix #6 pre-build + this
+        # post-seed call now share the `2>/dev/null || true` form — so the
+        # regression guard below checks the COUNT is at least 2.)
+        qualified = re.findall(
+            r"systemctl daemon-reload\s+2>/dev/null\s*\|\|\s*true",
+            no_comments,
+        )
+        assert len(qualified) >= 2, (
+            "Phase 24 Hotfix #7 — post-seed `systemctl daemon-reload` MUST "
+            "use the `2>/dev/null || true` form (Hotfix #6's pre-build "
+            "quiesce daemon-reload is the OTHER such call, so the file "
+            "must now contain >= 2 of them). Found "
+            f"{len(qualified)}: {qualified!r}."
+        )
+
+    def test_post_seed_daemon_reload_no_longer_warns_on_failure(self):
+        """The OLD `systemctl daemon-reload || warn "systemctl
+        daemon-reload failed."` form is forbidden: dead `|| warn` arm
+        (daemon-reload swallows the dispatch failure and exits 0) which
+        would paradoxically log to install.log while the chatter the
+        operator SEES escapes via stderr (never reaching install.log —
+        the smoking gun that proved Hotfix #7's root cause).
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        bad_daemon_reload = re.findall(
+            r"systemctl\s+daemon-reload\s*\|\|\s*warn\b[^\n]*",
+            no_comments,
+        )
+        assert not bad_daemon_reload, (
+            "Phase 24 Hotfix #7 — `systemctl daemon-reload || warn ...` "
+            "is NO LONGER allowed anywhere in panel_install.sh. The "
+            "`|| warn` arm was dead (daemon-reload swallows the queued "
+            "JobResult failure and exits 0) AND the chatter the operator "
+            "actually saw escaped via stderr to begin with (which is why "
+            "an `|| warn` variant would paradoxically write to install.log "
+            "while the operator still saw the noise on the terminal). Use "
+            "`systemctl daemon-reload 2>/dev/null || true` (the TRUE / "
+            "DEVNULL redirect silences the sysd chatter; the caller's "
+            "`|| true` keeps `set -e` from aborting on a transient "
+            "reload hiccup). Offending lines: "
+            f"{bad_daemon_reload!r}."
+        )
+
+    def test_pre_flight_start_redirects_stderr(self):
+        """The post-pre-flight `systemctl start psiphon-3x-ui.service`
+        must be wrapped in `if ! ... 2>/dev/null; then warn "..."; fi`.
+        The OLD bare `systemctl start psiphon-3x-ui.service \\ || warn
+        "..."` form leaked systemd's transient
+        `"Failed to restart psiphon-3x-ui.service: Unit ... not
+        found."` JobResult emit to the operator's terminal in the
+        `[seed] ── Psiphon-3X-UI installed ──` bracket on the 8th
+        install. The new wrapper keeps the warn funnel (genuine start
+        failures ARE operator-actionable — the warn goes via `_log` →
+        `tee -a LOG_FILE` → install.log) but silences the stderr
+        chatter leak with `2>/dev/null`.
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # The new form MUST be present.
+        assert re.search(
+            r"if\s+!\s*systemctl\s+start\s+psiphon-3x-ui\.service\s+2>/dev/null\s*;\s*then",
+            no_comments,
+        ), (
+            "Phase 24 Hotfix #7 — the post-pre-flight unit start MUST be "
+            "rewritten as `if ! systemctl start psiphon-3x-ui.service "
+            "2>/dev/null; then warn \"...\"; fi`. The bare "
+            "`systemctl start psiphon-3x-ui.service` (no redirect, no "
+            "if/then/fi wrapper) leaks systemd's transient "
+            "`Failed to restart ... Unit not found.` JobResult emit to "
+            "the operator's terminal — exactly the noise Hotfix #7 set "
+            "out to silence."
+        )
+
+    def test_pre_flight_start_no_bare_or_unredirected_form(self):
+        """The bare `systemctl start psiphon-3x-ui.service \\` (backslash
+        line-continuation, no `2>/dev/null`, splitting the `|| warn` onto
+        the next line) and the `systemctl start
+        psiphon-3x-ui.service \\n || warn` form are BOTH forbidden —
+        Hotfix #7's `if ! ... 2>/dev/null; then warn ...; fi` wrapper is
+        the only allowed shape for the post-pre-flight start.
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # No bare backslash-continuation start without a redirect AND
+        # no `|| warn` start. The only permitted start-line shape is
+        # `if ! systemctl start psiphon-3x-ui.service 2>/dev/null; then`.
+        bare_cont = re.findall(
+            r"systemctl\s+start\s+psiphon-3x-ui\.service\s*\\\s*\n",
+            no_comments,
+        )
+        warn_arm = re.findall(
+            r"systemctl\s+start\s+psiphon-3x-ui\.service\s*(?:\\\s*\n\s*)?\|\|\s*warn\b",
+            no_comments,
+        )
+        assert not bare_cont, (
+            "Phase 24 Hotfix #7 — the BACKSLASH-LINE-CONTINUATION "
+            "`systemctl start psiphon-3x-ui.service \\\\` form is no "
+            "longer allowed (it provided no stderr redirect — systemd's "
+            "transient JobResult emit leaked straight to install.sh's "
+            "inherited stderr → the operator's terminal). Use the "
+            "`if ! systemctl start ... 2>/dev/null; then warn ...; fi` "
+            f"wrapper. Offending: {bare_cont!r}."
+        )
+        assert not warn_arm, (
+            "Phase 24 Hotfix #7 — the `systemctl start psiphon-3x-ui"
+            ".service \\ || warn` form is NO LONGER allowed here. The "
+            "`|| warn` arm emits an installer-side log line (via "
+            "`_log` → `tee -a LOG_FILE`) but the actual chatter the "
+            "operator sees escapes that funnel via stderr (which is "
+            "exactly the diagnostic `wc -l install.log = 4` smoke gun). "
+            "Use the `if ! systemctl start ... 2>/dev/null; then warn "
+            f"...; fi` wrapper. Offending: {warn_arm!r}."
+        )
+
+    def test_daemon_reload_and_start_sit_between_seed_and_print_summary(self):
+        """Both Hotfix #7 call sites must sit strictly AFTER the `python
+        -m panel.seed` invocation (the seed call) and strictly BEFORE
+        `print_summary`. If either one drifted outside that span, the
+        stderr chatter they suppress would no longer live in the
+        `[seed] ── Psiphon-3X-UI installed ──` bracket where the operator
+        reported it on the 8th install.
+        """
+        lines = self._no_comment_nonblank_lines()
+        nonblank_with_indices = list(enumerate(lines))
+        # The seed invocation is ``"${VENV_DIR}/bin/python" -m panel.seed``
+        # — the substring ``-m panel.seed`` is the stable part (the
+        # ``"${VENV_DIR}/bin/python"`` prefix has shell interpolation).
+        idx_seed = next(
+            (i for i, ln in nonblank_with_indices
+             if "-m panel.seed" in ln),
+            None,
+        )
+        # ``print_summary`` lives in ``install.sh``, NOT in
+        # ``panel_install.sh``. The natural lower bound for the bracket
+        # here is the ``if ! wait_for_panel_socket; then`` invocation
+        # inside ``run_panel_install`` (which fires strictly AFTER the
+        # ``systemctl start`` and waits for the listening socket) — the
+        # ``wait_for_panel_socket() {`` function DEFINITION further down
+        # has a different shape (``()``-suffix) so anchoring on the
+        # ``if ! wait_for_panel_socket; then`` form uniquely picks the
+        # call site inside the function body.
+        idx_socket_wait = next(
+            (i for i, ln in nonblank_with_indices
+             if "if ! wait_for_panel_socket; then" in ln),
+            None,
+        )
+        assert (
+            idx_seed is not None and idx_socket_wait is not None
+        ), (
+            "Phase 24 Hotfix #7 — pre-condition: panel_install.sh MUST "
+            "still invoke ``-m panel.seed`` (the install.sh call site) "
+            "AND contain an ``if ! wait_for_panel_socket; then`` block "
+            "inside ``run_panel_install`` to bound the post-seed pre-"
+            "socket-wait bracket where Hotfix #7's two stderr redirects "
+            "belong."
+        )
+        assert idx_seed < idx_socket_wait, (
+            "Phase 24 Hotfix #7 — pre-condition: the ``-m panel.seed`` "
+            "invocation MUST run before the ``if ! wait_for_panel_socket; "
+            "then`` block (else the bracket Hotfix #7 pins is "
+            "meaningless)."
+        )
+        # Daemon-reload: the LAST ``systemctl daemon-reload`` in
+        # non-comment source. The pre-build one (Hotfix #6) sits ABOVE
+        # the seed invocation (it's at the top of run_panel_install),
+        # so the post-seed daemon-reload is the only candidate > idx_seed.
+        idx_daemon_reload = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_seed
+             and "systemctl daemon-reload" in ln),
+            None,
+        )
+        # Start: the LAST ``systemctl start psiphon-3x-ui.service`` in
+        # non-comment source — there is no other start in the file (the
+        # pre-flight stop is a ``stop``, not a start).
+        idx_start = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_seed
+             and "systemctl start psiphon-3x-ui.service" in ln),
+            None,
+        )
+        assert idx_daemon_reload is not None, (
+            "Phase 24 Hotfix #7 — ``systemctl daemon-reload`` MUST "
+            "appear in the post-seed pre-socket-wait bracket (the "
+            "pre-build one from Hotfix #6 sits ABOVE seed at the top "
+            "of run_panel_install — the post-seed call is the only "
+            "``daemon-reload`` strictly after the seed invocation)."
+        )
+        assert idx_start is not None, (
+            "Phase 24 Hotfix #7 — ``systemctl start psiphon-3x-ui"
+            ".service`` MUST appear in the post-seed pre-socket-wait "
+            "bracket."
+        )
+        # Both must fall STRICTLY between seed and the socket-wait.
+        assert idx_seed < idx_daemon_reload < idx_socket_wait, (
+            "Phase 24 Hotfix #7 — the post-seed ``systemctl daemon-reload`` "
+            f"must sit strictly BETWEEN the ``-m panel.seed`` invocation "
+            f"(line #{idx_seed}) and the ``if ! wait_for_panel_socket; "
+            f"then`` block (line #{idx_socket_wait}); it lives at line "
+            f"#{idx_daemon_reload}. If the chatter-suppressing redirect "
+            "drifted out of that bracket the operator would see it "
+            "again on the 9th install."
+        )
+        assert idx_seed < idx_start < idx_socket_wait, (
+            "Phase 24 Hotfix #7 — the post-pre-flight ``systemctl start "
+            "psiphon-3x-ui.service`` must sit strictly BETWEEN the "
+            f"``-m panel.seed`` invocation (line #{idx_seed}) and the "
+            f"``if ! wait_for_panel_socket; then`` block (line "
+            f"#{idx_socket_wait}); it lives at line #{idx_start}."
+        )
+
+    def test_daemon_reload_runs_before_enable_after_unit_install(self):
+        """Hotfix #7's redirect MUST NOT disturb the existing
+        Hotfix #5 ordering that the post-seed sequence still runs:
+        ``install -m 0644`` unit-install, then `systemctl daemon-reload`,
+        then `systemctl reset-failed psiphon-3x-ui.service
+        2>/dev/null || true`, then `systemctl enable
+        psiphon-3x-ui.service`. If the redirect's `|| true` accidentally
+        let daemon-reload fall through to the pre-flight stop instead of
+        enable, the prior install's queue would race the install again.
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        # The post-seed daemon-reload must still be FOLLOWED by the
+        # Hotfix #5 enable. We don't insist on the exact line number
+        # (Hotfix #7 docblock shifted them) but the LEFT-TO-RIGHT order
+        # must survive.
+        idx_daemon_reload = no_comments.find("systemctl daemon-reload 2>/dev/null || true")
+        # Skip the pre-build daemon-reload (Hotfix #6) — it's the FIRST
+        # such occurrence. Find the SECOND one (the post-seed call).
+        idx_daemon_reload = no_comments.find(
+            "systemctl daemon-reload 2>/dev/null || true",
+            idx_daemon_reload + 1,
+        )
+        idx_enable = no_comments.find(
+            "systemctl enable psiphon-3x-ui.service",
+            idx_daemon_reload,
+        )
+        assert idx_daemon_reload != -1 and idx_enable != -1, (
+            "Phase 24 Hotfix #7 — post-seed `systemctl daemon-reload` "
+            "and subsequent `systemctl enable psiphon-3x-ui.service` "
+            "must both be present."
+        )
+        assert idx_daemon_reload < idx_enable, (
+            "Phase 24 Hotfix #7 — `systemctl daemon-reload` MUST run "
+            "BEFORE `systemctl enable psiphon-3x-ui.service` (Hotfix #5 "
+            "ordering preserved). Hotfix #7 only added the stderr "
+            "redirect — it must NOT have reordered the post-seed "
+            "sequence the Hotfix #5 test_reset_failed_site_1_runs_"
+            "between_daemon_reload_and_enable test pins."
+        )
+
+    def test_start_warn_message_remains_actionable(self):
+        """The `warn` text emitted on a genuine `systemctl start` failure
+        MUST remain operator-actionable (point at `journalctl -u
+        psiphon-3x-ui`). Hotfix #7 silenced stderr chatter but must NOT
+        have removed the warn funnel entirely — a silent start failure
+        would leave the operator staring at a non-listening port with
+        no install.log breadcrumb.
+        """
+        lines = self._no_comment_nonblank_lines()
+        nonblank_with_indices = list(enumerate(lines))
+        idx_start = next(
+            (i for i, ln in nonblank_with_indices
+             if "systemctl start psiphon-3x-ui.service" in ln
+             and "2>/dev/null" in ln),
+            None,
+        )
+        assert idx_start is not None, (
+            "Phase 24 Hotfix #7 — pre-condition: the redirected start "
+            "shape `if ! systemctl start psiphon-3x-ui.service "
+            "2>/dev/null; then ...; fi` MUST be present."
+        )
+        # The `warn` call on the line immediately AFTER must mention
+        # `journalctl -u psiphon-3x-ui` so the operator has a concrete
+        # next-step diagnostic (not a bare "systemctl start failed").
+        assert any(
+            "journalctl -u psiphon-3x-ui" in ln
+            for _, ln in nonblank_with_indices
+            if ln.lstrip().startswith("warn")
+        ), (
+            "Phase 24 Hotfix #7 — the `warn` message on a genuine "
+            "`systemctl start` failure MUST point the operator at "
+            "`journalctl -u psiphon-3x-ui` (so a silent start failure "
+            "still leaves a concrete next-step in install.log). Removing "
+            "the actionable hint while `2>/dev/null` silences stderr was "
+            "tempting but would leave the operator debugging a "
+            "non-listening port with no breadcrumb."
         )
