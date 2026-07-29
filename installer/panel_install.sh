@@ -309,7 +309,42 @@ EOF
         -e "s|^Group=.*|Group=${PSIPHON3XUI_GROUP}|" \
         "${SYSTEMD_UNIT_DST}"
 
-    systemctl daemon-reload || warn "systemctl daemon-reload failed."
+    # Phase 24 Hotfix #7 (Bug: operator STILL saw wording on the 8th+ install,
+    # right after `[seed] country table synced (33 entries)` and before
+    # `── Psiphon-3X-UI installed ──`). Hotfix #6 SILENCED the journal
+    # boot-loop (verified: journald shows a clean boot at Jul 29 08:29:21 →
+    # `Uvicorn running on http://0.0.0.0:11199` at 08:29:24, no ImportError,
+    # no Restart=on-failure cycles). Hotfix #6 also proved install.log has
+    # only 4 lines + ZERO "Failed to restart" matches — so the wording is
+    # NOT coming from any of our `info`/`ok`/`warn`/`err` helpers (all
+    # funnel through `_log`, which `tee -a "${LOG_FILE}"` doubles to
+    # install.log). It MUST be coming from a child process whose stderr
+    # inherits install.sh's stderr (eliding the `_log`/`tee -a LOG_FILE`)
+    # funnel, and reaches the operator's terminal directly.
+    #
+    # `systemctl daemon-reload` (Hotfix #5/#6 left it WITHOUT `2>/dev/null`)
+    # is that executive child. Mechanism: `daemon-reload` re-reads the
+    # unit's just-updated MD while systemd's transaction graph STILL holds
+    # a queued restart transaction from a prior `enable` (queued auto-
+    # start slot from `WantedBy=multi-user.target` of the prior-enable
+    # pull). daemon-reload re-arms the queued transaction; systemd
+    # attempts to dispatch it against a unit whose MD is mid-reload →
+    # emits "Failed to restart psiphon-3x-ui.service: Unit ... not
+    # found." to stderr → that stderr is install.sh's stderr (inherited)
+    # → prints on the operator's terminal in this exact bracket. The
+    # daemon-reload call ITSELF exits 0 (it succeeded), so the `|| warn`
+    # was never triggered — that's why the warn text didn't show up in
+    # install.log (further confirming the source).
+    #
+    # Fix: redirect systemctl daemon-reload's stderr to /dev/null AND
+    # tolerate non-zero exit (`|| true`). On a fresh install daemon-
+    # reload is a fire-and-forget no-op (the unit MD will be re-read by
+    # the next `enable` + `start`); on a re-install the queued-transaction
+    # chatter goes to /dev/null where it belongs. Belt-and-braces:
+    # `reset-failed` (already on line 337, Hotfix #5) still flushes the
+    # FAILED-state entry; the queued-transaction re-arm only matters for
+    # the operator's terminal noise (not the actual install success).
+    systemctl daemon-reload 2>/dev/null || true
 
     # Phase 24 Hotfix #5 (Bug: operator's terminal sees
     # `Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
@@ -506,8 +541,18 @@ then re-run 'sudo bash install.sh'."
 
     # Start the unit fresh (we stopped it above, never restart).
     info "Starting psiphon-3x-ui.service …"
-    systemctl start psiphon-3x-ui.service \
-        || warn "systemctl start psiphon-3x-ui failed."
+    # Phase 24 Hotfix #7 (Bug: operator-side noise — see Hotfix #7 docblock
+    # at the daemon-reload call site above). `systemctl start` can mint a
+    # queued-restart transaction whose JobResult systemd surfaces to
+    # stderr if the unit's MD is mid-reload (mirrors the daemon-reload
+    # case). Silence stderr; capture the exit code separately so we can
+    # still `warn`-log on a genuine start failure (the failure message
+    # goes via `warn` → `_log` → install.log, so the operator still gets
+    # a clean diagnostic in the install.log AND sees the WARN banner on
+    # the terminal — but with NO SYSTEMD STDERR CHATTER leak).
+    if ! systemctl start psiphon-3x-ui.service 2>/dev/null; then
+        warn "systemctl start psiphon-3x-ui failed (unit may be mid-reload; check journalctl -u psiphon-3x-ui)."
+    fi
 
     # ── 9. Wait for the listening socket — fatal on failure ──────────────
     # Early Phase 2 builds emitted only a `warn` here, so a port collision
