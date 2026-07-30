@@ -5396,3 +5396,309 @@ class TestHotfix20PostReleaseRegressions:
             "tempting but would leave the operator debugging a "
             "non-listening port with no breadcrumb."
         )
+
+
+class TestHotfix21PostReleaseRegressions:
+    """Static-source grep tests for Phase 24 Hotfix #8 — the operator's
+    install terminal STILL printed ``Failed to restart psiphon-3x-ui
+    .service: Unit psiphon-3x-ui.service not found.`` between the
+    ``[seed] country table synced (33 entries)`` stderr print and the
+    ``── Psiphon-3X-UI installed ──`` banner even AFTER Hotfix #7 had
+    deployed ``2>/dev/null`` redirects on every ``systemctl`` call in
+    the post-seed bracket.
+
+    Hotfix #7's stderr-redirect theory was definitively proven WRONG by
+    the operator's 12th-install ``strace -f -e trace=execve,write``
+    trace: NO install.sh-lineage process writes the ``Failed to
+    restart`` wording to ANY terminal-addressed file descriptor — the
+    only matches in the strace are the installer writing its own
+    panel_install.sh SOURCE to disk (the docblock contains the literal
+    phrase). The operator's ``journalctl --system | grep "Failed to
+    restart"`` also returned ZERO matches. Hence the wording is:
+
+    * NOT coming from ``systemctl`` CLI's stderr (those are silenced).
+    * NOT going to systemd-journald (journalctl shows nothing).
+    * NOT being written by any installer helper / child process
+      (strace shows no such write to fd 1 / fd 2 / TTY).
+
+    The remaining explanation: the wording is emitted asynchronously by
+    **systemd PID 1 itself** when its ``Restart=on-failure`` policy
+    notices the panel process exited with non-zero status (which is
+    what happens during the installer's `pip install --force-reinstall
+    --no-deps` window — pip atomically unlinks the wheel files and a
+    still-running uvicorn process that has been SIGTERM'd by our pre-
+    build `systemctl stop` finally exits with non-zero status; PID 1
+    then queues a restart). The restart-transaction dispatch + emit is
+    **inside systemd's own logging path**, which on hosts where PID 1's
+    ``LogTarget=journal-or-kmsg`` is also routed to the system console
+    will leak to the operator's terminal DESPITE our ``2>/dev/null``
+    redirects (those silence the CLI's stderr, NOT PID 1's own log
+    emit).
+
+    Fix: change the unit's ``Restart=on-failure`` to ``Restart=
+    on-abort`` AND add a wait-for-prior-exit polling loop at the top
+    of ``run_panel_install`` so the pre-build ``systemctl stop``'s
+    SIGTERM actually propagates before any subsequent
+    ``daemon-reload`` / ``enable`` / ``start`` (which is when the
+    queued-restart JobResult emit would otherwise fire). With
+    ``Restart=on-abort``: (a) NO regular exit-1 (e.g. mid-wheel-swap
+    uvicorn teardown) EVER queues a restart; (b) the panel still
+    auto-recovers from SIGABRT/SIGSEGV/SIGILL-class aborts (OOM,
+    segfault, panic) which is the realistic production crash mode.
+    The wait-loop additionally silences the alternative race where
+    the prior install's `Restart=on-failure`-armed panel is STILL
+    alive when the current install reaches the post-seed
+    ``daemon-reload`` (the SIGTERM takes 1-3 seconds for uvicorn
+    lifespan-shutdown but daemon-reload fires immediately).
+
+    These tests pin the ``Restart=on-abort`` change AND the
+    pre-build wait-loop's exact form + positioning.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    _PANEL_INSTALL_SH = _REPO_ROOT / "installer" / "panel_install.sh"
+    _PANEL_UNIT = _REPO_ROOT / "systemd" / "psiphon-3x-ui.service"
+
+    def _no_comment_nonblank_lines(self) -> list[str]:
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        return [ln for ln in no_comments.splitlines() if ln.strip()]
+
+    def test_panel_unit_uses_restart_on_abort_not_on_failure(self):
+        """``Restart=on-abort`` is the load-bearing Hotfix #8 fix.
+
+        ``on-failure`` queues a restart on EVERY non-zero exit /
+        signal-other-than-clean-stop; ``on-abort`` only queues a
+        restart on SIGABRT / SIGSEGV / SIGILL class aborts. During
+        install, ``pip install --force-reinstall --no-deps`` atomically
+        unlinks the wheel files SSD-side; the panel process -
+        SIGTERM'd by the installer's pre-build ``systemctl stop`` -
+        continues executing until the kernel delivers the signal
+        through its syscall-suspension, then exits via the CPython
+        signal-handler with exit status 1 (NOT a clean exit-0). With
+        ``on-failure`` armed, that exit-1 queues a restart at
+        ``RestartSec=5`` seconds in the future. By the time the next
+        ``daemon-reload`` / ``enable`` / ``start`` runs
+        (deterministic timing in the post-seed bracket), the queued
+        restart is dispatched against the now-stopping unit and
+        systemd PID 1 emits ``Failed to restart psiphon-3x-ui.service:
+        Unit ... not found.`` to its log target.
+
+        With ``on-abort``, the panel's exit-1 (regular application
+        teardown) is NOT a restart-trigger — only an abort signal
+        would be. The queued-restart job is never minted. No
+        ``Failed to restart ...`` JobResult emit ever fires.
+        """
+        import re  # noqa: PLC0415
+
+        text = self._PANEL_UNIT.read_text(encoding="utf-8")
+        # The Hotfix #8 fix MUST have replaced on-failure with on-abort.
+        # We anchor on the BARE unit-directive line ``Restart=on-abort``
+        # (line-anchored) so the docblock comment in the [Service]
+        # block (which mentions the OLD policy name) doesn't false-flag.
+        assert re.search(
+            r"^[ \t]*Restart=on-abort[ \t]*$",
+            text,
+            flags=re.MULTILINE,
+        ), (
+            "Phase 24 Hotfix #8 — systemd/psiphon-3x-ui.service MUST "
+            "carry a bare `Restart=on-abort` unit directive in the "
+            "[Service] block (NOT `Restart=on-failure`). on-failure "
+            "mints a restart-transaction the moment the panel process "
+            "exits non-zero (which happens during the post-seed "
+            "window when the SIGTERM'd uvicorn finally teardowns) — "
+            "the queued job's JobResult emit is the exact wording "
+            "`Failed to restart psiphon-3x-ui.service: Unit ... not "
+            "found.` the operator saw."
+        )
+        # Belt-and-braces: a bare `Restart=on-failure` line DIRECTIVE
+        # (line-anchored, NOT in a comment) is forbidden. The docblock
+        # commentary mentioning the policy name is fine — only the
+        # actual directive matters. Strip comment lines first.
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        assert not re.search(
+            r"^[ \t]*Restart=on-failure[ \t]*$",
+            no_comments,
+            flags=re.MULTILINE,
+        ), (
+            "Phase 24 Hotfix #8 — the [Service] block MUST NOT have "
+            "a bare `Restart=on-failure` unit-directive line (the "
+            "bare-line check excludes comments mentioning the policy "
+            "name in prose). `on-failure` re-opens the queued-"
+            "restart race this Hotfix is closing."
+        )
+
+    def test_pre_build_quiesce_waits_for_prior_panel_to_exit(self):
+        """Hotfix #8 added a ``is-active --quiet`` polling loop right
+        after ``systemctl stop`` so the prior install's panel process
+        exits BEFORE any subsequent systemctl mutating op touches the
+        unit's MD. Without the wait, ``stop`` returns 0 the moment
+        SIGTERM is ISSUED (not when the process actually exits) and
+        the panel can linger for ~1-3 seconds (uvicorn lifespan
+        shutdown + BCrypt teardown + async teardown of SQLAlchemy
+        engine). Any subsequent ``daemon-reload`` (which we still issue
+        at the bottom of the pre-build block) can race against the
+        lingering process's final exit — and if the prior panel's
+        ``Restart=on-failure`` policy has armed a queued restart for
+        it (running under the OLD Hotfix #7-and-prior codepath), the
+        queued job's JobResult emit fires DURING that daemon-reload —
+        which is the bracket the operator actually observed.
+
+        The wait-loop polls ``systemctl is-active --quiet`` for up to
+        30 seconds; ``is-active --quiet`` returns 0 iff the unit is
+        in ``active`` state (running MainPID attached), non-zero
+        otherwise (inactive / failed / queued-restart-pending).
+        """
+        lines = self._no_comment_nonblank_lines()
+        joined = "\n".join(lines)
+        # The wait-for-prior-exit polling block MUST be present and
+        # use the is-active --quiet form.
+        assert "systemctl is-active --quiet psiphon-3x-ui.service" in joined, (
+            "Phase 24 Hotfix #8 — panel_install.sh's pre-build quiesce "
+            "block MUST poll `systemctl is-active --quiet "
+            "psiphon-3x-ui.service` until the prior panel process "
+            "exits (or the 30-second timeout fires). The single-"
+            "shot `systemctl stop` SIGTERM is fire-and-forget — "
+            "without the wait, the panel process lingers through the "
+            "subsequent daemon-reload and the prior install's "
+            "Restart=on-failure queue can re-dispatch against it "
+            "mid-reload (which is the bracket the wording appeared)."
+        )
+
+    def test_pre_build_quiesce_wait_loop_bounds_to_30_iterations(self):
+        """The polling loop MUST use a bounded counter (``local
+        tries=30; while (( tries-- > 0 ))``) — an unbounded `while
+        systemctl is-active --quiet` would hang the install forever
+        if the prior panel is genuinely hung in a SIGKILL-proof
+        state (e.g. in an uninterruptible disk-io syscall). The 30-
+        second timeout plus the fallback `systemctl kill -s SIGKILL`
+        covers the realistic uvicorn shutdown window plus margin.
+
+        Note: we intentionally do NOT pin the exact `30` literal —
+        the timeout may be tuned by future hotfixes — but the
+        pattern of a `tries=` counter and a `(( tries-- > 0 ))`
+        decrement must be present so a future accidental removal of
+        the bound is caught.
+        """
+        lines = self._no_comment_nonblank_lines()
+        joined = "\n".join(lines)
+        assert "tries-- > 0" in joined, (
+            "Phase 24 Hotfix #8 — the wait-for-prior-exit polling "
+            "loop MUST be bounded by a decrementing `tries` counter "
+            "(pattern `tries-- > 0` in the `(( ... ))` predicate). "
+            "An unbounded loop risks a forever-hang if the prior "
+            "uvicorn process is in an uninterruptible syscall."
+        )
+        # The SIGKILL fallback must be present.
+        assert "systemctl kill -s SIGKILL psiphon-3x-ui.service" in joined, (
+            "Phase 24 Hotfix #8 — the pre-build quiesce block MUST "
+            "include a `systemctl kill -s SIGKILL psiphon-3x-ui."
+            "service` fallback for the case where `is-active --quiet` "
+            "is STILL returning 0 after the 30-iteration wait (i.e. "
+            "the prior panel process is hung in an uninterruptible "
+            "syscall — SIGTERM is being queued but won't be "
+            "delivered). Without the SIGKILL fallback, the daemon-"
+            "reload can race against a zombie panel and the wording "
+            "returns."
+        )
+
+    def test_pre_build_quiesce_wait_loop_sits_between_stop_and_disable(self):
+        """Order matters: the wait-loop MUST come AFTER the pre-build
+        ``systemctl stop`` AND BEFORE the subsequent ``systemctl
+        disable`` (and the daemon-reload at the bottom of the block).
+        If the loop sat after disable (and the wants-symlink was
+        already removed), the panel's prior auto-restart policy
+        could already have re-armed a restart job that the
+        daemon-reload picks up — and we're back in the same trap.
+        """
+        lines = self._no_comment_nonblank_lines()
+        nonblank_with_indices = list(enumerate(lines))
+        # The pre-build stop is the FIRST `systemctl stop
+        # psiphon-3x-ui.service` AFTER the "Pre-build quiesce" banner.
+        idx_banner = next(
+            (i for i, ln in nonblank_with_indices
+             if "Pre-build quiesce" in ln),
+            None,
+        )
+        assert idx_banner is not None, (
+            "Phase 24 Hotfix #8 — pre-condition: `Pre-build quiesce` "
+            "info banner must be present (Hotfix #6 pinned this)."
+        )
+        idx_stop = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_banner
+             and "systemctl stop psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_wait_loop_start = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_stop and "tries-- > 0" in ln),
+            None,
+        )
+        idx_is_active_check = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_stop
+             and "systemctl is-active --quiet psiphon-3x-ui.service" in ln),
+            None,
+        )
+        idx_disable = next(
+            (i for i, ln in nonblank_with_indices
+             if i > idx_stop
+             and "systemctl disable psiphon-3x-ui.service" in ln),
+            None,
+        )
+        assert idx_stop is not None, (
+            "Phase 24 Hotfix #8 — pre-condition: pre-build stop is "
+            "present (Hotfix #6 pinned this; we only tightened the "
+            "race window BEFORE it)."
+        )
+        assert idx_wait_loop_start is not None, (
+            "Phase 24 Hotfix #8 — the `tries-- > 0` decrement marker "
+            "must appear in the pre-build quiesce block (the wait "
+            "loop's predicate)."
+        )
+        assert idx_is_active_check is not None, (
+            "Phase 24 Hotfix #8 — the `systemctl is-active --quiet "
+            "psiphon-3x-ui.service` check MUST appear in the wait "
+            "loop's body."
+        )
+        assert idx_disable is not None, (
+            "Phase 24 Hotfix #8 — the pre-build `systemctl disable` "
+            "MUST follow the wait loop (and continue to the "
+            "daemon-reload at the bottom of the block)."
+        )
+        # Strict left-to-right: stop < wait_loop_start < is_active <
+        # disable. The is_active check sits INSIDE the wait loop body,
+        # so it's necessarily after the loop-head line numbers. The
+        # canonical order is: stop < wait_loop_open < is_active
+        # < disable.
+        assert idx_stop < idx_wait_loop_start < idx_is_active_check < idx_disable, (
+            f"Phase 24 Hotfix #8 — pre-build quiesce order must be "
+            f"`stop` (line #{idx_stop}) THEN `tries-- > 0` (line #"
+            f"{idx_wait_loop_start}) THEN `is-active --quiet` (line "
+            f"#{idx_is_active_check}) THEN `disable` (line #"
+            f"{idx_disable}). Anything else lets the queued-restart "
+            "race slip back open."
+        )
+
+    def test_pre_build_quiesce_wait_loop_uses_sleep_one(self):
+        """Poll interval is ``sleep 1`` — the panel's actual exit
+        takes ~100-500ms in the normal case (uvicorn + BCrypt +
+        SQLAlchemy teardown); 1-second polling granularity is fine
+        and avoids burning a syscall storm in a tight loop. A slower
+        poll interval (e.g. 5s) would add 25 extra seconds to every
+        install for no benefit; a faster one (e.g. ``usleep`` or
+        0.1s) would burn poll-call syscalls.
+        """
+        lines = self._no_comment_nonblank_lines()
+        joined = "\n".join(lines)
+        assert "sleep 1" in joined, (
+            "Phase 24 Hotfix #8 — the wait loop's poll interval MUST "
+            "be `sleep 1` (the realistic uvicorn shutdown window plus "
+            "a small safety margin). Longer intervals (``sleep 5`` "
+            "etc) would unnecessarily stretch fresh-install time from "
+            "~5s to ~25s; shorter intervals would burn unnecessary "
+            "systemctl syscalls against the D-Bus monitor."
+        )

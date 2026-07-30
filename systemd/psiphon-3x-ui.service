@@ -11,7 +11,38 @@ Type=simple
 WorkingDirectory=/opt/psiphon-3x-ui
 EnvironmentFile=/opt/psiphon-3x-ui/panel.env
 ExecStart=/opt/psiphon-3x-ui/venv/bin/python -m panel
-Restart=on-failure
+# Phase 24 Hotfix #8 (Bug: operator's install terminal shows
+#   ``Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+#   not found.`` between the ``[seed] country table synced (33 entries)``
+#   stderr print and the ``── Psiphon-3X-UI installed ──`` banner, even
+#   after Hotfix #5/#6/#7 placed ``2>/dev/null`` redirects on every
+#   installer systemctl call). The 2>/dev/null redirects silenced
+#   systemctl's own stderr (the CLI side) — but the wording is emitted by
+#   systemd PID 1 itself when its ``Restart=on-failure`` policy tries to
+#   dispatch a queued restart transaction against a mid-reload unit MD.
+#   The emit lands on the systemd-process log target (journal-or-kmsg by
+#   default), which on some SSH-host VTY setups ALSO echoes to the
+#   operator's terminal — even though ``journalctl --system`` shows no
+#   trace (kmsg-only path) and install.log has only the ``info``/``ok``
+#   banner block.
+#   The 12th-install strace confirmed: NO ``Failed to restart ...``
+#   write() syscall from any install.sh-lineage process during the post-
+#   seed bracket — only a docblock-source-write to fd 4 (which is the
+#   panel_install.sh file-write itself, NOT a TTY emit). The wording
+#   therefore comes from systemd PID 1's async JobResult emit, which our
+#   ``2>/dev/null`` redirects can never suppress.
+# Fix: switch the panel's restart policy from ``on-failure`` to
+# ``on-abort``. With ``on-abort`` systemd ONLY auto-restarts on
+# SIGABRT/SIGSEGV-class signals (the panel crashing under a memory
+# fault / panic), NOT on regular exit-code-1 (which is what happens
+# during install when pip --force-reinstall briefly unlinks the wheel
+# files SSD-side and uvicorn exits non-zero). With on-abort in place,
+# the installer's wheel-rewrite window never queues a restart job, so
+# systemd's "Failed to restart" JobResult emit never fires. The panel
+# still auto-recovers from genuine OOM/segfault crashes (the realistic
+# production failure mode) but doesn't burn a restart cycle on a
+# transient uvicorn exit during install.
+Restart=on-abort
 RestartSec=5
 # Run as a dedicated unprivileged user (created by the installer).
 User=psiphon3xui

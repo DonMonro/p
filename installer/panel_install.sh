@@ -77,6 +77,42 @@ run_panel_install() {
     # line ~266) we re-enable + start it explicitly.
     info "Pre-build quiesce: stopping + disabling any prior psiphon-3x-ui.service unit …"
     systemctl stop psiphon-3x-ui.service 2>/dev/null || true
+    # Phase 24 Hotfix #8 (Bug: operator's install terminal shows
+    #   ``Failed to restart psiphon-3x-ui.service: Unit psiphon-3x-ui.service
+    #   not found.`` between the seed print and the summary banner, even
+    #   with Hotfix #5/#6/#7 in place). The strace from the 12th install
+    #   proved no install.sh-lineage process emits the wording (no `write()`
+    #   to a TTY touches that string). The wording is systemd PID 1's
+    #   async JobResult emit from a queued restart transaction — and the
+    #   queue is armed DURING the window between `systemctl stop` returning
+    #   (fire-and-forget SIGTERM issue) and the panel's actual exit, when
+    #   the panel's `Restart=on-failure` policy sees the soon-to-be-dead
+    #   process and queues a restart at `RestartSec=5`s in the future.
+    # Simply dispatching `2>/dev/null` on later systemctl calls doesn't
+    #   help — the emit comes from PID 1's policy re-arm, not from the
+    #   CLI's stderr.
+    # Fix: WAIT for the panel process to actually exit before any
+    # subsequent daemon-reload / enable / start. Polling
+    # `systemctl is-active --quiet` with a 30-second timeout covers the
+    # realistic uvicorn graceful-shutdown (BCrypt teardown + ASGI
+    # lifespan shutdown) plus margin. On a fresh install the loop exits
+    # instantly (is-active returns non-zero immediately when the unit
+    # has no MainPID).
+    info "Waiting for any prior psiphon-3x-ui.service process to exit …"
+    local tries=30
+    while (( tries-- > 0 )); do
+        if ! systemctl is-active --quiet psiphon-3x-ui.service 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    # If the unit's still active after 30s of polling, force-kill anything
+    # left behind (covers a hung uvicorn loop).
+    if systemctl is-active --quiet psiphon-3x-ui.service 2>/dev/null; then
+        warn "Panel process did not exit within 30s — forcing stop."
+        systemctl kill -s SIGKILL psiphon-3x-ui.service 2>/dev/null || true
+        sleep 1
+    fi
     systemctl disable psiphon-3x-ui.service 2>/dev/null || true
     systemctl reset-failed psiphon-3x-ui.service 2>/dev/null || true
     # `systemctl disable` removes the wants-symlink; `reset-failed`
