@@ -35,7 +35,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 from sqlalchemy.orm import Session
 
 from ..auth import decrypt_creds, get_current_user, hash_password, verify_password
@@ -62,6 +62,10 @@ from ..psiphon import (
 # Hotfix #10 (Bug #3): apply_country / PortAssignmentSpec power the inline
 # enable-without-existing-PortAssignment branch inside patch_country.
 from ..wizard.apply import PortAssignmentSpec, apply_country
+
+# Phase 25 (Feature A/C/D): single-country clone helper — shared by the
+# extended PATCH (enable-with-inbound) and the new _reclone endpoint.
+from ..wizard.clone import clone_for_country
 from .xui_client import XuiClient, XuiClientError
 
 _log = logging.getLogger(__name__)
@@ -454,12 +458,24 @@ class PatchCountryBody(BaseModel):
         le=65535,
         description="optional public port for enabling a no-PortAssignment country",
     )
+    # Phase 25 (Feature A): when enabling, the operator may also pick the
+    # 3x-ui template inbound to clone from. Combined with socks_port, this
+    # drives the extended "apply + clone" feature (Feature C) — the PATCH
+    # response then includes apply_result + clone_result.
+    # StrictInt so Pydantic refuses subclasses like ``bool`` BEFORE our
+    # field_validator runs — bool is a subclass of int and would otherwise
+    # slip through both coercion AND the ge=1 check.
+    inbound_id: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        description="optional 3x-ui template inbound id to clone from on enable",
+    )
 
-    @field_validator("socks_port", "public_port")
+    @field_validator("socks_port", "public_port", "inbound_id")
     @classmethod
     def _no_bool(cls, v: int | None) -> int | None:
         if isinstance(v, bool):
-            raise ValueError("port must be an integer, not bool")
+            raise ValueError("port/inbound_id must be an integer, not bool")
         return v
 
 
@@ -523,7 +539,7 @@ def list_dashboard_countries(
 
 
 @router.patch("/countries/{code}", status_code=status.HTTP_200_OK)
-def patch_country(
+async def patch_country(
     code: str,
     body: PatchCountryBody,
     user: Annotated[dict, Depends(get_current_user)],
@@ -531,28 +547,33 @@ def patch_country(
 ) -> dict[str, Any]:
     """Toggle a country's enabled flag and start/stop its systemd unit.
 
-    * ``enabled == True`` → start_unit + Country.enabled = True
+    * ``enabled == True`` → start_unit + (optionally) apply_country + clone
+      the operator's picked 3x-ui inbound; Country.enabled = True
     * ``enabled == False`` → stop_unit + Country.enabled = False
 
     Hotfix #10 (Bug #3): if the country has NO existing PortAssignment and
-    the operator requests ``enabled == True``, instead of raising 409 we
-    NOW accept optional ``socks_port``/``public_port`` from the request body
-    (or use sensible smart-recommendation defaults when those are null),
-    persist a fresh PortAssignment row, run ``apply_country`` inline so the
-    tunnel unit starts cleanly, and finally flip ``Country.enabled = True``.
-    If ``apply_country`` returns a ``failed`` ApplyEvent the handler raises
-    a structured 502 with the underlying failure detail so the operator sees
-    a useful error message instead of being bounced back to the wizard.
+    the operator requests ``enabled == True``, we accept
+    ``socks_port``/``public_port`` (smart-recommended when null), persist a
+    fresh PortAssignment row, run ``apply_country`` inline, and flip
+    ``Country.enabled = True``.
+
+    Phase 25 (Feature A+C): when ``body.inbound_id`` is supplied the handler
+    also clones that template inbound (via
+    :func:`panel.wizard.clone.clone_for_country`) and surfaces
+    ``apply_result`` + ``clone_result`` in the response so the SPA can
+    render them inline next to the country card.
     """
     _require_wizard_completed(db)
     country = _get_country(db, code)
     assignment = (
         db.query(PortAssignment).filter(PortAssignment.country_code == country.code).first()
     )
+
+    apply_event = None  # populated if / when apply_country runs
     if assignment is None and body.enabled is True:
-        # Hotfix #10: enable a country that has no PortAssignment yet by
-        # accepting socks_port + public_port from the operator (or picking
-        # smart-recommendation defaults) and running apply_country inline.
+        # Hotfix #10: enable a country with no PortAssignment yet by
+        # accepting socks_port + public_port (or smart defaults) and running
+        # apply_country inline.
         socks_port = int(body.socks_port) if body.socks_port else _pick_free_socks_port(db)
         public_port = int(body.public_port) if body.public_port else _pick_free_public_port(db)
         spec = PortAssignmentSpec(
@@ -561,6 +582,7 @@ def patch_country(
             public_port=public_port,
         )
         event = apply_country(spec)
+        apply_event = event
         if event.status != "healthy":
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -585,9 +607,8 @@ def patch_country(
             socks_port,
             public_port,
         )
-        return _country_card(country, db)
-
-    if body.enabled:
+        assignment = port_row
+    elif body.enabled:
         try:
             start_unit(country.code)
         except PsiphonUnitError as exc:
@@ -595,6 +616,28 @@ def patch_country(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"start_unit({country.code}) failed: {exc}",
             ) from exc
+        # Phase 25 (Feature C): run apply_country + clone ONLY when an
+        # inbound_id is supplied — the SPA's "Enable country with inbound"
+        # modal collects all three fields (ports optional, inbound required).
+        # If inbound_id is omitted, we preserve the legacy bare-toggle
+        # semantics: any prior unit-start error surfaces above; the tunnels
+        # are started but no config-write / health-probe / clone runs.
+        if body.inbound_id is not None:
+            spec = PortAssignmentSpec(
+                country_code=country.code,
+                socks_port=int(assignment.socks_port),
+                public_port=int(assignment.public_port),
+            )
+            apply_event = apply_country(spec)
+            if apply_event.status != "healthy":
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=(f"apply for {country.code} failed: {apply_event.message}"),
+                )
+        country.enabled = True
+        db.add(country)
+        db.commit()
+        db.refresh(country)
     else:
         try:
             stop_unit(country.code)
@@ -602,13 +645,171 @@ def patch_country(
             _log.warning("stop_unit(%s) failed during disable: %s", country.code, exc)
             # Best-effort — the dashboard's disable should still flip the flag
             # so the operator isn't stuck with a half-stopped unit.
+        country.enabled = False
+        db.add(country)
+        db.commit()
+        db.refresh(country)
 
-    country.enabled = bool(body.enabled)
-    db.add(country)
-    db.commit()
-    db.refresh(country)
+    # Phase 25 (Feature C): if the operator handed us an inbound to clone,
+    # run the single-country clone helper now that the PortAssignment row
+    # exists (and the apply step has run in this request, since enabled=true
+    # short-circuits via the branches above).
+    clone_result: dict[str, Any] | None = None
+    if body.enabled and body.inbound_id is not None:
+        client: XuiClient | None = None
+        try:
+            client = await _async_get_xui_client(db)
+            if client is None:
+                clone_result = {
+                    "inbound_id": None,
+                    "success": False,
+                    "error": "no cached 3x-ui creds — run the wizard's creds step first",
+                }
+            else:
+                clone_result = await clone_for_country(
+                    country.code,
+                    int(body.inbound_id),
+                    db,
+                    client,
+                )
+                _log.info(
+                    "patch_country clone for %s from inbound %d → %s",
+                    country.code,
+                    body.inbound_id,
+                    clone_result,
+                )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("patch_country clone raised for %s", country.code)
+            clone_result = {
+                "inbound_id": None,
+                "success": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
 
-    return _country_card(country, db)
+    response = _country_card(country, db)
+    if apply_event is not None:
+        response["apply_result"] = {
+            "status": apply_event.status,
+            "progress": int(apply_event.progress),
+            "message": apply_event.message,
+        }
+    else:
+        response["apply_result"] = None
+    if clone_result is not None:
+        response["clone_result"] = clone_result
+    else:
+        response["clone_result"] = None
+    return response
+
+
+class RecloneBody(BaseModel):
+    """``POST /api/dashboard/countries/{code}/_reclone`` body.
+
+    Phase 25 (Feature D): lets the operator swap the 3x-ui inbound serving
+    a country to a DIFFERENT template. The handler:
+
+    1. Deletes the country's existing cloned inbound (if any) via
+       ``XuiClient.delete_inbound``.
+    2. Clones ``inbound_id`` for the country (``clone_for_country`` — persists
+       a new ``CloneRecord`` row).
+    3. Runs ``apply_country`` so the unit config + systemd unit reflect the
+       latest PortAssignment + country state.
+    4. Returns the refreshed country card with the same ``apply_result`` /
+       ``clone_result`` shape the extended PATCH uses.
+    """
+
+    inbound_id: StrictInt = Field(..., ge=1, description="new template inbound id to clone")
+
+
+@router.post("/countries/{code}/_reclone", status_code=status.HTTP_200_OK)
+async def reclone_country(
+    code: str,
+    body: RecloneBody,
+    user: Annotated[dict, Depends(get_current_user)],
+    db: Session = Depends(get_db),  # noqa: B008  FastAPI idiom
+) -> dict[str, Any]:
+    """Re-clone the country's 3x-ui inbound from a NEW template, then re-apply.
+
+    Phase 25 (Feature D): the dashboard's "Edit inbound" button targets this
+    endpoint. The handler is resilient — failures are reported via the
+    ``apply_result`` / ``clone_result`` fields rather than raised as HTTP
+    errors so the SPA can render them inline without losing the rest of the
+    country card (mirrors the extended PATCH shape).
+    """
+    _require_wizard_completed(db)
+    country = _get_country(db, code)
+
+    assignment = (
+        db.query(PortAssignment).filter(PortAssignment.country_code == country.code).first()
+    )
+    if assignment is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{country.code} has no PortAssignment — enable it with ports first"
+            ),
+        )
+
+    # ── 1. Delete the existing cloned inbound (if any) ────────────────────
+    existing = db.query(CloneRecord).filter(CloneRecord.country_code == country.code).first()
+    deleted_prior: int | None = None
+    delete_error: str | None = None
+
+    client: XuiClient | None = None
+    clone_result: dict[str, Any]
+    try:
+        client = await _async_get_xui_client(db)
+        if client is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="no cached 3x-ui creds — cannot re-clone",
+            )
+
+        if existing is not None:
+            try:
+                await client.delete_inbound(int(existing.inbound_id))
+                deleted_prior = int(existing.inbound_id)
+            except XuiClientError as exc:
+                delete_error = str(exc)
+                _log.warning("reclone: delete_inbound(%d) failed: %s", existing.inbound_id, exc)
+            db.delete(existing)
+            db.commit()
+
+        # ── 2. Clone the new template ─────────────────────────────────────
+        clone_result = await clone_for_country(
+            country.code,
+            int(body.inbound_id),
+            db,
+            client,
+        )
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    # ── 3. Re-apply the tunnel (write config + restart unit) ─────────────
+    spec = PortAssignmentSpec(
+        country_code=country.code,
+        socks_port=int(assignment.socks_port),
+        public_port=int(assignment.public_port),
+    )
+    apply_event = apply_country(spec)
+
+    response = _country_card(country, db)
+    response["apply_result"] = {
+        "status": apply_event.status,
+        "progress": int(apply_event.progress),
+        "message": apply_event.message,
+    }
+    response["clone_result"] = clone_result
+    response["prior_inbound_deleted"] = deleted_prior
+    if delete_error:
+        response["prior_inbound_delete_error"] = delete_error
+    return response
 
 
 @router.delete("/countries/{code}", status_code=status.HTTP_200_OK)

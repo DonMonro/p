@@ -377,9 +377,12 @@ EOF
 
     run_deps
     run_prepare_user      # creates psiphon3xui user/group + sets prefix ownership
-    run_prompt            # sets PANEL_PORT, PANEL_USER, PANEL_PASS, PANEL_ENABLE_HTTPS
+    run_prompt            # sets PANEL_PORT, PANEL_USER, PANEL_PASS (HTTPS prompt removed — feature parked)
     run_psiphon_install   # builds psiphon-tunnel-core from the pinned tag (needs the group)
-    run_https_install     # Phase 7 — self-signed cert (skips if PANEL_ENABLE_HTTPS != yes)
+    run_https_install     # self-signed cert helper kept for future re-enablement;
+                          # short-circuits because the install prompt no longer
+                          # sets PANEL_ENABLE_HTTPS=yes (re-enable manually by
+                          # exporting PANEL_ENABLE_HTTPS=yes before install.sh)
     run_panel_install     # venv + wheel + seed + systemd enable (needs the user, may pick up TLS)
     run_firewall          # opens panel port only (range opened later by wizard)
 
@@ -425,7 +428,7 @@ ${COLOR_OK}── Psiphon-3X-UI installed ────────────�
  Web UI : ${scheme}://${public_ipv4}:${PANEL_PORT}
  User   : ${PANEL_USER}
  Pass   : ${PANEL_PASS}      ${COLOR_WARN}(shown once — copy it now)${COLOR_RESET}
- HTTPS  : ${PANEL_ENABLE_HTTPS:-no}      ${COLOR_WARN}(self-signed: expect browser warning)${COLOR_RESET}
+ HTTPS  : ${PANEL_ENABLE_HTTPS:-no}      ${COLOR_WARN}(front with Caddy for real TLS)${COLOR_RESET}
  Log    : ${LOG_FILE}
 ${COLOR_OK}──────────────────────────────────────────────────────────${COLOR_RESET}
 EOF

@@ -616,6 +616,374 @@ class TestPatchCountry:
         assert r.json()["enabled"] is False
 
 
+# ---------------------------------------------------------------------------
+# 3b. Feature A+C: enable-with-inbound (PATCH @enabled=true + inbound_id)
+# ---------------------------------------------------------------------------
+class TestPatchCountryWithInbound:
+    """Phase 25 Features A+C — PATCH accepts an ``inbound_id`` and, when
+    enabled=true, runs apply_country + clone_for_country and surfaces
+    apply_result + clone_result in the response.
+    """
+
+    def _stub_apply(self, monkeypatch):
+        """Sandbox apply_country's I/O (write_config/start/is_active/probe)."""
+        from panel.psiphon import HealthProbeResult
+        from panel.wizard import apply as apply_mod
+
+        calls: dict[str, list] = {"write": [], "start": [], "active": [], "probe": []}
+
+        def _fake_write(country_code, socks_port, *, config_dir=None):
+            calls["write"].append((country_code, socks_port))
+            return Path(f"/tmp/psiphon-fake-{country_code}.json")
+
+        def _fake_start(country_code):
+            calls["start"].append(country_code)
+
+        def _fake_active(country_code):
+            calls["active"].append(country_code)
+            return True
+
+        def _fake_health(socks_port, **kwargs):  # noqa: ANN001
+            calls["probe"].append(socks_port)
+            return HealthProbeResult(healthy=True, detail="ok")
+
+        monkeypatch.setattr(apply_mod, "write_config", _fake_write)
+        monkeypatch.setattr(apply_mod, "start_unit", _fake_start)
+        monkeypatch.setattr(apply_mod, "is_unit_active", _fake_active)
+        monkeypatch.setattr(apply_mod, "health_probe", _fake_health)
+        return calls
+
+    def test_enable_with_inbound_clones_and_reports(self, monkeypatch, tmp_path):
+        """Enabling a country that has NO existing PortAssignment with
+        ``inbound_id`` runs apply+clone; apply_result + clone_result ride the
+        response. The CloneRecord row mirrors the freshly-cloned id.
+        """
+        self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {"id": 4242}
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 17},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["enabled"] is True
+        # apply ran (new PortAssignment branch always runs apply_country).
+        assert body["apply_result"] is not None
+        assert body["apply_result"]["status"] == "healthy"
+        assert body["apply_result"]["progress"] == 100
+        # clone ran.
+        assert body["clone_result"] is not None
+        assert body["clone_result"]["success"] is True
+        assert body["clone_result"]["inbound_id"] == 4242
+        assert body["clone_result"]["error"] is None
+        # xui_client.clone_inbound was invoked with the template_id we sent.
+        assert FakeXuiClient.clone_inbound_calls == [
+            (17, {"code": "JP", "name": "United States", "flag": "🇺🇸"},
+             body["socks_port"], body["public_port"])
+        ]
+        # DB row mirrors it.
+        init_db()
+        with Session(get_engine()) as s:
+            clone = s.query(CloneRecord).filter(CloneRecord.country_code == "JP").first()
+            assert clone is not None
+            assert clone.inbound_id == 4242
+
+    def test_enable_with_inbound_falls_back_to_smart_ports(self, monkeypatch, tmp_path):
+        """socks_port/public_port omitted → smart-recommendation defaults are
+        used (≥11000 / ≥31000, not colliding with other assignments)."""
+        self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 7},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["socks_port"] >= 11000
+        assert body["public_port"] >= 31000
+
+    def test_enable_existing_assignment_with_inbound_applies_and_clones(
+        self, monkeypatch, tmp_path,
+    ):
+        """A country that ALREADY has a PortAssignment still runs
+        apply_country + clone when enabled=true + inbound_id are sent; the
+        legacy bare-toggle path (no inbound_id) does NOT call apply_country.
+        """
+        calls = self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {"id": 55555}
+
+        r = client.patch(
+            "/api/dashboard/countries/US",
+            json={"enabled": True, "inbound_id": 3},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # apply ran with the PERSISTED ports, not fresh ones.
+        assert calls["write"] == [("US", 11001)]
+        assert calls["probe"] == [11001]
+        # clone ran from the picked template id.
+        assert FakeXuiClient.clone_inbound_calls == [
+            (3, {"code": "US", "name": "United States", "flag": "🇺🇸"}, 11001, 31001)
+        ]
+        assert body["apply_result"]["status"] == "healthy"
+        assert body["clone_result"]["inbound_id"] == 55555
+
+    def test_bare_toggle_without_inbound_skips_apply(self, monkeypatch, tmp_path):
+        """Legacy Hotfix-#10 semantic: PATCH @enabled=true without inbound_id
+        does NOT call apply_country — start_unit is enough (cheap toggle)."""
+        calls = self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["enabled"] is True
+        # apply_country NOT in play (no inbound_id).
+        assert calls["write"] == []
+        assert calls["probe"] == []
+        # And clone wasn't triggered either.
+        assert body["apply_result"] is None
+        assert body["clone_result"] is None
+
+    def test_enable_with_inbound_clone_failure_recorded(self, monkeypatch, tmp_path):
+        """If the 3x-ui clone fails mid-flow the PATCH still succeeds (the
+        country IS enabled — the tunnel is up) but surfaces the error in
+        clone_result.error so the SPA can render it inline.
+        """
+        self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+        from panel.dashboard.xui_client import XuiClientError
+
+        FakeXuiClient.clone_inbound_raises = XuiClientError
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 17},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["enabled"] is True
+        assert body["apply_result"]["status"] == "healthy"
+        assert body["clone_result"]["success"] is False
+        assert "clone_inbound" in body["clone_result"]["error"]
+
+    def test_enable_with_inbound_no_creds_recorded(self, monkeypatch, tmp_path):
+        """No XuiLink row → clone_result.success == False with a clear
+        error string; the country is still enabled (apply succeeded)."""
+        self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        # NOTE: no _seed_xui_link call.
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 17},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["enabled"] is True
+        assert body["clone_result"]["success"] is False
+        assert "no cached 3x-ui creds" in body["clone_result"]["error"]
+
+    def test_disable_with_inbound_ignores_inbound(self, monkeypatch, tmp_path):
+        """PATCH @enabled=false ignores a stray inbound_id — disable is
+        best-effort stop_unit only."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+
+        r = client.patch(
+            "/api/dashboard/countries/US",
+            json={"enabled": False, "inbound_id": 17},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["enabled"] is False
+        # No clone was triggered.
+        assert body["clone_result"] is None
+
+    def test_patch_inbound_id_validation_rejects_bool(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        r = client.patch(
+            "/api/dashboard/countries/US",
+            json={"enabled": True, "inbound_id": True},  # bool, not int
+        )
+        assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 3c. Feature D: POST /api/dashboard/countries/{code}/_reclone
+# ---------------------------------------------------------------------------
+class TestRecloneCountry:
+    """Phase 25 Feature D — swap the 3x-ui template inbound for a country."""
+
+    def _stub_apply(self, monkeypatch):
+        from panel.psiphon import HealthProbeResult
+        from panel.wizard import apply as apply_mod
+
+        monkeypatch.setattr(
+            apply_mod, "write_config", lambda *a, **k: Path("/tmp/fake.json")
+        )
+        monkeypatch.setattr(apply_mod, "start_unit", lambda *a, **k: None)
+        monkeypatch.setattr(apply_mod, "is_unit_active", lambda *a, **k: True)
+        monkeypatch.setattr(
+            apply_mod,
+            "health_probe",
+            lambda *a, **k: HealthProbeResult(healthy=True, detail="ok"),
+        )
+
+    def test_reclone_happy_path(self, monkeypatch, tmp_path):
+        """Deletes the old clone, clones the new template, persists the new
+        CloneRecord, applies the tunnel config, and returns the refreshed
+        card + apply_result + clone_result.
+        """
+        self._stub_apply(monkeypatch)
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {"id": 77777}
+
+        r = client.post(
+            "/api/dashboard/countries/US/_reclone",
+            json={"inbound_id": 5},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["code"] == "US"
+        assert body["prior_inbound_deleted"] == 31001
+        assert body["clone_result"]["success"] is True
+        assert body["clone_result"]["inbound_id"] == 77777
+        assert body["apply_result"]["status"] == "healthy"
+        # xui_client saw delete(31001) + clone(template=5).
+        assert FakeXuiClient.delete_inbound_calls == [31001]
+        assert FakeXuiClient.clone_inbound_calls == [
+            (5, {"code": "US", "name": "United States", "flag": "🇺🇸"}, 11001, 31001)
+        ]
+        # DB row holds the new inbound id.
+        init_db()
+        with Session(get_engine()) as s:
+            clone = s.query(CloneRecord).filter(CloneRecord.country_code == "US").first()
+            assert clone.inbound_id == 77777
+
+    def test_reclone_no_prior_assignment_returns_409(self, monkeypatch, tmp_path):
+        """Can't re-clone a country that has no PortAssignment (no socks_port
+        to route through)."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+
+        r = client.post(
+            "/api/dashboard/countries/JP/_reclone",
+            json={"inbound_id": 5},
+        )
+        assert r.status_code == 409
+        assert "PortAssignment" in r.json()["detail"]
+
+    def test_reclone_no_creds_returns_409(self, monkeypatch, tmp_path):
+        """Without a cached XuiLink row the endpoint refuses at 409 — there's
+        no way to reach 3x-ui."""
+        self._stub_apply(monkeypatch)
+        client = _seed_us_full(monkeypatch, tmp_path)
+        # NOTE: no _seed_xui_link call.
+
+        r = client.post(
+            "/api/dashboard/countries/US/_reclone",
+            json={"inbound_id": 5},
+        )
+        assert r.status_code == 409
+
+    def test_reclone_no_prior_clone_falls_through(self, monkeypatch, tmp_path):
+        """A country with a PortAssignment but NO CloneRecord (fresh enable)
+        still re-clones from the new template — no prior delete happens."""
+        self._stub_apply(monkeypatch)
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {"id": 88888}
+
+        r = client.post(
+            "/api/dashboard/countries/US/_reclone",
+            json={"inbound_id": 9},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["prior_inbound_deleted"] is None
+        assert body["clone_result"]["inbound_id"] == 88888
+        assert FakeXuiClient.delete_inbound_calls == []  # nothing to delete
+
+    def test_reclone_clone_failure_recorded(self, monkeypatch, tmp_path):
+        """A clone_inbound failure after delete is surfaced via clone_result,
+        not raised — the apply step still completes."""
+        self._stub_apply(monkeypatch)
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_xui_link()
+        from panel.dashboard.xui_client import XuiClientError
+
+        FakeXuiClient.clone_inbound_raises = XuiClientError
+
+        r = client.post(
+            "/api/dashboard/countries/US/_reclone",
+            json={"inbound_id": 5},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["clone_result"]["success"] is False
+        assert "clone_inbound" in body["clone_result"]["error"]
+        assert body["apply_result"]["status"] == "healthy"
+        # Prior inbound was still deleted.
+        assert FakeXuiClient.delete_inbound_calls == [31001]
+
+    def test_reclone_unknown_country_returns_404(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        r = client.post(
+            "/api/dashboard/countries/ZZ/_reclone",
+            json={"inbound_id": 5},
+        )
+        assert r.status_code == 404
+
+    def test_reclone_inbound_id_validation(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+
+        # Missing inbound_id → 422 body-validation error.
+        r = client.post("/api/dashboard/countries/US/_reclone", json={})
+        assert r.status_code == 422
+        # bool rejected at the StrictInt schema level.
+        r = client.post(
+            "/api/dashboard/countries/US/_reclone", json={"inbound_id": True}
+        )
+        assert r.status_code == 422
+
+
 # ===========================================================================
 # 4. DELETE /api/dashboard/countries/{code}
 # ===========================================================================
