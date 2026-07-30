@@ -77,22 +77,13 @@ run_prompt() {
     ask_value "Admin username"    user "PANEL_USER"
     ask_value "Admin password"    pass "PANEL_PASS" yes
 
-    # Phase 7 — opt-in self-signed HTTPS. Default: no (operator can front with
-    # Caddy for a real Let's Encrypt cert; enabling this mints an openssl cert
-    # so the panel terminates TLS itself with a browser-warning self-signed).
-    local enable_https=""
-    printf '%s[Drift] Enable self-signed HTTPS? [y/N]:%s ' "${COLOR_INFO}" "${COLOR_RESET}"
-    read -r enable_https || enable_https=""
-    case "${enable_https}" in
-        y|Y|yes|YES|Yes)
-            PANEL_ENABLE_HTTPS="yes"
-            ok "Self-signed HTTPS enabled (openssl cert mints after the panel.wheel install)."
-            ;;
-        *)
-            PANEL_ENABLE_HTTPS="no"
-            info "HTTPS disabled — panel will bind plain HTTP (front with Caddy for real TLS)."
-            ;;
-    esac
+    # Self-signed HTTPS prompt REMOVED (operator request). The TLS plumbing
+    # stays in place — PSIPHON3XUI_TLS_CERT / PSIPHON3XUI_TLS_KEY /
+    # PSIPHON3XUI_HTTPS_ONLY can still be set manually in ${ENV_FILE} after
+    # install to re-enable panel-terminated TLS; run_https_install short-
+    # circuits when PANEL_ENABLE_HTTPS is unset. The feature will be brought
+    # back in a later release with a proper ACME/Caddy flow.
+    PANEL_ENABLE_HTTPS="no"
     export PANEL_ENABLE_HTTPS
 
     # Phase 24 (post-Hotfix-#14 cleanup): the Psiphon-Inc public-bootstrap

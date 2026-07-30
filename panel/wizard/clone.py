@@ -197,6 +197,61 @@ async def clone_country(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard reuse helper — single-country clone (Phase 25 Feature A/C/D).
+# ---------------------------------------------------------------------------
+async def clone_for_country(
+    country_code: str,
+    template_inbound_id: int,
+    db: Session,
+    client: XuiClient,
+) -> dict[str, Any]:
+    """Clone *template_inbound_id* for exactly ONE country and persist a
+    ``CloneRecord`` row.
+
+    This is the per-country fragment of the wizard's ``_build_clone_specs`` +
+    ``clone_country`` flow — the dashboard's enable-with-inbound (Feature C)
+    and re-clone (Feature D) endpoints call it after writing/looking up the
+    country's ``PortAssignment`` row, so the dashboard surfaces never need to
+    import the wizard's batch orchestrator.
+
+    Returns ``{"inbound_id": <int|null>, "success": <bool>, "error": <str|null>}``
+    — never raises. ``success == True`` implies the new ``CloneRecord`` was
+    committed; ``success == False`` carries a human-readable ``error``.
+    """
+    from ..models import Country, PortAssignment  # local import to avoid cycles
+
+    country_row = db.get(Country, country_code.upper())
+    if country_row is None:
+        return {"inbound_id": None, "success": False, "error": f"unknown country {country_code!r}"}
+    pa = db.query(PortAssignment).filter(PortAssignment.country_code == country_row.code).first()
+    if pa is None:
+        return {
+            "inbound_id": None,
+            "success": False,
+            "error": f"no PortAssignment for {country_row.code} — apply it first",
+        }
+    country_dict = {
+        "code": country_row.code,
+        "name": country_row.name,
+        "flag": country_row.flag_emoji or "",
+    }
+    spec = CloneSpec(
+        country_code=country_row.code,
+        socks_port=int(pa.socks_port),
+        public_port=int(pa.public_port),
+        template_id=int(template_inbound_id),
+        country=country_dict,
+    )
+    try:
+        event = await clone_country(spec, client, db=db)
+    except Exception as exc:  # noqa: BLE001
+        return {"inbound_id": None, "success": False, "error": f"{type(exc).__name__}: {exc}"}
+    if event.status != "cloned":
+        return {"inbound_id": None, "success": False, "error": event.message}
+    return {"inbound_id": event.inbound_id, "success": True, "error": None}
+
+
+# ---------------------------------------------------------------------------
 # Batch orchestrator with rollback.
 # ---------------------------------------------------------------------------
 async def orchestrator_clone_events(

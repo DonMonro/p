@@ -220,16 +220,16 @@ local wheel_glob="${SCRIPT_DIR}/dist/psiphon_3x_ui_panel-*.whl"
     fi
 
     info "Writing EnvironmentFile ${ENV_FILE} …"
-    # Phase 7 — append TLS + CSRF + login rate-limit knobs ONLY when applicable,
-    # so DEV / non-HTTPS / scripted deploys aren't affected by extra env vars.
+    # The self-signed HTTPS install prompt has been REMOVED (operator request).
+    # The TLS env-var plumbing below is kept intact so a future "enable HTTPS
+    # later" path can set PSIPHON3XUI_TLS_CERT / PSIPHON3XUI_TLS_KEY /
+    # PSIPHON3XUI_HTTPS_ONLY by hand-editing ${ENV_FILE} and restarting the
+    # panel service. The installer itself now ALWAYS writes HTTPS_ONLY=false
+    # and never emits the TLS_CERT/TLS_KEY pair.
     local tls_env_block=""
-    local https_only_line=""
-    if [[ "${PANEL_ENABLE_HTTPS:-no}" == "yes" && -n "${PANEL_TLS_CERT:-}" && -s "${PANEL_TLS_CERT}" && -s "${PANEL_TLS_KEY:-}" ]]; then
-        tls_env_block=$(printf 'PSIPHON3XUI_TLS_CERT=%s\nPSIPHON3XUI_TLS_KEY=%s\n' "${PANEL_TLS_CERT}" "${PANEL_TLS_KEY}")
-        https_only_line="PSIPHON3XUI_HTTPS_ONLY=true"
-    else
-        https_only_line="PSIPHON3XUI_HTTPS_ONLY=false"
-    fi
+    local https_only_line="PSIPHON3XUI_HTTPS_ONLY=false"
+    # PSIPHON3XUI_TLS_CERT=      # ← set manually to re-enable panel TLS
+    # PSIPHON3XUI_TLS_KEY=       # ← set manually to re-enable panel TLS
 
     # Phase 24 (post-Hotfix-#14 cleanup): the Psiphon-Inc public-bootstrap
     # credentials are BAKED INTO the panel wheel (panel/psiphon/__init__.py
