@@ -1471,3 +1471,316 @@ class TestChangePanelPort:
         r = client.post("/api/dashboard/change-panel-port", json={"new_port": 31001})
         assert r.status_code == 400
         assert "US" in r.json()["detail"]
+
+
+class TestPsiphonXrayRoutingHelpers:
+    """Hotfix #9 (Phase 25) unit tests for
+    :func:`panel.dashboard.router._apply_psiphon_xray_outbound_and_rule`
+    and :func:`_remove_psiphon_xray_outbound_and_rule`.
+
+    Each test drops a ``config.json`` into ``tmp_path``, monkey-patches the
+    ``PSIPHON_XUI_XRAY_CONFIG_PATH`` env var to point at it, monkey-patches
+    ``subprocess.run`` (via the module-level alias on
+    ``panel.dashboard.router``) so the ``systemctl restart x-ui.service``
+    call is intercepted, and asserts the on-disk JSON shape matches the
+    Hotfix #9 contract.
+    """
+
+    BASE_CONFIG: dict = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "tag": "in-31001-tcp",
+                "listen": "0.0.0.0",
+                "port": 31001,
+                "protocol": "vless",
+                "settings": {},
+                "streamSettings": {"network": "tcp", "security": "reality"},
+            },
+            {
+                "tag": "in-31002-tcp",
+                "listen": "0.0.0.0",
+                "port": 31002,
+                "protocol": "vless",
+                "settings": {},
+                "streamSettings": {"network": "tcp", "security": "reality"},
+            },
+        ],
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "blocked", "protocol": "blackhole", "settings": {}},
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"},
+                {
+                    "type": "field",
+                    "ip": ["geoip:private"],
+                    "outboundTag": "blocked",
+                },
+            ],
+        },
+    }
+
+    def _write_config(self, tmp_path: Path, payload: dict) -> Path:
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+        return cfg_path
+
+    def _patch_systemctl_restart(self, monkeypatch) -> list[list[str]]:
+        """Replace ``subprocess.run`` so we record systemctl invocations and
+        return a stub CompletedProcess with exit 0."""
+        from panel.dashboard import router as dr
+
+        calls: list[list[str]] = []
+
+        def _fake_run(args, *_, **__):
+            calls.append(list(args))
+
+            class _CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _CP()
+
+        monkeypatch.setattr(dr.subprocess, "run", _fake_run)
+        return calls
+
+    def test_apply_on_fresh_config_appends_outbound_and_rule(
+        self, monkeypatch, tmp_path
+    ):
+        """On a config.json lacking any psiphon-out-* entries: outbound +
+        rule are appended (no duplicate)."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        calls = self._patch_systemctl_restart(monkeypatch)
+
+        ok, err = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok, err
+        assert err == ""
+        assert calls == [["systemctl", "restart", "x-ui.service"]]
+
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        ob_tags = [o["tag"] for o in on_disk["outbounds"] if isinstance(o, dict)]
+        assert "psiphon-out-US" in ob_tags
+        us_out = next(o for o in on_disk["outbounds"] if o.get("tag") == "psiphon-out-US")
+        assert us_out["protocol"] == "socks"
+        srv = us_out["settings"]["servers"][0]
+        assert srv["address"] == "127.0.0.1"
+        assert srv["port"] == 11001
+
+        rules = on_disk["routing"]["rules"]
+        # Rule is inserted BEFORE the catch-alls (bittorrent/geoip:private).
+        # First rule should now be ours.
+        assert rules[0]["type"] == "field"
+        assert rules[0]["inboundTag"] == ["in-31001-tcp"]
+        assert rules[0]["outboundTag"] == "psiphon-out-US"
+
+    def test_apply_idempotent_no_duplicate_on_second_call(
+        self, monkeypatch, tmp_path
+    ):
+        """Re-applying the same outbound+rule does not duplicate either."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok1, _ = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        ok2, _ = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok1 and ok2
+
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        outbounds = on_disk["outbounds"]
+        us_outbounds = [o for o in outbounds if o.get("tag") == "psiphon-out-US"]
+        assert len(us_outbounds) == 1, "must not duplicate outbound on re-apply"
+        rules = on_disk["routing"]["rules"]
+        us_rules = [
+            r
+            for r in rules
+            if r.get("outboundTag") == "psiphon-out-US"
+            and r.get("inboundTag") == ["in-31001-tcp"]
+        ]
+        assert len(us_rules) == 1, "must not duplicate rule on re-apply"
+
+    def test_apply_gracefully_creates_missing_cpu_container_keys(
+        self, monkeypatch, tmp_path
+    ):
+        """If config.json lacks ``outbounds`` or ``routing`` keys entirely
+        the helper must create them, not crash."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        payload = {"log": {"loglevel": "warning"}}
+        cfg_path = self._write_config(tmp_path, payload)
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok, err = _apply_psiphon_xray_outbound_and_rule("DE", 11002, 31002)
+        assert ok, err
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert any(o.get("tag") == "psiphon-out-DE" for o in on_disk["outbounds"])
+        assert any(
+            r.get("outboundTag") == "psiphon-out-DE"
+            and r.get("inboundTag") == ["in-31002-tcp"]
+            for r in on_disk["routing"]["rules"]
+        )
+
+    def test_apply_for_one_country_does_not_touch_another(
+        self, monkeypatch, tmp_path
+    ):
+        """Applying a binding for DE must leave the existing US entry
+        untouched — keyed edits only touch their own country's tag."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok1, _ = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        ok2, _ = _apply_psiphon_xray_outbound_and_rule("DE", 11002, 31002)
+        assert ok1 and ok2
+
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        ob_tags = [o["tag"] for o in on_disk["outbounds"]]
+        assert "psiphon-out-US" in ob_tags
+        assert "psiphon-out-DE" in ob_tags
+        us_rules = [
+            r
+            for r in on_disk["routing"]["rules"]
+            if r.get("outboundTag") == "psiphon-out-US"
+        ]
+        de_rules = [
+            r
+            for r in on_disk["routing"]["rules"]
+            if r.get("outboundTag") == "psiphon-out-DE"
+        ]
+        assert len(us_rules) == 1
+        assert len(de_rules) == 1
+        # Sanity: they route to the correct socks ports.
+        assert us_rules[0]["inboundTag"] == ["in-31001-tcp"]
+        assert de_rules[0]["inboundTag"] == ["in-31002-tcp"]
+
+    def test_apply_inserts_rule_before_bittorrent_and_geoip_catchalls(
+        self, monkeypatch, tmp_path
+    ):
+        """Per Hotfix #9 the rule must sit BEFORE the ``bittorrent`` /
+        ``geoip:private`` catch-alls so Xray matches ours first."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok, _ = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok
+
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        rules = on_disk["routing"]["rules"]
+        # Find indices of rule kinds.
+        ours_idx = next(
+            i for i, r in enumerate(rules) if r.get("outboundTag") == "psiphon-out-US"
+        )
+        bt_idx = next(
+            i for i, r in enumerate(rules) if r.get("protocol") == ["bittorrent"]
+        )
+        geo_idx = next(
+            i
+            for i, r in enumerate(rules)
+            if isinstance(r.get("ip"), list) and "geoip:private" in r["ip"]
+        )
+        assert ours_idx < bt_idx, "our rule must precede bittorrent catch-all"
+        assert ours_idx < geo_idx, "our rule must precede geoip:private catch-all"
+
+    def test_remove_strips_both_entry_and_rule_idempotently(
+        self, monkeypatch, tmp_path
+    ):
+        """Removing strips the outbound AND the routing rule; second call
+        is a no-op for the file but may still skip the service restart."""
+        from panel.dashboard.router import (
+            _apply_psiphon_xray_outbound_and_rule,
+            _remove_psiphon_xray_outbound_and_rule,
+        )
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok1, _ = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok1
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert any(o.get("tag") == "psiphon-out-US" for o in on_disk["outbounds"])
+
+        ok2, err2 = _remove_psiphon_xray_outbound_and_rule("US", 31001)
+        assert ok2, err2
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert not any(o.get("tag") == "psiphon-out-US" for o in on_disk["outbounds"])
+        assert not any(
+            r.get("outboundTag") == "psiphon-out-US"
+            for r in on_disk["routing"]["rules"]
+        )
+        # Catch-alls are still there.
+        assert any(r.get("protocol") == ["bittorrent"] for r in on_disk["routing"]["rules"])
+        assert any(
+            isinstance(r.get("ip"), list) and "geoip:private" in r["ip"]
+            for r in on_disk["routing"]["rules"]
+        )
+
+        # Second remove: success (idempotent), file unchanged.
+        ok3, err3 = _remove_psiphon_xray_outbound_and_rule("US", 31001)
+        assert ok3, err3
+
+    def test_apply_malformed_json_returns_error(self, monkeypatch, tmp_path):
+        """A malformed on-disk config.json is surfaced as a clean error, not
+        a raised exception."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text("{ not json", encoding="utf-8")
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok, err = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok is False
+        assert "parse" in err.lower()
+
+    def test_apply_missing_file_returns_error(self, monkeypatch, tmp_path):
+        """Absent config.json yields (False, <read error>)."""
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = tmp_path / "config.json"  # not created
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+        self._patch_systemctl_restart(monkeypatch)
+
+        ok, err = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok is False
+        assert "read" in err.lower()
+
+    def test_apply_systemctl_failure_propagates(self, monkeypatch, tmp_path):
+        """If systemctl restart returns non-zero, the helper surfaces a
+        failure but the config write already happened (operator can
+        manually `systemctl restart x-ui`)."""
+        from panel.dashboard import router as dr
+        from panel.dashboard.router import _apply_psiphon_xray_outbound_and_rule
+
+        cfg_path = self._write_config(tmp_path, dict(self.BASE_CONFIG))
+        monkeypatch.setenv("PSIPHON_XUI_XRAY_CONFIG_PATH", str(cfg_path))
+
+        def _failing_run(args, *_, **__):
+            class _CP:
+                returncode = 3
+                stdout = ""
+                stderr = "systemd: access denied"
+
+            return _CP()
+
+        monkeypatch.setattr(dr.subprocess, "run", _failing_run)
+        ok, err = _apply_psiphon_xray_outbound_and_rule("US", 11001, 31001)
+        assert ok is False
+        assert "x-ui.service" in err
+        # But the config file still received the write.
+        on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert any(o.get("tag") == "psiphon-out-US" for o in on_disk["outbounds"])

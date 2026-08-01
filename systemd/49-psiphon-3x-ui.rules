@@ -31,8 +31,15 @@
 //       explicit-name guard means the panel CANNOT enumerate arbitrary
 //       units, and the verb scope means it cannot enable/mask/reload them.
 //
+//   (3) The 3x-ui panel's own systemd unit `x-ui.service` — restricted to
+//       the `restart` verb only (called from panel.dashboard.router.
+//       _restart_xui_service after Hotfix #9 / Phase 25 so the panel can
+//       rewrite Xray's `outbounds[]` + `routing.rules[]` per-country in
+//       /usr/local/x-ui/bin/config.json and restart the unit in-band
+//       without dropping to a shell).
+//
 // The panel can NEVER start/stop arbitrary units. Only its own tunnel fleet
-// plus its own unit restart are authorised.
+// plus its own unit restart plus the 3x-ui panel restart are authorised.
 //
 // The rule is JavaScript (polkit's native rules language) and runs inside
 // polkitd's JS interpreter. The numerical prefix `49-` keeps it ahead of
@@ -69,10 +76,11 @@ polkit.addRule(function(action, subject) {
     var unitStr = String(unit);
     var isFleet = unitStr.startsWith("psiphon-tunnel@");
     var isPanelSelf = unitStr === "psiphon-3x-ui.service";
-    if (!isFleet && !isPanelSelf) {
+    var isXuiSelf = unitStr === "x-ui.service";
+    if (!isFleet && !isPanelSelf && !isXuiSelf) {
         return polkit.Result.NOT_HANDLED;
     }
-    if (isPanelSelf && verb !== "restart") {
+    if ((isPanelSelf || isXuiSelf) && verb !== "restart") {
         return polkit.Result.NOT_HANDLED;
     }
 

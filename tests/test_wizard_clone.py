@@ -567,24 +567,46 @@ def clone_client(monkeypatch, tmp_path):
 
 
 class TestCloneEndpoint:
-    def test_clone_happy_stream_advances_to_done_and_flips_wizard_completed(self, clone_client):
+    def test_clone_happy_stream_advances_to_done_and_flips_wizard_completed(
+        self, clone_client, monkeypatch
+    ):
+        # Hotfix #9 (Phase 25): stub the apply helper so the SSE handler's
+        # per-country routing records are emitted deterministically (and so
+        # the real config-file write + systemctl restart are skipped).
+        from panel.dashboard import router as _dr
+
+        monkeypatch.setattr(
+            _dr,
+            "_apply_psiphon_xray_outbound_and_rule",
+            lambda code, socks, public: (True, ""),
+        )
+
         _advance_to_clone(clone_client)
         # Default FakeXuiClient clone_inbound returns per-public-port ids.
         with clone_client.stream("POST", "/api/wizard/clone") as r:
             assert r.status_code == 200
             events = _parse_sse_stream(r)
 
-        # Three working + three terminal + one summary = 7 records.
-        assert len(events) == 7, events
-        # Working records (every other one starting from index 0).
+        # Three working + three cloned + three routing + one summary = 10 records
+        # (the routing records were added in Hotfix #9 / Phase 25).
+        assert len(events) == 10, events
+        # Working records — every third event, starting from 0.
         assert events[0]["status"] == "working"
         assert events[0]["country"] == "DE"  # alphabetical sort
-        assert events[2]["country"] == "JP"
-        assert events[4]["country"] == "US"
-        # Terminal cloned records (those following the working ones).
+        assert events[3]["country"] == "JP"
+        assert events[6]["country"] == "US"
+        # Terminal cloned records.
         assert events[1]["status"] == "cloned"
-        assert events[3]["status"] == "cloned"
-        assert events[5]["status"] == "cloned"
+        assert events[4]["status"] == "cloned"
+        assert events[7]["status"] == "cloned"
+        # Hotfix #9: terminal routing records — one per cloned country,
+        # non-fatal, emitted after each "cloned" record.
+        assert events[2]["status"] == "routing"
+        assert events[2]["country"] == "DE"
+        assert events[5]["status"] == "routing"
+        assert events[5]["country"] == "JP"
+        assert events[8]["status"] == "routing"
+        assert events[8]["country"] == "US"
         # Summary.
         summary = events[-1]
         assert summary["country"] == "*"

@@ -43,6 +43,7 @@ its own dedicated test class:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -5702,3 +5703,151 @@ class TestHotfix21PostReleaseRegressions:
             "~5s to ~25s; shorter intervals would burn unnecessary "
             "systemctl syscalls against the D-Bus monitor."
         )
+
+
+class TestHotfix22PostReleaseRegressions:
+    """Static-source grep tests for Phase 25 Hotfix #9 — the "Psiphon is
+    connected but end-user traffic still exits via the SERVER's own IP"
+    defect.
+
+    Operator-verified on the live install:
+
+    * Psiphon tunnels healthy (SOCKS5 listener up at 127.0.0.1:N per
+      country).
+    * 3x-ui cloned inbounds have ``streamSettings.outbound = { protocol:
+      "socks", settings.servers=[{address:"127.0.0.1", port:N}] }``.
+
+    Despite both, end-user traffic exits via the SERVER's own IP. Verified
+    via the operator's live xray config ``/usr/local/x-ui/bin/config.json``:
+    the cloned inbound's ``streamSettings.outbound`` field IS persisted to
+    the config file by 3x-ui but is NOT honoured by Xray core — Xray's
+    routing engine decides outbound-by-inboundTag via the top-level
+    ``routing.rules[]`` array, not via per-inbound ``streamSettings.outbound``
+    (which is a legacy/sniffing hint). As a result every clone's traffic
+    falls back to the default ``freedom`` outbound (``outbounds[0]``
+    tag=``direct``).
+
+    The fix (this Hotfix) edits ``/usr/local/x-ui/bin/config.json``
+    directly to inject:
+
+    1. One SOCKS outbound per enabled country, keyed by
+       ``tag == "psiphon-out-<CODE>"``.
+    2. One routing rule per enabled country, keyed by
+       ``inboundTag == ["in-<public_port>-tcp"]`` →
+       ``outboundTag == "psiphon-out-<CODE>"``, inserted BEFORE the
+       existing ``bittorrent``/``geoip:private`` catch-alls.
+    3. ``systemctl restart x-ui.service`` so Xray picks up the new config.
+
+    These grep tests pin the static contract; the behavioural unit tests
+    for the idempotent apply/remove helpers live in
+    ``tests/test_dashboard.py::TestPsiphonXrayRoutingHelpers``.
+    """
+
+    PANEL_ROOT = Path(__file__).resolve().parents[1] / "panel"
+
+    def test_dashboard_router_defines_apply_and_remove_helpers(self):
+        """``panel/dashboard/router.py`` MUST define BOTH Hotfix #9 helpers
+        — the apply helper AND its inverse (otherwise deletes/disables would
+        leave a stale outbound+rule pair pinning the inboundTag)."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        assert "def _apply_psiphon_xray_outbound_and_rule(" in text
+        assert "def _remove_psiphon_xray_outbound_and_rule(" in text
+
+    def test_dashboard_router_uses_correct_outbound_tag_pattern(self):
+        """Outbound tag must be exactly ``psiphon-out-<CODE>`` (uppercase ISO
+        country code suffix) — matching the docstring the operator verifying
+        the live config was given."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        assert 'f"psiphon-out-{code}"' in text
+
+    def test_dashboard_router_uses_correct_routing_rule_pattern(self):
+        """Routing rule must match the clone inbound's auto-generated tag
+        3x-ui emits — ``in-<public_port>-tcp`` — and route to the per-country
+        outbound."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        # Constructed as f"in-{int(public_port)}-tcp" in the helper.
+        assert 'f"in-{int(public_port)}-tcp"' in text
+        # And the rule body is a field-rule with the inboundTag list +
+        # outboundTag keyed by the same tags.
+        assert '"type": "field"' in text or '"type":"field"' in text
+
+    def test_clone_for_country_invokes_apply_helper(self):
+        """Wizard's per-country clone helper MUST call the Hotfix #9 apply
+        helper after a successful clone so end-user traffic actually exits
+        via Psiphon (this is the Phase 25 / Feature A+C+D wiring)."""
+        text = (self.PANEL_ROOT / "wizard" / "clone.py").read_text(encoding="utf-8")
+        assert "_apply_psiphon_xray_outbound_and_rule(" in text
+
+    def test_wizard_submit_clone_calls_apply_helper_per_country(self):
+        """The wizard's /clone SSE handler MUST surface a routing outcome
+        per country (per-clone) so the operator can see Xray-routing
+        failures inline."""
+        text = (self.PANEL_ROOT / "wizard" / "router.py").read_text(encoding="utf-8")
+        assert "_apply_psiphon_xray_outbound_and_rule(" in text
+        # Routing failures must be non-fatal and visible separately.
+        assert '"routing_failed"' in text
+
+    def test_dashboard_reclone_calls_apply_and_remove_helpers(self):
+        """Re-clone must re-apply the NEW binding AFTER a successful clone
+        AND remove the PRIOR binding if the public port ever diverges —
+        otherwise a swap to a different template+port leaves the old
+        inboundTag mapping alive (with no inbound to actually serve it,
+        leaking a stale rule)."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        m = re.search(
+            r"async\s+def\s+reclone_country\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
+            text,
+            flags=re.DOTALL,
+        )
+        assert m, "reclone_country handler missing"
+        body = m.group(0)
+        assert "_apply_psiphon_xray_outbound_and_rule(" in body
+        assert "_remove_psiphon_xray_outbound_and_rule(" in body
+
+    def test_dashboard_delete_country_calls_remove_helper(self):
+        """Delete must drop the outbound+rule pair for the deleted
+        country's public_port."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        m = re.search(
+            r"async\s+def\s+delete_country\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
+            text,
+            flags=re.DOTALL,
+        )
+        assert m, "delete_country handler missing"
+        assert "_remove_psiphon_xray_outbound_and_rule(" in m.group(0)
+
+    def test_polkit_rules_authorises_xui_restart(self):
+        """polkit rule file must authorise ``systemctl restart x-ui.service``
+        for the panel service user — without it the Hotfix #9 config-edit
+        flow's restart step would 403 and the Xray config change would
+        never take effect."""
+        rules_path = (
+            Path(__file__).resolve().parents[1]
+            / "systemd"
+            / "49-psiphon-3x-ui.rules"
+        )
+        text = rules_path.read_text(encoding="utf-8")
+        assert '"x-ui.service"' in text
+
+    def test_helpers_restart_xui_service_synchronously(self):
+        """Helper must invoke ``systemctl restart x-ui.service`` directly
+        (NOT detached): the panel process is NOT the unit being restarted,
+        so the in-flight FastAPI response survives."""
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        # _restart_xui_service must be defined and contain the literal
+        # restart command.
+        m = re.search(
+            r"def\s+_restart_xui_service\b.*?(?=\ndef\s|\nclass\s|\n@router|\Z)",
+            text,
+            flags=re.DOTALL,
+        )
+        assert m, "_restart_xui_service helper missing"
+        body = m.group(0)
+        assert '"systemctl", "restart", _XUI_SERVICE_NAME' in body
+        assert "systemd-run" not in body, (
+            "Hotfix #9 — unlike the panel-service self-restart (which uses "
+            "systemd-run --no-block to avoid killing our own HTTP stream), "
+            "the x-ui.service restart is safe to run synchronously because "
+            "we're not inside the unit being restarted."
+        )
+
