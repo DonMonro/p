@@ -5745,109 +5745,172 @@ class TestHotfix22PostReleaseRegressions:
 
     PANEL_ROOT = Path(__file__).resolve().parents[1] / "panel"
 
-    def test_dashboard_router_defines_apply_and_remove_helpers(self):
-        """``panel/dashboard/router.py`` MUST define BOTH Hotfix #9 helpers
-        — the apply helper AND its inverse (otherwise deletes/disables would
-        leave a stale outbound+rule pair pinning the inboundTag)."""
-        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
-        assert "def _apply_psiphon_xray_outbound_and_rule(" in text
-        assert "def _remove_psiphon_xray_outbound_and_rule(" in text
+    # NOTE (Hotfix #10 / Phase 25): the original Hotfix-#9 grep tests in
+    # this class referenced
+    # ``_apply_psiphon_xray_outbound_and_rule`` /
+    # ``_remove_psiphon_xray_outbound_and_rule`` /
+    # the panel's old direct-write behaviour. Those helpers were DELETED by
+    # Hotfix #10 in favour of the queue+applier sidecar
+    # (``_enqueue_xray_patch``). The rewritten greps live in
+    # ``TestHotfix23PostReleaseRegressions`` (below) to keep the "what
+    # shipped" / "how it's wired" contracts separable per-hotfix.
 
-    def test_dashboard_router_uses_correct_outbound_tag_pattern(self):
-        """Outbound tag must be exactly ``psiphon-out-<CODE>`` (uppercase ISO
-        country code suffix) — matching the docstring the operator verifying
-        the live config was given."""
-        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+class TestHotfix23PostReleaseRegressions:
+    """Static-source grep tests for Phase 25 Hotfix #10 — the queue+applier
+    sidecar that ACTUALLY applies the per-country Xray outbound+routing
+    binding Hotfix #9 set out to write.
+
+    Hotfix #9 introduced `_apply_psiphon_xray_outbound_and_rule` /
+    `_remove_psiphon_xray_outbound_and_rule` on `panel/dashboard/router.py`
+    which attempted to read+write `/usr/local/x-ui/bin/config.json` in-process.
+    The operator verified on a live install that the file is owned
+    `root:root` mode 0600 (NOT group-readable) and that the unprivileged
+    `psiphon3xui` panel user cannot even READ it — every helper call
+    silently returned EACCES and surfaced an empty `routing_result` payload.
+
+    Hotfix #10 replaces the in-process edit with a cross-privilege queue +
+    root-side oneshot systemd service. These greps pin the wiring.
+    """
+
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    PANEL_ROOT = REPO_ROOT / "panel"
+
+    def test_applier_path_unit_ships_and_watches_queue_dir(self):
+        """``systemd/psiphon-xray-applier.path`` must exist (shipped by the
+        installer) and ``PathChanged=`` must point at the panel's queue
+        directory so the path unit edge-triggers on each new patch file."""
+        p = self.REPO_ROOT / "systemd" / "psiphon-xray-applier.path"
+        assert p.exists(), f"missing {p}"
+        text = p.read_text(encoding="utf-8")
+        assert "[Path]" in text
+        assert (
+            "PathChanged=/var/lib/psiphon-3x-ui/xray-patch-queue" in text
+        )
+        assert "WantedBy=multi-user.target" in text
+
+    def test_applier_service_unit_runs_applier_script(self):
+        """``systemd/psiphon-xray-applier.service`` must exist, run the
+        bash driver via ExecStart, and have [Install] so it can be enabled
+        alongside the .path unit."""
+        p = self.REPO_ROOT / "systemd" / "psiphon-xray-applier.service"
+        assert p.exists(), f"missing {p}"
+        text = p.read_text(encoding="utf-8")
+        assert "Type=oneshot" in text
+        assert "User=root" in text
+        assert (
+            "ExecStart=/usr/local/libexec/psiphon-3x-ui/xray-applier.sh"
+            in text
+        )
+
+    def test_applier_script_uses_flock_and_invokes_python_helper(self):
+        """``installer/xray_applier.sh`` must serialise concurrent runs
+        via flock on a known lockfile path and invoke the python helper
+        for each queued patch."""
+        p = self.REPO_ROOT / "installer" / "xray_applier.sh"
+        assert p.exists(), f"missing {p}"
+        text = p.read_text(encoding="utf-8")
+        assert "flock -x 9" in text
+        assert "/var/lib/psiphon-3x-ui/xray-applier.lock" in text
+        assert "xray_apply.py" in text
+        assert 'systemctl restart "${XUI_SERVICE_NAME}"' in text or (
+            "systemctl restart" in text and "x-ui.service" in text
+        )
+
+    def test_xray_apply_py_has_outbound_tag_and_rule_shape(self):
+        """``installer/xray_apply.py`` must reference the per-country
+        outbound tag pattern AND the inboundTag rule shape so the applier
+        writes the exact keys Hotfix #9 documented."""
+        p = self.REPO_ROOT / "installer" / "xray_apply.py"
+        assert p.exists(), f"missing {p}"
+        text = p.read_text(encoding="utf-8")
         assert 'f"psiphon-out-{code}"' in text
+        assert '"inboundTag"' in text
+        assert '"outboundTag"' in text
+        assert '"type": "field"' in text or "'type': 'field'" in text or (
+            '"type": "field"' in text.replace("'", '"')
+        )
+        # Stdlib-only assurance: no pydantic / sqlalchemy IMPORTS (the
+        # docstring legitimately mentions them by name in the "no pydantic
+        # / no sqlalchemy / no panel imports" rationale — match actual
+        # import statements only).
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")):
+                assert "pydantic" not in stripped
+                assert "sqlalchemy" not in stripped
 
-    def test_dashboard_router_uses_correct_routing_rule_pattern(self):
-        """Routing rule must match the clone inbound's auto-generated tag
-        3x-ui emits — ``in-<public_port>-tcp`` — and route to the per-country
-        outbound."""
+    def test_panel_router_uses_enqueue_not_legacy_apply(self):
+        """``panel/dashboard/router.py`` must NO LONGER call
+        ``_apply_psiphon_xray_outbound_and_rule`` (the deleted direct-edit
+        helper) anywhere in its body; the enqueue helper must be the only
+        write path used by patch_country / reclone_country / delete_country."""
         text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
-        # Constructed as f"in-{int(public_port)}-tcp" in the helper.
-        assert 'f"in-{int(public_port)}-tcp"' in text
-        # And the rule body is a field-rule with the inboundTag list +
-        # outboundTag keyed by the same tags.
-        assert '"type": "field"' in text or '"type":"field"' in text
+        assert "_apply_psiphon_xray_outbound_and_rule(" not in text
+        assert "_remove_psiphon_xray_outbound_and_rule(" not in text
+        # Spot-check each wired handler references the new helper.
+        for fn in ("patch_country", "reclone_country", "delete_country"):
+            m = re.search(
+                rf"async\s+def\s+{fn}\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
+                text,
+                flags=re.DOTALL,
+            )
+            assert m, f"{fn} handler missing"
+            assert "_enqueue_xray_patch(" in m.group(0), (
+                f"{fn} does not call _enqueue_xray_patch"
+            )
 
-    def test_clone_for_country_invokes_apply_helper(self):
-        """Wizard's per-country clone helper MUST call the Hotfix #9 apply
-        helper after a successful clone so end-user traffic actually exits
-        via Psiphon (this is the Phase 25 / Feature A+C+D wiring)."""
+    def test_panel_clone_helper_uses_enqueue(self):
+        """``panel/wizard/clone.py``'s clone_for_country must call the new
+        enqueue helper (the wizard batch path in panel/wizard/router.py
+        uses the same helper)."""
         text = (self.PANEL_ROOT / "wizard" / "clone.py").read_text(encoding="utf-8")
-        assert "_apply_psiphon_xray_outbound_and_rule(" in text
+        assert "_enqueue_xray_patch(" in text
+        assert "_apply_psiphon_xray_outbound_and_rule(" not in text
 
-    def test_wizard_submit_clone_calls_apply_helper_per_country(self):
-        """The wizard's /clone SSE handler MUST surface a routing outcome
-        per country (per-clone) so the operator can see Xray-routing
-        failures inline."""
+    def test_wizard_router_batch_clone_uses_enqueue(self):
+        """The wizard's batch-clone SSE handler must enqueue per-country
+        patches; routing failures remain non-fatal (``routing_failed`` SSE
+        status is still emitted)."""
         text = (self.PANEL_ROOT / "wizard" / "router.py").read_text(encoding="utf-8")
-        assert "_apply_psiphon_xray_outbound_and_rule(" in text
-        # Routing failures must be non-fatal and visible separately.
+        assert "_enqueue_xray_patch(" in text
         assert '"routing_failed"' in text
 
-    def test_dashboard_reclone_calls_apply_and_remove_helpers(self):
-        """Re-clone must re-apply the NEW binding AFTER a successful clone
-        AND remove the PRIOR binding if the public port ever diverges —
-        otherwise a swap to a different template+port leaves the old
-        inboundTag mapping alive (with no inbound to actually serve it,
-        leaking a stale rule)."""
+    def test_panel_install_installs_applier_bits_and_enables_path_unit(self):
+        """``installer/panel_install.sh`` must install the two new systemd
+        units + the bash driver + the python helper, create the queue dir,
+        and enable+start the .path unit."""
+        p = self.REPO_ROOT / "installer" / "panel_install.sh"
+        assert p.exists()
+        text = p.read_text(encoding="utf-8")
+        assert "installer/xray_applier.sh" in text
+        assert "installer/xray_apply.py" in text
+        assert "systemd/psiphon-xray-applier.path" in text
+        assert "systemd/psiphon-xray-applier.service" in text
+        assert "/var/lib/psiphon-3x-ui/xray-patch-queue" in text
+        assert (
+            "systemctl enable --now psiphon-xray-applier.path" in text
+        )
+
+    def test_enqueue_xray_patch_helper_atomic_write_pattern(self):
+        """``_enqueue_xray_patch`` must write the patch file with
+        ``tempfile.mkstemp`` in the queue dir followed by ``os.replace``
+        (rename) so inotify only ever publishes fully-formed files."""
         text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
         m = re.search(
-            r"async\s+def\s+reclone_country\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
+            r"def\s+_enqueue_xray_patch\b.*?(?=\ndef\s|\nclass\s|\n@router|\Z)",
             text,
             flags=re.DOTALL,
         )
-        assert m, "reclone_country handler missing"
+        assert m, "_enqueue_xray_patch helper missing"
         body = m.group(0)
-        assert "_apply_psiphon_xray_outbound_and_rule(" in body
-        assert "_remove_psiphon_xray_outbound_and_rule(" in body
+        assert "tempfile.mkstemp(" in body
+        assert "os.replace(" in body
+        assert "PSIPHON_XRAY_PATCH_QUEUE_DIR" in text
 
-    def test_dashboard_delete_country_calls_remove_helper(self):
-        """Delete must drop the outbound+rule pair for the deleted
-        country's public_port."""
-        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
-        m = re.search(
-            r"async\s+def\s+delete_country\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
-            text,
-            flags=re.DOTALL,
-        )
-        assert m, "delete_country handler missing"
-        assert "_remove_psiphon_xray_outbound_and_rule(" in m.group(0)
-
-    def test_polkit_rules_authorises_xui_restart(self):
-        """polkit rule file must authorise ``systemctl restart x-ui.service``
-        for the panel service user — without it the Hotfix #9 config-edit
-        flow's restart step would 403 and the Xray config change would
-        never take effect."""
-        rules_path = (
-            Path(__file__).resolve().parents[1]
-            / "systemd"
-            / "49-psiphon-3x-ui.rules"
-        )
-        text = rules_path.read_text(encoding="utf-8")
-        assert '"x-ui.service"' in text
-
-    def test_helpers_restart_xui_service_synchronously(self):
-        """Helper must invoke ``systemctl restart x-ui.service`` directly
-        (NOT detached): the panel process is NOT the unit being restarted,
-        so the in-flight FastAPI response survives."""
-        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
-        # _restart_xui_service must be defined and contain the literal
-        # restart command.
-        m = re.search(
-            r"def\s+_restart_xui_service\b.*?(?=\ndef\s|\nclass\s|\n@router|\Z)",
-            text,
-            flags=re.DOTALL,
-        )
-        assert m, "_restart_xui_service helper missing"
-        body = m.group(0)
-        assert '"systemctl", "restart", _XUI_SERVICE_NAME' in body
-        assert "systemd-run" not in body, (
-            "Hotfix #9 — unlike the panel-service self-restart (which uses "
-            "systemd-run --no-block to avoid killing our own HTTP stream), "
-            "the x-ui.service restart is safe to run synchronously because "
-            "we're not inside the unit being restarted."
-        )
-
+    def test_polkit_rules_authorises_xray_applier_start(self):
+        """polkit rule must ALSO authorise ``systemctl start
+        psiphon-xray-applier.service`` for the panel service user
+        (belt-and-braces alongside the .path unit's auto-trigger)."""
+        p = self.REPO_ROOT / "systemd" / "49-psiphon-3x-ui.rules"
+        text = p.read_text(encoding="utf-8")
+        assert "psiphon-xray-applier.service" in text

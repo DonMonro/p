@@ -1,0 +1,33 @@
+[Unit]
+Description=Apply pending per-country Xray outbound+routing patches from /var/lib/psiphon-3x-ui/xray-patch-queue
+Documentation=man:systemd.service(5)
+# Phase 25 Hotfix #10: triggered by psiphon-xray-applier.path every time a
+# panel-side _enqueue_xray_patch() drops a patch file into the queue
+# directory. Runs ONESHOT as root, consumes the pending files in
+# deterministic (sorted) order, merges them into
+# /usr/local/x-ui/bin/config.json atomically (tmp+rename), and restarts
+# x-ui.service ONCE at the very end (only if at least one patch actually
+# mutated the config — the helper exits with status 10 in the "all patches
+# were no-ops" case so the applier skips the otherwise-disruptive restart).
+After=local-fs.target
+ConditionPathIsDirectory=/var/lib/psiphon-3x-ui/xray-patch-queue
+
+[Service]
+Type=oneshot
+# Run as root — the ONLY uid allowed to read+write
+# /usr/local/x-ui/bin/config.json on a stock 3x-ui install (mode 0600,
+# owner root:root). The panel service runs as the unprivileged
+# psiphon3xui user and CANNOT touch this file directly (Hotfix #9
+# proved that: every direct edit returned EACCES).
+User=root
+Group=root
+ExecStart=/usr/local/libexec/psiphon-3x-ui/xray-applier.sh
+# Sandboxing is intentionally light here: the script legitimately needs to
+# write /usr/local/x-ui/bin/config.json AND to `systemctl restart
+# x-ui.service`, both of which require broad system access. We still clamp
+# the obvious escapes (no SUID escalation, private /tmp).
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
