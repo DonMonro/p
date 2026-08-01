@@ -1185,18 +1185,64 @@ async def submit_clone(
                 events.append(await clone_country(spec, client, db=db))
                 yield _sse(events[-1].as_dict())
 
-            # Drive rollback through the orchestrator's rollback helper — it
-            # deletes the freshly-cloned inbounds via delete_inbound and removes
-            # the CloneRecord rows we persisted mid-batch. rolled_back is the
-            # list of inbound ids that were successfully deleted (the user
-            # would otherwise see orphaned clones in their 3x-ui panel).
+                # Hotfix #9 (Phase 25): write the per-country Xray outbound +
+                # routing rule so the clone actually egresses via Psiphon.
+                # The clone itself succeeded already — routing failures are
+                # non-fatal and surfaced as extra SSE records.
+                if events[-1].status == "cloned":
+                    try:
+                        # Lazy local import to avoid a module-level cycle with
+                        # panel.dashboard.router (dashboard already imports
+                        # clone_for_country from this same module).
+                        from ..dashboard.router import (  # noqa: PLC0415
+                            _apply_psiphon_xray_outbound_and_rule,
+                        )
+
+                        rok, rerr = _apply_psiphon_xray_outbound_and_rule(
+                            spec.country_code, int(spec.socks_port), int(spec.public_port)
+                        )
+                        events.append(
+                            CloneEvent(
+                                country_code=spec.country_code,
+                                status="routing" if rok else "routing_failed",
+                                progress=100,
+                                inbound_id=events[-1].inbound_id,
+                                message=(
+                                    f"xray routing applied for {spec.country_code}"
+                                    if rok
+                                    else f"xray routing for {spec.country_code} failed: {rerr}"
+                                ),
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001  defensive
+                        events.append(
+                            CloneEvent(
+                                country_code=spec.country_code,
+                                status="routing_failed",
+                                progress=100,
+                                inbound_id=events[-1].inbound_id,
+                                message=(
+                                    f"xray routing for {spec.country_code} raised "
+                                    f"{type(exc).__name__}: {exc}"
+                                ),
+                            )
+                        )
+                    yield _sse(events[-1].as_dict())
+
+            # Drive rollback through the orchestrator's rollback helper. We
+            # pass ONLY the actual clone events (filtering out the Hotfix #9
+            # routing records appended above) so the rollback logic still
+            # counts the real clone outcomes.
+            clone_outcomes = [
+                e for e in events if e.status in ("cloned", "failed")
+            ]
             _, rolled_back = await _rollback_on_failure(
-                events=events,
+                events=clone_outcomes,
                 db=db,
                 client=client,
             )
 
-            success = not rolled_back and all(e.status == "cloned" for e in events)
+            success = not rolled_back and all(e.status == "cloned" for e in clone_outcomes)
             if success:
                 row.current_step = WizardStep.DONE.value
                 db.add(row)
@@ -1208,7 +1254,7 @@ async def submit_clone(
                 db.refresh(row)
                 summary_message = f"cloned {total} countries — wizard complete"
             else:
-                cloned_n = sum(1 for e in events if e.status == "cloned")
+                cloned_n = sum(1 for e in clone_outcomes if e.status == "cloned")
                 summary_message = (
                     f"cloned {cloned_n}/{total} countries — "
                     f"{len(rolled_back)} clone(s) rolled back via delete_inbound"

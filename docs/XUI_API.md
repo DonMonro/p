@@ -563,3 +563,80 @@ reminding the operator to `systemctl restart psiphon-3x-ui.service` and
 re-run `installer/firewall.sh` — the panel listens on the persisted port but
 the actual `psiphon-3x-ui.service` unit needs a restart for that to take
 effect.
+
+## Per-country routing via direct config edit
+
+> Introduced in **Phase 25 Hotfix #9** after the operator confirmed end-user
+> traffic still exited via the SERVER's own IP despite
+> `streamSettings.outbound` being correctly persisted on each cloned 3x-ui
+> inbound.
+
+### Why the direct edit
+
+Xray-core does NOT honour the per-inbound `streamSettings.outbound` field
+for routing decisions — that field is persisted by the 3x-ui panel but
+ignored by Xray's routing engine. Xray decides outbound-by-inboundTag via
+the top-level `routing.rules[]` array, period. Clones therefore fell back
+to the default `freedom` outbound (`outbounds[0]`, tag=`direct`) and
+end-user traffic exited from the server's own IP.
+
+This 3x-ui version does not expose a `/panel/api/xray/*` JSON API for
+managing outbounds + routing rules programmatically. The panel therefore
+edits the on-disk Xray config **directly**:
+
+```
+/usr/local/x-ui/bin/config.json
+```
+
+(The path can be overridden via the `PSIPHON_XUI_XRAY_CONFIG_PATH`
+environment variable — useful in unit tests.)
+
+After the file is rewritten (atomically: tmp + `os.replace`), the panel
+invokes `systemctl restart x-ui.service` — authorised by the extended
+polkit rule (`systemd/49-psiphon-3x-ui.rules`). The restart is SYNCHRONOUS
+(no `systemd-run --no-block`) because the panel service is NOT the unit
+being restarted, so the in-flight HTTP response survives.
+
+### What the panel writes
+
+For every enabled country `<CODE>` with SOCKS port `<socks_port>` and
+3x-ui public port `<public_port>`, the panel idempotently writes:
+
+**1. One outbound entry** (keyed by `tag`, never duplicated):
+
+```json
+{
+  "tag": "psiphon-out-<CODE>",
+  "protocol": "socks",
+  "settings": {
+    "servers": [
+      {"address": "127.0.0.1", "port": <socks_port>, "users": []}
+    ]
+  }
+}
+```
+
+**2. One routing rule** (inserted BEFORE the `bittorrent` / `geoip:private`
+catch-alls so Xray matches it first; never duplicated):
+
+```json
+{
+  "type": "field",
+  "inboundTag": ["in-<public_port>-tcp"],
+  "outboundTag": "psiphon-out-<CODE>"
+}
+```
+
+The inboundTag `in-<public_port>-tcp` pattern matches the auto-generated
+tag that 3x-ui assigns to every inbound (see the operator's live config
+verification in the Hotfix #9 commit). On country delete / disable the
+panel removes BOTH entries via the inverse helper.
+
+### See also
+
+* `panel/dashboard/router.py::_apply_psiphon_xray_outbound_and_rule`
+  and `_remove_psiphon_xray_outbound_and_rule`.
+* `tests/test_dashboard.py::TestPsiphonXrayRoutingHelpers` — idempotency,
+  insertion-order, and per-country isolation contract.
+* `tests/test_hardening.py::TestHotfix22PostReleaseRegressions` — source-level
+  greps pinning the tag patterns + polkit authorisation.

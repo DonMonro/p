@@ -68,7 +68,21 @@ class CloneSpec:
 class CloneEvent:
     """A single broadcast event emitted by :func:`clone_country`.
 
-    ``status`` is one of ``"working"``, ``"cloned"``, ``"failed"``.
+    ``status`` is one of:
+
+    * ``"working"``   — the per-clone "in flight" sentinel emitted by the
+      SSE handler before the underlying HTTP request finishes.
+    * ``"cloned"``    — the inbound was created in 3x-ui and the
+      ``CloneRecord`` row was persisted.
+    * ``"failed"``    — the clone itself errored.
+    * ``"routing"``   — Hotfix #9 (Phase 25): post-clone, the per-country
+      Xray ``outbounds[]`` + ``routing.rules[]`` entry was written and
+      x-ui.service restarted so end-user traffic egresses via Psiphon.
+    * ``"routing_failed"`` — same as ``"routing"`` but the apply failed
+      (non-fatal; the clone itself already succeeded).
+    * ``"rolled_back"`` — emitted by the wizard's SSE handler only when an
+      inbound is rolled back because a different country's clone failed.
+
     ``inbound_id`` is the new inbound id on success (``None`` on failure or
     for the intermediate ``working`` record). ``message`` is a short human
     description suitable for the progress-bar UI.
@@ -217,6 +231,15 @@ async def clone_for_country(
     Returns ``{"inbound_id": <int|null>, "success": <bool>, "error": <str|null>}``
     — never raises. ``success == True`` implies the new ``CloneRecord`` was
     committed; ``success == False`` carries a human-readable ``error``.
+
+    Hotfix #9 (Phase 25): on success the helper now also writes the per-
+    country Xray outbound+routing rule into ``/usr/local/x-ui/bin/config.json``
+    (via :func:`panel.dashboard.router._apply_psiphon_xray_outbound_and_rule`)
+    so end-user traffic actually exits through the country's Psiphon tunnel.
+    ``streamSettings.outbound`` is persisted by 3x-ui but ignored by Xray
+    core routing — see Hotfix #9 docblock. The binding's success/failure is
+    reported back via the new ``routing_error`` / ``routing_applied`` keys
+    (non-fatal — the inbound clone itself already succeeded).
     """
     from ..models import Country, PortAssignment  # local import to avoid cycles
 
@@ -248,7 +271,39 @@ async def clone_for_country(
         return {"inbound_id": None, "success": False, "error": f"{type(exc).__name__}: {exc}"}
     if event.status != "cloned":
         return {"inbound_id": None, "success": False, "error": event.message}
-    return {"inbound_id": event.inbound_id, "success": True, "error": None}
+
+    # Hotfix #9 (Phase 25): write the routing binding to the Xray config so
+    # the clone's inboundTag actually egresses via Psiphon. Local import —
+    # dashboard.router already imports this module at top-level for
+    # `clone_for_country`, so a top-level reverse import would form a cycle.
+    routing_applied: bool = False
+    routing_error: str | None = None
+    try:
+        from ..dashboard.router import (  # noqa: PLC0415 — cycle-avoiding local
+            _apply_psiphon_xray_outbound_and_rule,
+        )
+
+        rok, rerr = _apply_psiphon_xray_outbound_and_rule(
+            country_row.code, int(pa.socks_port), int(pa.public_port)
+        )
+        routing_applied = bool(rok)
+        routing_error = None if rok else rerr
+        if not rok:
+            _log.warning(
+                "clone_for_country routing binding for %s failed: %s",
+                country_row.code, rerr,
+            )
+    except Exception as exc:  # noqa: BLE001  defensive — never fail the clone
+        routing_error = f"{type(exc).__name__}: {exc}"
+        _log.exception("clone_for_country routing raised for %s", country_row.code)
+
+    return {
+        "inbound_id": event.inbound_id,
+        "success": True,
+        "error": None,
+        "routing_applied": routing_applied,
+        "routing_error": routing_error,
+    }
 
 
 # ---------------------------------------------------------------------------

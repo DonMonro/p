@@ -463,3 +463,36 @@ I've packaged these in good faith — a few items in the prompt warrant refineme
 Switch to **Code mode** and start with **Phase 0** (repo skeleton + CI), then immediately run the **Phase 1 3x-ui API spike** against a real VM to de-risk the clone-engine design before committing UI work.
 
 This plan is intentionally thorough because the project is global and public — getting the integration contract right early will save painful rework later.
+
+---
+
+## Phase 25 Post-Completion Note (Hotfix #9)
+
+The original **Phase 1 design assumed** `streamSettings.outbound` on a
+cloned 3x-ui inbound would be honored by the Xray core routing engine —
+i.e. that writing
+
+```json
+{"streamSettings": {"outbound": {"protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": N}]}}}}
+```
+
+would route that inbound's traffic out through the local Psiphon SOCKS
+listener at `127.0.0.1:N`. **Hotfix #9 (Phase 25) confirmed this is NOT
+the case on the operator's live 3x-ui + Xray-core install.** Xray decides
+outbound-by-inboundTag via the top-level `routing.rules[]` array — the
+per-inbound `streamSettings.outbound` field is persisted by 3x-ui but is
+not consulted by the routing engine.
+
+The per-country routing is therefore done by **direct config-file edit** of
+`/usr/local/x-ui/bin/config.json`'s **`outbounds[]`** + **`routing.rules[]`**
+arrays from inside `panel/dashboard/router.py` (see
+`_apply_psiphon_xray_outbound_and_rule` and
+`_remove_psiphon_xray_outbound_and_rule`). Path is overridable via
+`PSIPHON_XUI_XRAY_CONFIG_PATH`. After each write the panel invokes
+`systemctl restart x-ui.service` — synchronous (the panel service is not
+the unit being restarted; in-flight HTTP responses survive), and gated by
+the extended `systemd/49-psiphon-3x-ui.rules` polkit rule.
+
+See `docs/XUI_API.md` § "Per-country routing via direct config edit" for
+the outbound/routing-rule JSON shapes and the `psiphon-out-<CODE>` /
+`in-<public_port>-tcp` tag contract.
