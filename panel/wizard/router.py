@@ -1185,21 +1185,25 @@ async def submit_clone(
                 events.append(await clone_country(spec, client, db=db))
                 yield _sse(events[-1].as_dict())
 
-                # Hotfix #9 (Phase 25): write the per-country Xray outbound +
-                # routing rule so the clone actually egresses via Psiphon.
-                # The clone itself succeeded already — routing failures are
-                # non-fatal and surfaced as extra SSE records.
+                # Hotfix #10 (Phase 25): enqueue the per-country Xray outbound +
+                # routing patch so the root-side applier merges it into
+                # /usr/local/x-ui/bin/config.json. The clone itself succeeded
+                # already — enqueue failures are non-fatal and surfaced as
+                # extra SSE records.
                 if events[-1].status == "cloned":
                     try:
                         # Lazy local import to avoid a module-level cycle with
                         # panel.dashboard.router (dashboard already imports
                         # clone_for_country from this same module).
                         from ..dashboard.router import (  # noqa: PLC0415
-                            _apply_psiphon_xray_outbound_and_rule,
+                            _enqueue_xray_patch,
                         )
 
-                        rok, rerr = _apply_psiphon_xray_outbound_and_rule(
-                            spec.country_code, int(spec.socks_port), int(spec.public_port)
+                        rok, rerr = _enqueue_xray_patch(
+                            "apply",
+                            spec.country_code,
+                            int(spec.socks_port),
+                            int(spec.public_port),
                         )
                         events.append(
                             CloneEvent(

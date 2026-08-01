@@ -570,15 +570,17 @@ class TestCloneEndpoint:
     def test_clone_happy_stream_advances_to_done_and_flips_wizard_completed(
         self, clone_client, monkeypatch
     ):
-        # Hotfix #9 (Phase 25): stub the apply helper so the SSE handler's
+        # Hotfix #10 (Phase 25): stub the ENQUEUE helper so the SSE handler's
         # per-country routing records are emitted deterministically (and so
-        # the real config-file write + systemctl restart are skipped).
+        # the test never writes to the real queue dir). The Hotfix-#9
+        # direct-file-write helper was deleted; this stub stands in for the
+        # root-side applier trigger.
         from panel.dashboard import router as _dr
 
         monkeypatch.setattr(
             _dr,
-            "_apply_psiphon_xray_outbound_and_rule",
-            lambda code, socks, public: (True, ""),
+            "_enqueue_xray_patch",
+            lambda op, code, socks, public: (True, ""),
         )
 
         _advance_to_clone(clone_client)

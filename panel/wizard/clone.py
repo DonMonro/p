@@ -232,14 +232,18 @@ async def clone_for_country(
     — never raises. ``success == True`` implies the new ``CloneRecord`` was
     committed; ``success == False`` carries a human-readable ``error``.
 
-    Hotfix #9 (Phase 25): on success the helper now also writes the per-
-    country Xray outbound+routing rule into ``/usr/local/x-ui/bin/config.json``
-    (via :func:`panel.dashboard.router._apply_psiphon_xray_outbound_and_rule`)
-    so end-user traffic actually exits through the country's Psiphon tunnel.
-    ``streamSettings.outbound`` is persisted by 3x-ui but ignored by Xray
-    core routing — see Hotfix #9 docblock. The binding's success/failure is
-    reported back via the new ``routing_error`` / ``routing_applied`` keys
-    (non-fatal — the inbound clone itself already succeeded).
+    Hotfix #10 (Phase 25): on success the helper also enqueues a per-country
+    Xray outbound+routing patch into
+    ``/var/lib/psiphon-3x-ui/xray-patch-queue/`` (via
+    :func:`panel.dashboard.router._enqueue_xray_patch`). The root-side
+    applier service consumes the queue file, merges it into
+    ``/usr/local/x-ui/bin/config.json``, and restarts x-ui.service ONCE per
+    trigger. ``streamSettings.outbound`` is persisted by 3x-ui but ignored
+    by Xray core routing — that's why the direct per-inbound hint never
+    sufficed (see Hotfix #9 docblock in git history). The binding's
+    success/failure is reported back via the ``routing_error`` /
+    ``routing_applied`` keys (non-fatal — the inbound clone itself already
+    succeeded).
     """
     from ..models import Country, PortAssignment  # local import to avoid cycles
 
@@ -272,25 +276,28 @@ async def clone_for_country(
     if event.status != "cloned":
         return {"inbound_id": None, "success": False, "error": event.message}
 
-    # Hotfix #9 (Phase 25): write the routing binding to the Xray config so
-    # the clone's inboundTag actually egresses via Psiphon. Local import —
-    # dashboard.router already imports this module at top-level for
-    # `clone_for_country`, so a top-level reverse import would form a cycle.
+    # Hotfix #10 (Phase 25): enqueue the routing binding for the root-side
+    # applier to merge into Xray's config. Local import — dashboard.router
+    # already imports this module at top-level for `clone_for_country`, so a
+    # top-level reverse import would form a cycle.
     routing_applied: bool = False
     routing_error: str | None = None
     try:
         from ..dashboard.router import (  # noqa: PLC0415 — cycle-avoiding local
-            _apply_psiphon_xray_outbound_and_rule,
+            _enqueue_xray_patch,
         )
 
-        rok, rerr = _apply_psiphon_xray_outbound_and_rule(
-            country_row.code, int(pa.socks_port), int(pa.public_port)
+        rok, rerr = _enqueue_xray_patch(
+            "apply",
+            country_row.code,
+            int(pa.socks_port),
+            int(pa.public_port),
         )
         routing_applied = bool(rok)
         routing_error = None if rok else rerr
         if not rok:
             _log.warning(
-                "clone_for_country routing binding for %s failed: %s",
+                "clone_for_country routing enqueue for %s failed: %s",
                 country_row.code, rerr,
             )
     except Exception as exc:  # noqa: BLE001  defensive — never fail the clone

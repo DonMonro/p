@@ -34,6 +34,16 @@ release-artifacts.sha256  text eol=lf
 # fresh `git clone` would see a mismatch on hosts where core.autocrlf=true
 # silently CRLF-converted the file on checkout).
 *.service          text eol=lf
+# Phase 25 Hotfix #10: psiphon-xray-applier.path (systemd path unit) is
+# shipped + installed by panel_install.sh; pin LF so the working-tree SHA
+# matches the git-blob SHA served by raw.githubusercontent.com.
+*.path             text eol=lf
+
+# Phase 25 Hotfix #10: the applier's bash driver + stdlib-only json merger
+# are root-owned helpers installed to /usr/local/libexec/psiphon-3x-ui/.
+# *.sh is already LF-pinned at the top of this block; the .py helper
+# inherits the generic `*.py text` rule below which uses git's default
+# text handling on Linux and is safe for the operator-side install copy.
 
 # ── Python source (default text = LF on commit) ─────────────────────────
 *.py               text
