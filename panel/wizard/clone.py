@@ -234,7 +234,7 @@ async def clone_for_country(
 
     Hotfix #10 (Phase 25): on success the helper also enqueues a per-country
     Xray outbound+routing patch into
-    ``/var/lib/psiphon-3x-ui/xray-patch-queue/`` (via
+    ``/opt/psiphon-3x-ui/xray-patch-queue/`` (via
     :func:`panel.dashboard.router._enqueue_xray_patch`). The root-side
     applier service consumes the queue file, merges it into
     ``/usr/local/x-ui/bin/config.json``, and restarts x-ui.service ONCE per

@@ -83,7 +83,7 @@ the root-owned on-disk config:
 1. **Panel-side enqueue helper** — `panel/dashboard/router.py::
    _enqueue_xray_patch(op, country_code, socks_port, public_port)`.
    Atomically drops `<CODE>-<op>-<uuid8>.json` into
-   `/var/lib/psiphon-3x-ui/xray-patch-queue/` via `tempfile.mkstemp` in
+   `/opt/psiphon-3x-ui/xray-patch-queue/` via `tempfile.mkstemp` in
    the same directory followed by `os.replace` (rename — the only
    interposable-on-inotify syscall, so the watcher never sees a partial
    file). Honours `PSIPHON_XRAY_PATCH_QUEUE_DIR` for tests.
@@ -99,7 +99,7 @@ the root-owned on-disk config:
    `systemd/psiphon-xray-applier.service` (`Type=oneshot`, `User=root`)
    execs `/usr/local/libexec/psiphon-3x-ui/xray-applier.sh`. The bash
    driver:
-   * flock -x 9's `/var/lib/psiphon-3x-ui/xray-applier.lock` so two
+   * flock -x 9's `/opt/psiphon-3x-ui/xray-applier.lock` so two
      appliers never race config.json.
    * Iterates pending `*.json` in sorted order and hands each to
      `/usr/local/libexec/psiphon-3x-ui/xray_apply.py` (stdlib-only — no

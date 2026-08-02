@@ -1,5 +1,5 @@
 [Unit]
-Description=Apply pending per-country Xray outbound+routing patches from /var/lib/psiphon-3x-ui/xray-patch-queue
+Description=Apply pending per-country Xray outbound+routing patches from /opt/psiphon-3x-ui/xray-patch-queue
 Documentation=man:systemd.service(5)
 # Phase 25 Hotfix #10: triggered by psiphon-xray-applier.path every time a
 # panel-side _enqueue_xray_patch() drops a patch file into the queue
@@ -10,7 +10,7 @@ Documentation=man:systemd.service(5)
 # mutated the config — the helper exits with status 10 in the "all patches
 # were no-ops" case so the applier skips the otherwise-disruptive restart).
 After=local-fs.target
-ConditionPathIsDirectory=/var/lib/psiphon-3x-ui/xray-patch-queue
+ConditionPathIsDirectory=/opt/psiphon-3x-ui/xray-patch-queue
 
 [Service]
 Type=oneshot

@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch /var/lib/psiphon-3x-ui/xray-patch-queue for per-country Xray outbound+routing patch files
+Description=Watch /opt/psiphon-3x-ui/xray-patch-queue for per-country Xray outbound+routing patch files
 Documentation=man:systemd.path(5)
 # Phase 25 Hotfix #10: this path unit triggers psiphon-xray-applier.service
 # every time a panel-side _enqueue_xray_patch() call drops a patch file into
@@ -16,7 +16,7 @@ Documentation=man:systemd.path(5)
 # Fire when a patch file is created (the panel uses write-tmp+rename, so
 # `PathChanged` on the directory edge-triggers on the rename event, not
 # on the intermediate tmp file).
-PathChanged=/var/lib/psiphon-3x-ui/xray-patch-queue
+PathChanged=/opt/psiphon-3x-ui/xray-patch-queue
 # Ensure the queue directory exists at boot with the right ownership
 # (root:psiphon3xui, mode 0755) so the panel user can mktemp+rename files
 # inside it but no other unprivileged user can.

@@ -88,7 +88,7 @@ _XUI_SERVICE_NAME = "x-ui.service"
 # queue file into a shared directory and a root-side systemd oneshot
 # service (psiphon-xray-applier.service, triggered by the companion
 # .path unit watching the same directory) does the privileged merge.
-_XRAY_PATCH_QUEUE_DIR_DEFAULT = "/var/lib/psiphon-3x-ui/xray-patch-queue"
+_XRAY_PATCH_QUEUE_DIR_DEFAULT = "/opt/psiphon-3x-ui/xray-patch-queue"
 
 
 def _xray_patch_queue_dir() -> Path:

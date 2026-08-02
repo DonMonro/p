@@ -516,7 +516,7 @@ EOF
     #       x-ui.service` once at the very end (multi-country bursts land as
     #       a single restart, not N restarts).
     #
-    #   (c) The shared queue directory /var/lib/psiphon-3x-ui/xray-patch-queue/
+    #   (c) The shared queue directory /opt/psiphon-3x-ui/xray-patch-queue/
     #       is owned root:psiphon3xui mode 0755 so the panel user can
     #       mktemp+rename inside it but no other unprivileged user can write.
     #
@@ -524,7 +524,7 @@ EOF
     # (re-runs overwrite in place); the path unit needs `daemon-reload` +
     # `enable --now` for .path activation.
     local APPLIER_LIBEXEC_DIR="/usr/local/libexec/psiphon-3x-ui"
-    local APPLIER_QUEUE_DIR="/var/lib/psiphon-3x-ui/xray-patch-queue"
+    local APPLIER_QUEUE_DIR="/opt/psiphon-3x-ui/xray-patch-queue"
 
     # libexec directory (root-owned; helpers are mode 0755).
     install -d -m 0755 -o root -g root "${APPLIER_LIBEXEC_DIR}" \
@@ -569,16 +569,16 @@ EOF
     # needs). Other unprivileged users are neither owner nor group members
     # → they get r-x (read+execute, no write) per the mode. The lock file
     # the applier bash script flock()s lives one level UP at
-    # /var/lib/psiphon-3x-ui/xray-applier.lock and is created on first
+    # /opt/psiphon-3x-ui/xray-applier.lock and is created on first
     # applier run with default umask (root-owned mode 0644) — the panel
     # never needs to open it.
     install -d -m 0775 -o root -g "${PSIPHON3XUI_GROUP}" "${APPLIER_QUEUE_DIR}" \
         || warn "mkdir ${APPLIER_QUEUE_DIR} failed (applier sidecar will not work)."
-    # Belt-and-braces: make sure the parent /var/lib/psiphon-3x-ui root is
+    # Belt-and-braces: make sure the parent /opt/psiphon-3x-ui root is
     # traversable by the panel user (so the path-unit can inotify the queue
     # dir contents). Owned by root, group ${PSIPHON3XUI_GROUP}, 0755.
-    install -d -m 0755 -o root -g "${PSIPHON3XUI_GROUP}" "/var/lib/psiphon-3x-ui" \
-        || warn "mkdir /var/lib/psiphon-3x-ui failed (continuing)."
+    install -d -m 0755 -o root -g "${PSIPHON3XUI_GROUP}" "/opt/psiphon-3x-ui" \
+        || warn "mkdir /opt/psiphon-3x-ui failed (continuing)."
 
     # Enable + start the .path unit so it watches the queue dir from boot.
     systemctl daemon-reload 2>/dev/null || true

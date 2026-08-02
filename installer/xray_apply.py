@@ -7,7 +7,7 @@ triggered from psiphon-xray-applier.path). The panel NEVER reads or writes
 ``/usr/local/x-ui/bin/config.json`` itself — the unprivileged
 ``psiphon3xui`` user can't (stock 3x-ui ships that file mode 0600
 root:root). Instead the panel drops an atomic queue file describing the
-binding into ``/var/lib/psiphon-3x-ui/xray-patch-queue/`` and the path
+binding into ``/opt/psiphon-3x-ui/xray-patch-queue/`` and the path
 unit's trigger lands here.
 
 Patch-file schema (a single JSON object)::
@@ -150,10 +150,10 @@ def _atomic_write(path: Path, cfg: dict) -> None:
         tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:
-        try:
+        import contextlib  # noqa: PLC0415 — best-effort cleanup
+
+        with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
-        except OSError:  # pragma: no cover — best-effort cleanup
-            pass
         _err(f"write {path} failed: {type(exc).__name__}: {exc}")
         raise SystemExit(EXIT_CONFIG_IO) from exc
 
@@ -290,10 +290,7 @@ def main(argv: list[str]) -> int:
     cfg_path = _config_path()
     cfg = _load_config(cfg_path)
 
-    if patch["op"] == "apply":
-        mutated = _apply(cfg, patch)
-    else:  # "remove"
-        mutated = _remove(cfg, patch)
+    mutated = _apply(cfg, patch) if patch["op"] == "apply" else _remove(cfg, patch)
 
     if mutated:
         _atomic_write(cfg_path, cfg)

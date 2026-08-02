@@ -498,7 +498,7 @@ sidecar:**
 
 * Panel-side: `_enqueue_xray_patch(op, country_code, socks_port,
   public_port)` atomically drops `<CODE>-<op>-<uuid8>.json` into
-  `/var/lib/psiphon-3x-ui/xray-patch-queue/` (tempfile.mkstemp in the same
+  `/opt/psiphon-3x-ui/xray-patch-queue/` (tempfile.mkstemp in the same
   dir + os.replace; only the rename edge-triggers the path unit's inotify
   watch).
 * systemd-side: `psiphon-xray-applier.path` watches the queue dir and
