@@ -1483,7 +1483,7 @@ class TestEnqueueXrayPatch:
     (the file is root:root mode 0600 and 3x-ui regenerates it from
     ``/etc/x-ui/x-ui.db``, so the unprivileged panel process could never
     write it anyway). Instead, the panel drops an atomic patch file into
-    ``/var/lib/psiphon-3x-ui/xray-patch-queue/`` and a root-running
+    ``/opt/psiphon-3x-ui/xray-patch-queue/`` and a root-running
     systemd oneshot (``psiphon-xray-applier.service``, triggered by the
     companion ``.path`` unit) consumes it.
 

@@ -5784,7 +5784,7 @@ class TestHotfix23PostReleaseRegressions:
         text = p.read_text(encoding="utf-8")
         assert "[Path]" in text
         assert (
-            "PathChanged=/var/lib/psiphon-3x-ui/xray-patch-queue" in text
+            "PathChanged=/opt/psiphon-3x-ui/xray-patch-queue" in text
         )
         assert "WantedBy=multi-user.target" in text
 
@@ -5810,7 +5810,7 @@ class TestHotfix23PostReleaseRegressions:
         assert p.exists(), f"missing {p}"
         text = p.read_text(encoding="utf-8")
         assert "flock -x 9" in text
-        assert "/var/lib/psiphon-3x-ui/xray-applier.lock" in text
+        assert "/opt/psiphon-3x-ui/xray-applier.lock" in text
         assert "xray_apply.py" in text
         assert 'systemctl restart "${XUI_SERVICE_NAME}"' in text or (
             "systemctl restart" in text and "x-ui.service" in text
@@ -5886,7 +5886,7 @@ class TestHotfix23PostReleaseRegressions:
         assert "installer/xray_apply.py" in text
         assert "systemd/psiphon-xray-applier.path" in text
         assert "systemd/psiphon-xray-applier.service" in text
-        assert "/var/lib/psiphon-3x-ui/xray-patch-queue" in text
+        assert "/opt/psiphon-3x-ui/xray-patch-queue" in text
         assert (
             "systemctl enable --now psiphon-xray-applier.path" in text
         )

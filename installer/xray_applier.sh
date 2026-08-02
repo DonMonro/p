@@ -6,11 +6,11 @@
 # Phase 25 Hotfix #10: invoked ONESHOT by psiphon-xray-applier.service (which
 # is in turn triggered by psiphon-xray-applier.path every time a panel-side
 # _enqueue_xray_patch() call drops a <COUNTRY>-<op>-<uuid8>.json file into
-# /var/lib/psiphon-3x-ui/xray-patch-queue/).
+# /opt/psiphon-3x-ui/xray-patch-queue/).
 #
 # What this script does (in order):
 #   1. Acquire an exclusive flock() on
-#      /var/lib/psiphon-3x-ui/xray-applier.lock — serialized against any
+#      /opt/psiphon-3x-ui/xray-applier.lock — serialized against any
 #      concurrent applier fire-ups from rapid successive path-unit triggers,
 #      so two appliers never race each other on the same config.json.
 #   2. For each pending patch file under the queue dir — processed in
@@ -42,8 +42,8 @@ set -u  # -e deliberately omitted: we want a single patch's failure to be
         # x-ui.service restart at the end then still covers the patches
         # that DID succeed).
 
-QUEUE_DIR="${PSIPHON_XRAY_PATCH_QUEUE_DIR:-/var/lib/psiphon-3x-ui/xray-patch-queue}"
-LOCK_FILE="${PSIPHON_XRAY_APPLIER_LOCK:-/var/lib/psiphon-3x-ui/xray-applier.lock}"
+QUEUE_DIR="${PSIPHON_XRAY_PATCH_QUEUE_DIR:-/opt/psiphon-3x-ui/xray-patch-queue}"
+LOCK_FILE="${PSIPHON_XRAY_APPLIER_LOCK:-/opt/psiphon-3x-ui/xray-applier.lock}"
 APPLY_PY="${PSIPHON_XRAY_APPLY_PY:-/usr/local/libexec/psiphon-3x-ui/xray_apply.py}"
 XUI_SERVICE_NAME="${PSIPHON_XUI_SERVICE_NAME:-x-ui.service}"
 

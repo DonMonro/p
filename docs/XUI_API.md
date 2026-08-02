@@ -127,7 +127,7 @@ API is touched), the panel cannot safely read or write that file directly
 either. The queue+applier sidecar documented in
 `docs/ARCHITECTURE.md` (\"Xray applier sidecar\") is the supported
 integration: the panel drops a small patch file into
-`/var/lib/psiphon-3x-ui/xray-patch-queue/` and a root-running
+`/opt/psiphon-3x-ui/xray-patch-queue/` and a root-running
 `psiphon-xray-applier.service` (systemd `.path` unit trigger) merges it.
 
 Operators who want to force a queue drain by hand can run:
@@ -622,7 +622,7 @@ effect.
 
 The queue+applier sidecar (see `docs/ARCHITECTURE.md` "Xray applier
 sidecar") resolves the privilege split: the panel drops a small patch
-file into `/var/lib/psiphon-3x-ui/xray-patch-queue/` (a directory it CAN
+file into `/opt/psiphon-3x-ui/xray-patch-queue/` (a directory it CAN
 write because it's group-writable + group-owned by `psiphon3xui`), and
 the root-running `psiphon-xray-applier.service` consumes it.
 
