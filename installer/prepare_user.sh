@@ -53,19 +53,22 @@ run_prepare_user() {
     # Make sure the prefix tree is owned by our service user/group so the panel
     # can write to it without root. Idempotent: chown -R is safe to re-run.
     #
-    # INSTALL_PREFIX is made GROUP-writable (0770) so the psiphon-3x-ui service
-    # uid (User=psiphon3xui, in Group=psiphon3xui) can create SQLite sidecar
-    # files (panel.db-wal / panel.db-shm / panel.db-journal) next to the panel.db
-    # file that lives at ${INSTALL_PREFIX}/panel.db. SQLite needs WRITE access to
-    # the directory containing the DB file (not just the file itself) — even
-    # when WAL is OFF it still mints a -journal tmp file on the first INSERT.
-    # With 0750 (group r-x) the service uid couldn't create those sidecars and
-    # the very first wizard step blew up with `sqlite3.OperationalError: attempt
-    # to write a readonly database` (see Hotfix #3 in the v1.0.0 amend cycle).
+    # Phase 25 Hotfix #11: instead ofs bare chmod 0770 without a setgid
+    # bit, install -d with mode 2775 (setgid: files inherit the group of the
+    # parent dir). This is the LAST mode fix for Hotfix #12 — on the
+    # operator's box the prior version of this script's chmod 0770 (no
+    # setgid) lost the setgid bit because prior mkdir -p had created the
+    # dir without it. Files created inside end up with the caller's primary
+    # group instead of psiphon3xui — panel.db becomes root:root 0644 and
+    # sqlite's WAL can't write sidecars next to it (the "attempt to write
+    # a readonly database" traceback the operator pasted). install -d
+    # applies setgid AND the right mode in one shot; it also already does
+    # the chown+chmod work (via -o root -g) so no separate chown -R call.
     mkdir -p "${CONFIG_DIR}" "${BIN_DIR}" "${VENV_DIR}"
+    install -d -m 2775 -o root -g "${PSIPHON3XUI_GROUP}" "${INSTALL_PREFIX}" 2>/dev/null || true
     chown -R "root:${PSIPHON3XUI_GROUP}" "${INSTALL_PREFIX}" 2>/dev/null || true
-    chmod 0770 "${INSTALL_PREFIX}" 2>/dev/null || true
-    chmod 0770 "${CONFIG_DIR}" 2>/dev/null || true
+    chmod 2775 "${INSTALL_PREFIX}" 2>/dev/null || true
+    chmod 2775 "${CONFIG_DIR}" 2>/dev/null || true
     chmod 0750 "${BIN_DIR}" 2>/dev/null || true
 
     ok "Service user '${PSIPHON3XUI_USER}' and group '${PSIPHON3XUI_GROUP}' ready."

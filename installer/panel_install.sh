@@ -575,9 +575,20 @@ EOF
     install -d -m 0775 -o root -g "${PSIPHON3XUI_GROUP}" "${APPLIER_QUEUE_DIR}" \
         || warn "mkdir ${APPLIER_QUEUE_DIR} failed (applier sidecar will not work)."
     # Belt-and-braces: make sure the parent /opt/psiphon-3x-ui root is
-    # traversable by the panel user (so the path-unit can inotify the queue
-    # dir contents). Owned by root, group ${PSIPHON3XUI_GROUP}, 0755.
-    install -d -m 0755 -o root -g "${PSIPHON3XUI_GROUP}" "/opt/psiphon-3x-ui" \
+    #:
+    #   (a) traversable by the panel user (so the path-unit can inotify the
+    #       queue dir contents)
+    #   (b) GROUP-WRITABLE (mode 2775) — the panel.db file sits ONE LEVEL
+    #       UP from the queue dir and must stay writable by the panel
+    #       service. Phase 25 Hotfix #12 (status quo): the prior install
+    #       wrote mode 0755 here — the panel service's _get_wizard_row()
+    #       INSERT into panel.db was then blocked with
+    #       `sqlite3.OperationalError: attempt to write a readonly
+    #       database` (the panel user — psiphon3xui — can read but not
+    #       write under mode 0755 with owner=root). Fix here: invoke
+    #       install with mode 2775 (group-writable) + the setgid bit so
+    #       any files created inside inherit the psiphon3xui group.
+    install -d -m 2775 -o root -g "${PSIPHON3XUI_GROUP}" "/opt/psiphon-3x-ui" \
         || warn "mkdir /opt/psiphon-3x-ui failed (continuing)."
 
     # Enable + start the .path unit so it watches the queue dir from boot.
