@@ -4174,36 +4174,72 @@ class TestHotfix17PostReleaseRegressions:
             "exit 1 → restart loop → ConnectionRefused on 11000)."
         )
 
-    def test_execstartpre_uses_install_minus_d(self):
-        """The ``ExecStartPre`` must use ``/usr/bin/install -d`` (recursive
-        mkdir) so BOTH the per-country subdir AND its parent
-        ``/opt/psiphon-3x-ui/data`` get created on first start. Plain
-        ``mkdir /opt/psiphon-3x-ui/data/<CODE>`` would fail when the parent
-        ``data`` dir is missing — which is exactly the failure mode that
-        Hotfix #4 was authored to close."""
+    def test_execstartpre_uses_mkdir_minus_p(self):
+        """Phase 26 Hotfix #13 — the ``ExecStartPre`` must use
+        ``/usr/bin/mkdir -p`` (recursive, idempotent), NOT ``install -d``.
+        GNU coreutils ``install -d`` on newer Ubuntu internally still calls
+        chown(2) on the directory it's about to create even when no
+        ``-o``/``-g`` args are passed, AND when the parent has the setgid
+        bit set (which ``/opt/psiphon-3x-ui`` does, mode 2775 since
+        Hotfix #12). With ``NoNewPrivileges=true`` + ``ProtectSystem=strict``
+        the CAP_CHOWN capability is stripped, so the chown syscall fails
+        with EACCES — exactly what the operator's fresh install hit
+        (journald: ``/usr/bin/install: cannot create directory
+        '/opt/psiphon-3x-ui/data': Permission denied``, repeating in a
+        tight RestartSec=5 loop).
+
+        The substitute is plain ``mkdir -p -m 0700 --``:
+          * ``-p`` walks the path recursively creating each missing
+            component AND is idempotent on a pre-existing dir (so systemd
+            restarts don't fail the pre-flight);
+          * ``-m 0700`` applies the owner-only mode atomically at mkdir
+            time (no chmod followup);
+          * ``--`` ends option parsing so a country-code that began with
+            ``-`` would be treated as a literal path;
+          * ``mkdir`` never invokes chown — the new dir simply inherits
+            the creating process's uid/gid (here psiphon3xui per the unit's
+            ``User=``/``Group=``)."""
         import re  # noqa: PLC0415
 
         text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-        # The Hotfix-#4 ExecStartPre line:
-        #   ExecStartPre=/usr/bin/install -d -m 0700 -o psiphon3xui -g psiphon3xui /opt/psiphon-3x-ui/data/%i
+        # The Hotfix-#13 ExecStartPre line:
+        #   ExecStartPre=/usr/bin/mkdir -p -m 0700 -- /opt/psiphon-3x-ui/data/%i
         execstartpre_match = re.search(
             r"^ExecStartPre\s*=\s*(\S.*)$",
             no_comments,
             re.M,
         )
         assert execstartpre_match is not None, (
-            "Phase 24 Hotfix #4 — ExecStartPre line not found in the unit "
+            "Phase 26 Hotfix #13 — ExecStartPre line not found in the unit "
             "file (test_tunnel_unit_has_execstartpre_directive guards the "
             "directive presence; this test pins its specific shape)."
         )
         execstartpre_cmd = execstartpre_match.group(1)
-        assert re.search(r"\binstall\s+-d\b", execstartpre_cmd), (
-            "Phase 24 Hotfix #4 — ExecStartPre must use `install -d` so BOTH "
-            "the per-country dir AND its (possibly-missing) parent `/opt/"
-            "psiphon-3x-ui/data` get created. Plain `mkdir` would fail when "
-            "the parent is missing — exactly the failure mode that surfaced "
-            "in the operator's post-Hotfix-#3 field report."
+        assert re.search(r"\bmkdir\s+-p\b", execstartpre_cmd), (
+            "Phase 26 Hotfix #13 — ExecStartPre must use `mkdir -p` (NOT "
+            "`install -d`). GNU coreutils `install -d` calls chown(2) "
+            "internally even without `-o`/`-g` when the parent dir has "
+            "the setgid bit (which /opt/psiphon-3x-ui does, mode 2775 "
+            "since Hotfix #12). Under `NoNewPrivileges=true` + "
+            "`ProtectSystem=strict` the CAP_CHOWN capability is stripped, "
+            "so chown fails with EACCES and the ExecStartPre aborts — "
+            "exactly the failure the operator's fresh install hit "
+            "(journald: '/usr/bin/install: cannot create directory "
+            "\\'/opt/psiphon-3x-ui/data\\': Permission denied', repeating "
+            "in a tight RestartSec=5 loop)."
+        )
+        assert re.search(r"\bmkdir\s+[^|;&]*--\s", execstartpre_cmd), (
+            "Phase 26 Hotfix #13 — ExecStartPre's `mkdir` invocation must "
+            "pass `--` to end option parsing, so a country-code beginning "
+            "with `-` (if one ever appears in countries.yaml) is treated "
+            "as a literal path component rather than a flag."
+        )
+        assert not re.search(r"\binstall\s+-d\b", execstartpre_cmd), (
+            "Phase 26 Hotfix #13 — ExecStartPre must NOT use `install -d`: "
+            "that binary's implicit chown(2) under a setgid parent fails "
+            "with EACCES under the unit's NoNewPrivileges + ProtectSystem "
+            "sandbox. Use `mkdir -p` instead."
         )
 
     def test_execstartpre_targets_per_country_data_dir_with_percent_i(self):
@@ -4250,19 +4286,37 @@ class TestHotfix17PostReleaseRegressions:
         assert execstartpre_match is not None
         execstartpre_cmd = execstartpre_match.group(1)
         assert re.search(r"-m\s+0700\b", execstartpre_cmd), (
-            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
-            "`-m 0700` so the per-country tunnel datastore dir is "
-            "owner-only (psiphon3xui). Group- or world-readable would leak "
-            "tunnel-core state (key material, server-list cache, OSL "
-            "registry) to other system users."
+            "Phase 24 Hotfix #4 + Phase 26 Hotfix #13 — ExecStartPre "
+            "`mkdir -p` (formerly `install -d`) MUST pass `-m 0700` so the "
+            "per-country tunnel datastore dir is owner-only (psiphon3xui). "
+            "Group- or world-readable would leak tunnel-core state (key "
+            "material, server-list cache, OSL registry) to other system "
+            "users."
         )
 
-    def test_execstartpre_owns_to_psiphon3xui_user_and_group(self):
-        """The pre-created dir MUST be owned by ``psiphon3xui:psiphon3xui``
-        (the service's ``User=``/``Group=``) so the subsequent ExecStart,
-        which runs as the SAME ``psiphon3xui`` identity, can write into it.
-        A mismatch would make the binary's first-run mkdir of its own
-        per-country subdirs fail with EACCES."""
+    def test_execstartpre_does_not_run_chown(self):
+        """Phase 25 Hotfix #12 + Phase 26 Hotfix #13: the `ExecStartPre`
+        must NOT pass ``-o <user>`` / ``-g <group>`` — those flags force a
+        privileged ``chown()`` syscall which the kernel rejects when the
+        unit runs as a non-root ``User=psiphon3xui``. The operator's live
+        failure was the user-visible symptom:
+
+            /usr/bin/install: cannot create directory
+            '/opt/psiphon-3x-ui/data': Permission denied
+
+        Hotfix #12 dropped the ``-o``/``-g`` args from ``install -d``;
+        Hotfix #13 then switched the pre-flight to plain ``mkdir -p``
+        entirely (``install -d`` internally invokes chown even WITHOUT
+        ``-o``/``-g`` when the parent dir is setgid — mode 2775 since
+        Hotfix #12 — and CAP_CHOWN is stripped under
+        ``NoNewPrivileges=true`` + ``ProtectSystem=strict``). ``mkdir``
+        never chowns: the new directory simply inherits the creating
+        process's uid/gid (i.e. psiphon3xui per the unit's ``User=`` /
+        ``Group=``). This regression test pins both halves of the fix:
+        no ``-o``, no ``-g``, and (per Hotfix #13) the pre-flight is
+        ``mkdir``-shaped so the "no chown" guarantee actually holds. The
+        directory is STILL made under mode 0700 to satisfy the original
+        hardening intent (no other-user read access)."""
         import re  # noqa: PLC0415
 
         text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
@@ -4275,18 +4329,33 @@ class TestHotfix17PostReleaseRegressions:
         assert execstartpre_match is not None
         execstartpre_cmd = execstartpre_match.group(1)
         # The unit's User=/Group= are literal `psiphon3xui` (no env vars in
-        # a systemd unit), so ExecStartPre must reference the same literal.
-        assert "-o psiphon3xui" in execstartpre_cmd, (
-            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
-            "`-o psiphon3xui` so the pre-created dir belongs to the service "
-            "identity (the unit's `User=psiphon3xui` is the same literal)."
+        # a systemd unit), so ExecStartPre must NOT pass -o/-g — those are
+        # privileged this process can't do without being root / having
+        # CAP_CHOWN, which we deliberately omit from the sandbox.
+        assert "-o " not in execstartpre_cmd, (
+            "Phase 25 Hotfix #12 + Phase 26 Hotfix #13 — ExecStartPre must "
+            "NOT pass `-o <owner>`: that flag invokes a privileged chown "
+            "syscall which fails with `Permission denied` when the unit "
+            "runs as a non-root User=psiphon3xui. Drop the flag."
         )
-        assert "-g psiphon3xui" in execstartpre_cmd, (
-            "Phase 24 Hotfix #4 — ExecStartPre `install -d` MUST pass "
-            "`-g psiphon3xui` so the pre-created dir's group belongs to "
-            "the service identity (the unit's `Group=psiphon3xui` is the "
-            "same literal)."
+        assert "-g " not in execstartpre_cmd, (
+            "Phase 25 Hotfix #12 + Phase 26 Hotfix #13 — ExecStartPre must "
+            "NOT pass `-g <group>`: same privileged syscall; drop the flag."
         )
+        # Hotfix #13 secondary pin: pre-flight uses `mkdir`, not `install`,
+        # so even an accidental future reintroduction of owner/group args
+        # would be a syntax error (mkdir has no -o/-g) rather than a silent
+        # chown regression.
+        assert not re.search(r"\binstall\b", execstartpre_cmd), (
+            "Phase 26 Hotfix #13 — ExecStartPre must not invoke `install` "
+            "at all (it internally chowns under a setgid parent when no "
+            "-o/-g is given). Use `mkdir -p -m 0700 --` instead; the pin "
+            "lives here as defense-in-depth next to the no-`-o`/`-g` "
+            "assertions above."
+        )
+        # The unit still has User=/Group= directives — sanity guard.
+        assert "User=psiphon3xui" in no_comments
+        assert "Group=psiphon3xui" in no_comments
 
     def test_execstartpre_runs_before_execstart(self):
         """Ordering invariant: ``ExecStartPre`` must appear BEFORE
