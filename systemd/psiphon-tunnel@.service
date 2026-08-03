@@ -69,16 +69,52 @@ Type=simple
 # ALSO needs is fragile. This Hotfix #4 makes the unit SELF-SUFFICIENT:
 # `ExecStartPre=` is a privileged pre-flight (it runs as the unit's `User=`
 # — here `psiphon3xui` — and `ReadWritePaths=/opt/psiphon-3x-ui` grants the
-# service writeBits there, so `install -d -m 0700 -o psiphon3xui -g
-# psiphon3xui` can recursively create the per-country dir + its parent).
-# This works with or without Hotfix #3's installer-side pre-create (which
-# still acts as belt-and-braces for first-time race tolerance). Idempotent:
-# `install -d` is a no-op on a pre-existing dir, so subsequent restarts
-# keep working. After this, the operator's previously-failing US tunnel
-# starts cleanly once the new unit file is dropped in +
-# `systemctl daemon-reload` runs — without re-running the installer or
-# having to `mkdir -p /opt/psiphon-3x-ui/data` by hand.
-ExecStartPre=/usr/bin/install -d -m 0700 -o psiphon3xui -g psiphon3xui /opt/psiphon-3x-ui/data/%i
+# service writeBits there, so the pre-flight can recursively create the
+# per-country dir + its parent). This works with or without Hotfix #3's
+# installer-side pre-create (which still acts as belt-and-braces for
+# first-time race tolerance). Idempotent on a pre-existing dir, so
+# subsequent restarts keep working. After this, the operator's
+# previously-failing US tunnel starts cleanly once the new unit file is
+# dropped in + `systemctl daemon-reload` runs — without re-running the
+# installer or having to `mkdir -p /opt/psiphon-3x-ui/data` by hand.
+# Phase 24 Hotfix #4's ExecStartPre shape `/usr/bin/install -d -m 0700
+# -o psiphon3xui -g psiphon3xui ...` previously specified `-o psiphon3xui
+# -g psiphon3xui` — but `install -d -o <uid> -g <gid>` ONLY succeeds when
+# the CALLER is root (chown is a privileged syscall; even with the unit's
+# `User=`->`Group=` privilege, the kernel still rejects a chown that isn't
+# executed as uid 0). When the unit ran as `User=psiphon3xui`, the
+# ExecStartPre failed with `install: cannot create directory
+# '/opt/psiphon-3x-ui/data': Permission denied`. The error is misleading —
+# the "install" program called chown before mkdir, and only then does the
+# mkdir fail. On Phase 24 Hotfix #4 it landed anyway (the operator's
+# earlier manual fix succeeded), which is why the symptom didn't surface.
+#
+# Phase 25 Hotfix #12 dropped the `-o`/`-g` args so `install -d -m 0700`
+# wouldn't call chown at all. That worked in SOME setups but the operator's
+# fresh install (Phase 26, with Hotfixes #10+#11 applied) STILL failed —
+# journald showed:
+#
+#   Aug 02 18:57:52 ali install[10644]: /usr/bin/install: cannot create
+#   directory '/opt/psiphon-3x-ui/data': Permission denied
+#
+# repeating ~14 times in a tight RestartSec=5 loop. The cause: GNU
+# coreutils `install -d` on newer Ubuntu releases internally still calls
+# chown(2) on the directory it's about to create — even when no `-o`/`-g`
+# was passed — when the target's parent has the setgid bit set (which
+# /opt/psiphon-3x-ui does, mode 2775 since Hotfix #12). With
+# `NoNewPrivileges=true` + `ProtectSystem=strict` the CAP_CHOWN capability
+# is stripped, so the syscall fails with EACCES.
+#
+# Phase 26 Hotfix #13: replace `install -d` with plain `mkdir -p`. `mkdir`
+# (also coreutils) NEVER calls chown — the new directory simply inherits
+# the creating process's uid/gid (here psiphon3xui per `User=`/`Group=`).
+# The mode `0700` is applied atomically at mkdir time (no chmod followup
+# needed). `-p` makes it idempotent across restarts and also tolerant of
+# the installer-side pre-create at panel_install.sh:454 still running as
+# root with the full `install -d -o/-g` form (which IS privileged there
+# and remains in place as belt-and-braces). `--` ends option parsing so
+# a future country code that began with `-` would be treated literally.
+ExecStartPre=/usr/bin/mkdir -p -m 0700 -- /opt/psiphon-3x-ui/data/%i
 ExecStart=/opt/psiphon-3x-ui/bin/psiphon-tunnel-core \
     -config /opt/psiphon-3x-ui/config/%i.json \
     -dataRootDirectory /opt/psiphon-3x-ui/data/%i
