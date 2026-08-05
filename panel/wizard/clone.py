@@ -93,6 +93,12 @@ class CloneEvent:
     progress: int
     inbound_id: int | None = None
     message: str = ""
+    # Phase 26: the tag 3x-ui actually assigned to the cloned inbound. The
+    # routing rule MUST reference this exact string — upstream's
+    # resolveInboundTag() only honours our requested tag when it is not
+    # already taken, otherwise it generates one (see 3x-ui
+    # internal/web/service/port_conflict.go composeInboundTag/generateInboundTag).
+    inbound_tag: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +107,7 @@ class CloneEvent:
             "status": self.status,
             "progress": int(self.progress),
             "inbound_id": self.inbound_id,
+            "inbound_tag": self.inbound_tag,
             "message": self.message,
         }
 
@@ -189,6 +196,15 @@ async def clone_country(
             message=f"clone response missing id: {clone_obj!r}",
         )
 
+    # Phase 26: extract the ACTUAL tag 3x-ui assigned (upstream's resolveInboundTag
+    # may append a collision suffix like "-2", or use "udp"/"tcpudp" instead of "tcp"
+    # — see 3x-ui internal/web/service/port_conflict.go). The routing patch must
+    # reference the real tag, not an assumed "in-{port}-tcp".
+    actual_tag = clone_obj.get("tag")
+    if not actual_tag or not isinstance(actual_tag, str):
+        # Fallback to the expected format if the response somehow lacks a tag.
+        actual_tag = f"in-{spec.public_port}-tcp"
+
     if db is not None:
         # The SSE handler pre-persists the CloneRecord row so a crash mid-batch
         # still leaves a paper trail (rollback only happens at the very end on
@@ -203,8 +219,9 @@ async def clone_country(
         status="cloned",
         progress=100,
         inbound_id=inbound_id,
+        inbound_tag=actual_tag,
         message=(
-            f"cloned inbound {inbound_id} for {spec.country_code} "
+            f"cloned inbound {inbound_id} (tag={actual_tag}) for {spec.country_code} "
             f"on public_port={spec.public_port} → socks={spec.socks_port}"
         ),
     )
@@ -232,17 +249,15 @@ async def clone_for_country(
     — never raises. ``success == True`` implies the new ``CloneRecord`` was
     committed; ``success == False`` carries a human-readable ``error``.
 
-    Hotfix #10 (Phase 25): on success the helper also enqueues a per-country
-    Xray outbound+routing patch into
-    ``/opt/psiphon-3x-ui/xray-patch-queue/`` (via
-    :func:`panel.dashboard.router._enqueue_xray_patch`). The root-side
-    applier service consumes the queue file, merges it into
-    ``/usr/local/x-ui/bin/config.json``, and restarts x-ui.service ONCE per
-    trigger. ``streamSettings.outbound`` is persisted by 3x-ui but ignored
-    by Xray core routing — that's why the direct per-inbound hint never
-    sufficed (see Hotfix #9 docblock in git history). The binding's
-    success/failure is reported back via the ``routing_error`` /
-    ``routing_applied`` keys (non-fatal — the inbound clone itself already
+    Phase 26: on success the helper also binds the new inbound to the
+    country's Psiphon SOCKS5 outbound via the supported 3x-ui Xray settings
+    API (see :func:`panel.dashboard.xray_routing.apply_country_binding`).
+    ``streamSettings.outbound`` is persisted by 3x-ui but ignored by Xray
+    core routing — without a top-level ``outbounds[]`` entry and a matching
+    ``routing.rules[]`` rule, traffic falls through to the default freedom
+    outbound and egresses on the server's own IP. The binding's
+    success/failure is reported back via the ``routing_applied`` /
+    ``routing_error`` keys (non-fatal — the inbound clone itself already
     succeeded).
     """
     from ..models import Country, PortAssignment  # local import to avoid cycles
@@ -276,28 +291,29 @@ async def clone_for_country(
     if event.status != "cloned":
         return {"inbound_id": None, "success": False, "error": event.message}
 
-    # Hotfix #10 (Phase 25): enqueue the routing binding for the root-side
-    # applier to merge into Xray's config. Local import — dashboard.router
-    # already imports this module at top-level for `clone_for_country`, so a
-    # top-level reverse import would form a cycle.
+    # Phase 26: write the outbound + routing rule through the panel's own API.
+    # The rule must reference the tag 3x-ui actually assigned to the clone —
+    # upstream's resolveInboundTag() only honours a client-supplied tag when
+    # it is still free (see 3x-ui internal/web/service/port_conflict.go).
+    inbound_tag = event.inbound_tag or f"in-{int(pa.public_port)}-tcp"
     routing_applied: bool = False
     routing_error: str | None = None
     try:
-        from ..dashboard.router import (  # noqa: PLC0415 — cycle-avoiding local
-            _enqueue_xray_patch,
+        from ..dashboard.xray_routing import (  # noqa: PLC0415 — cycle-avoiding local
+            apply_country_binding,
         )
 
-        rok, rerr = _enqueue_xray_patch(
-            "apply",
+        rok, rerr = await apply_country_binding(
+            client,
             country_row.code,
             int(pa.socks_port),
-            int(pa.public_port),
+            inbound_tag,
         )
         routing_applied = bool(rok)
         routing_error = None if rok else rerr
         if not rok:
             _log.warning(
-                "clone_for_country routing enqueue for %s failed: %s",
+                "clone_for_country routing for %s failed: %s",
                 country_row.code, rerr,
             )
     except Exception as exc:  # noqa: BLE001  defensive — never fail the clone
@@ -308,6 +324,7 @@ async def clone_for_country(
         "inbound_id": event.inbound_id,
         "success": True,
         "error": None,
+        "inbound_tag": inbound_tag,
         "routing_applied": routing_applied,
         "routing_error": routing_error,
     }

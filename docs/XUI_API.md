@@ -104,12 +104,50 @@ Notes:
   Setting `0` for both the outgoing clone payload AND the server response
   is the only valid value without a Telegram ID configured.
 
-## No JSON API for `outbounds[]` / `routing.rules[]` (Phase 25 Hotfix #10)
+## Mutating `outbounds[]` / `routing.rules[]` (Phase 26)
 
-A programmatic API to MUTATE the top-level `outbounds[]` array and the
-`routing.rules[]` array per inbound does not exist on this 3x-ui version.
-Verified by probing (POST + GET + PUT on every plausible path shape; every
-candidate URL returned HTTP 404):
+> **Correction.** This section previously asserted that no JSON API could
+> mutate the top-level `outbounds[]` / `routing.rules[]` arrays, and that
+> assertion is what motivated the Hotfix #9/#10/#11 queue+applier sidecar.
+> It was wrong. The earlier probe enumerated *per-entity* endpoints
+> (`/panel/api/xray/outbound/add`, `/panel/api/xray/routing/rule/add`, …),
+> all of which really do 404 — but it never tried the *whole-document*
+> endpoint that 3x-ui actually ships. The sidecar has been deleted.
+
+3x-ui exposes a supported Xray-settings API that reads and writes the
+entire Xray template as one document:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /panel/api/xray/` | Read the current template. Returns `{"obj": {"xraySetting": "<json string>"}}`. |
+| `POST /panel/api/xray/update` | Write it back. Form field `xraySetting` carries the full JSON document as a string. |
+
+`update` validates the candidate config before persisting, writes it to
+the `xrayTemplateConfig` row in 3x-ui's settings table, and then
+reconciles the running core itself — a gRPC hot-reload when only
+`inbounds`/`outbounds`/`routing` changed, so there is no process restart
+and no dropped connection.
+
+This is a read-modify-write API, not a patch API: fetch the document,
+splice your entries in, send the whole thing back. `panel/dashboard/
+xray_routing.py` implements that cycle.
+
+Two ordering constraints matter when splicing:
+
+* **Append outbounds, never prepend.** `outbounds[0]` is Xray's default
+  egress; prepending a country outbound would silently redirect *all*
+  unmatched traffic through it.
+* **Insert routing rules before the catch-alls.** Rules match
+  top-to-bottom, first hit wins, so a per-country rule placed after the
+  stock `bittorrent` / `geoip:private` entries still works, but one placed
+  after a broader catch-all would never fire.
+
+Because 3x-ui owns the write and the reload, the panel needs no root and
+never touches `/usr/local/x-ui/bin/config.json` — which matters, since
+that file is `root:root` mode 0600 and is regenerated from the DB anyway.
+
+The following per-entity endpoints do NOT exist on this version (all
+return HTTP 404) — use the whole-document API above instead:
 
 * `/panel/api/xray/outbound/add`, `/panel/api/xray/outbound/del`,
   `/panel/api/xray/outbound/update`
@@ -119,20 +157,6 @@ candidate URL returned HTTP 404):
 * direct xray-core `HandlerService` gRPC (the upstream protobuf surface
   that the 3x-ui panel *itself* shells into is not bound to the host:port
   the 3x-ui HTTP API listens on; not reachable from the panel process).
-
-Because the panel service runs as the unprivileged `psiphon3xui` user AND
-3x-ui installs `/usr/local/x-ui/bin/config.json` as `root:root` mode 0600
-(and regenerates it from `/etc/x-ui/x-ui.db` every time *its own* inbound
-API is touched), the panel cannot safely read or write that file directly
-either. The queue+applier sidecar documented in
-`docs/ARCHITECTURE.md` (\"Xray applier sidecar\") is the supported
-integration: the panel drops a small patch file into
-`/opt/psiphon-3x-ui/xray-patch-queue/` and a root-running
-`psiphon-xray-applier.service` (systemd `.path` unit trigger) merges it.
-
-Operators who want to force a queue drain by hand can run:
-
-    sudo systemctl start psiphon-xray-applier.service
 
 ## Where the SOCKS5 outbound lives
 
@@ -594,57 +618,41 @@ re-run `installer/firewall.sh` — the panel listens on the persisted port but
 the actual `psiphon-3x-ui.service` unit needs a restart for that to take
 effect.
 
-## Per-country routing via the queue+applier sidecar
+## Per-country routing via the Xray-settings API (Phase 26)
 
-> Phase 25 **Hotfix #9** introduced a direct config-edit flow and was
-> verified operationally to be ineffective: the panel service runs as the
-> unprivileged `psiphon3xui` user and the live
-> `/usr/local/x-ui/bin/config.json` is owned `root:root` mode 0600 — every
-> Hotfix-#9 helper call returned EACCES and the routing_result surfaced
-> empty. **Hotfix #10** replaced the direct edit with a queue+applier
-> sidecar that's split across the privilege boundary.
+> **History.** Phase 25 **Hotfix #9** tried a direct edit of
+> `/usr/local/x-ui/bin/config.json` and was verified ineffective: the panel
+> runs as the unprivileged `psiphon3xui` user and that file is `root:root`
+> mode 0600, so every call returned EACCES. **Hotfix #10/#11** replaced it
+> with a root-side queue+applier sidecar. **Phase 26** deleted the sidecar
+> outright, because the premise behind it — "3x-ui has no API for this" —
+> turned out to be false.
 
-### Why not direct edit, and why not a JSON API
+### Why not the inbound field, and why not a direct edit
 
-1. The Xray-core routing engine does NOT honour the per-inbound
-   `streamSettings.outbound` field for routing decisions — it's a
-   persisted sniffing hint. Routing happens via the top-level
-   `routing.rules[]` array, period. Clones fell back to the default
-   `freedom` outbound (`outbounds[0]`, tag=`direct`).
-2. 3x-ui ships `/usr/local/x-ui/bin/config.json` with `root:root` 0600
-   ownership and REGENERATES it from `/etc/x-ui/x-ui.db` every time the
-   3x-ui panel's own `/panel/api/inbounds/*` handlers run — the panel
-   process can neither read it nor write it, and any hypothetical write
-   would race 3x-ui's own rewrites.
-3. Probing `/panel/api/xray/outbound/add`, `/panel/api/xray/routing/rule/add`,
-   and similar candidate URLs returns HTTP 404 on this 3x-ui version — there
-   is no JSON API for top-level outbounds/routing mutation.
+1. Xray-core does NOT honour the per-inbound `streamSettings.outbound`
+   field for routing decisions. 3x-ui persists it, but routing happens via
+   the top-level `outbounds[]` + `routing.rules[]` arrays, period. Clones
+   that relied on it fell through to the default `freedom` outbound
+   (`outbounds[0]`, tag=`direct`) and egressed on the server's own IP.
+2. `/usr/local/x-ui/bin/config.json` is `root:root` 0600 and is
+   REGENERATED from the 3x-ui SQLite DB whenever 3x-ui's own
+   `/panel/api/inbounds/*` handlers run. The panel can neither read nor
+   write it, and an out-of-band write would race (and lose to) 3x-ui's own
+   regeneration.
 
-The queue+applier sidecar (see `docs/ARCHITECTURE.md` "Xray applier
-sidecar") resolves the privilege split: the panel drops a small patch
-file into `/opt/psiphon-3x-ui/xray-patch-queue/` (a directory it CAN
-write because it's group-writable + group-owned by `psiphon3xui`), and
-the root-running `psiphon-xray-applier.service` consumes it.
+Both problems disappear if 3x-ui performs the write, which is what the
+Xray-settings API does — see "Mutating `outbounds[]` / `routing.rules[]`"
+above for the endpoint pair and its ordering constraints.
 
-### What the applier writes
+### What the panel writes
 
-For every enabled country `<CODE>` with SOCKS port `<socks_port>` and
-3x-ui public port `<public_port>`, the panel enqueues a JSON patch:
+For every enabled country `<CODE>` with SOCKS port `<socks_port>`, the
+panel reads the template, splices in two entries, and sends the whole
+document back to `POST /panel/api/xray/update`.
 
-```json
-{
-  "op":           "apply",
-  "country_code": "<CODE>",
-  "socks_port":   <socks_port>,
-  "public_port":  <public_port>,
-  "inbound_tag":  "in-<public_port>-tcp"
-}
-```
-
-The root-side `xray_apply.py` helper then idempotently writes into
-`/usr/local/x-ui/bin/config.json`:
-
-**1. One outbound entry** (keyed by `tag`, never duplicated):
+**1. One outbound entry** (keyed by `tag`, never duplicated, always
+**appended** so it can't displace `outbounds[0]`):
 
 ```json
 {
@@ -658,69 +666,42 @@ The root-side `xray_apply.py` helper then idempotently writes into
 }
 ```
 
-**2. One routing rule** (inserted BEFORE the `bittorrent` / `geoip:private`
-catch-alls so Xray matches it first; never duplicated):
+**2. One routing rule** (inserted BEFORE the `bittorrent` /
+`geoip:private` catch-alls so Xray matches it first; never duplicated):
 
 ```json
 {
   "type": "field",
-  "inboundTag": ["in-<public_port>-tcp"],
+  "inboundTag": ["<actual inbound tag>"],
   "outboundTag": "psiphon-out-<CODE>"
 }
 ```
 
-On country delete / disable the panel enqueues an `op: "remove"` patch
-and the helper strips BOTH entries in one pass. The applier script
-restarts `x-ui.service` exactly once per trigger batch (only if at least
-one patch mutated the config).
+> ⚠️ **Never guess the inbound tag.** 3x-ui's `resolveInboundTag()` honours
+> a requested tag only when it's free; otherwise it appends a collision
+> suffix (`-2`) or swaps the protocol segment (`udp` / `tcpudp` instead of
+> `tcp`). A rule bound to an assumed `in-<public_port>-tcp` therefore
+> matches nothing, fails silently, and looks exactly like the original bug.
+> `clone_country` reads the tag back from the clone response
+> (`clone_obj["tag"]`) and passes it to `apply_country_binding`.
 
-### Hotfix #11 — the same patch must ALSO be written to `x-ui.db`
+On country delete / disable the panel strips BOTH entries in one pass, and
+re-cloning strips before cloning — otherwise a re-used port could inherit
+a stale rule pointing at a dead tag.
 
-Hotfix #10 (above) wrote only `/usr/local/x-ui/bin/config.json` and was
-verified **ineffective in production**. 3x-ui **regenerates** that file
-from its SQLite DB on every service start — so the `systemctl restart
-x-ui.service` that the applier issues at the end of its own run wiped the
-outbounds and routing rules it had just written. Traffic kept falling
-through to `outbounds[0]` (`freedom`/`direct`) and egressed on the
-server's own IP.
-
-The fix: the applier now patches the **source of truth** first. 3x-ui
-stores its Xray template in the `settings` table (columns `id, key,
-value`) under the key `xrayTemplateConfig` — a JSON string holding the
-top-level `outbounds[]` and `routing{}`. `installer/xray_db_apply.py`
-applies the exact same upsert/strip logic to that template, so the
-regeneration *reproduces* our entries instead of dropping them. The
-`config.json` write is retained as belt-and-braces for the
-currently-running Xray process.
-
-DB path resolution: `PSIPHON_XUI_DB_PATH` (tests) → `/usr/local/x-ui/x-ui.db`
-→ `/etc/x-ui/x-ui.db`. Writes use a `BEGIN IMMEDIATE` transaction so a
-concurrent 3x-ui write is serialised rather than lost.
-
-> ⚠️ **Helper order is load-bearing.** `xray_apply.py` unlinks the patch
-> file on every exit path, so `xray_db_apply.py` MUST run first — it
-> deliberately does not unlink. Reversing the two silently reverts this
-> hotfix (the DB helper would find no file to read, and nothing would
-> survive the restart).
+3x-ui validates the candidate document before persisting it and then
+reconciles the running core itself (gRPC hot-reload when only
+inbounds/outbounds/routing changed), so there is no restart to schedule
+and no window where the config on disk disagrees with the running core.
 
 ### See also
 
-* `panel/dashboard/router.py::_enqueue_xray_patch` — panel-side queue
-  writer (`tempfile.mkstemp` + `os.replace`; honours
-  `PSIPHON_XRAY_PATCH_QUEUE_DIR` for tests).
-* `installer/xray_applier.sh` — root-side consumer; runs
-  `xray_db_apply.py` then `xray_apply.py` per patch, then restarts x-ui
-  once.
-* `installer/xray_db_apply.py` — stdlib-only patcher for the DB's
-  `xrayTemplateConfig` (the durable write).
-* `installer/xray_apply.py` — stdlib-only JSON merger for the live
-  `config.json` (also consumes the patch file).
-* `systemd/psiphon-xray-applier.path` + `.service` — trigger + oneshot
-  runner.
-* `tests/test_dashboard.py::TestEnqueueXrayPatch` — panel-side contract
-  tests.
-* `tests/test_xray_db_apply.py` — DB-helper contract tests (apply /
-  remove / idempotency / exit codes / missing-key seeding).
-* `tests/test_hardening.py::TestHotfix23PostReleaseRegressions` — source
-  greps pinning the applier wiring.
+* `panel/dashboard/xray_routing.py` — the read-modify-write cycle
+  (`apply_country_binding` / strip helpers).
+* `panel/wizard/clone.py` — passes the real inbound tag through
+  `CloneEvent.inbound_tag`; surfaces `routing_applied` / `routing_error`.
+* `tests/test_dashboard.py` — `FakeXuiClient.get_xray_setting` /
+  `update_xray_setting` model the API for panel-side tests.
+* `tests/test_hardening.py::TestHotfix23PostReleaseRegressions` — pins the
+  sidecar as deleted so a revert can't resurrect half of it.
 

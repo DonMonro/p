@@ -291,6 +291,30 @@ def _patch_journalctl(monkeypatch):
 # ---------------------------------------------------------------------------
 # FakeXuiClient — replaces panel.dashboard.router.XuiClient.
 # ---------------------------------------------------------------------------
+def _stock_xray_template() -> dict:
+    """A minimal stand-in for 3x-ui's default ``xrayTemplateConfig``.
+
+    Carries the two pieces the routing binder cares about: a ``direct``
+    freedom outbound that MUST stay at index 0 (Xray's default egress), and
+    the stock trailing catch-all rules a per-country rule must be inserted
+    *before*.
+    """
+    return {
+        "log": {"loglevel": "warning"},
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "blocked", "protocol": "blackhole"},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"},
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
+            ],
+        },
+    }
+
+
 class FakeXuiClient:
     """Test stand-in for :class:`panel.dashboard.xui_client.XuiClient`.
 
@@ -307,6 +331,14 @@ class FakeXuiClient:
     clone_inbound_raises: type[Exception] | Exception | None = None
     clone_inbound_calls: list[tuple[int, dict, int, int]] = []
 
+    # Phase 26: the in-memory Xray template the routing binder reads/writes
+    # via get_xray_setting / update_xray_setting. Replaces the Hotfix #10
+    # queue-file stubbing — routing now goes through the panel's own API.
+    xray_template: dict | None = None
+    xray_updates: list[str] = []
+    xray_get_raises: type[Exception] | Exception | None = None
+    xray_update_raises: type[Exception] | Exception | None = None
+
     def __init__(self, base_url: str, username: str, password: str, **kwargs) -> None:
         self.base_url = base_url
         self.username = username
@@ -318,6 +350,23 @@ class FakeXuiClient:
 
     async def aclose(self) -> None:
         pass
+
+    async def get_xray_setting(self) -> dict:
+        exc = FakeXuiClient.xray_get_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake get_xray_setting")
+        if FakeXuiClient.xray_template is None:
+            FakeXuiClient.xray_template = _stock_xray_template()
+        # The real panel returns the template as a JSON *string*.
+        return {"xraySetting": json.dumps(FakeXuiClient.xray_template)}
+
+    async def update_xray_setting(self, xray_setting: str) -> dict:
+        exc = FakeXuiClient.xray_update_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake update_xray_setting")
+        FakeXuiClient.xray_updates.append(xray_setting)
+        FakeXuiClient.xray_template = json.loads(xray_setting)
+        return {"success": True}
 
     async def delete_inbound(self, inbound_id: int) -> dict:
         FakeXuiClient.delete_inbound_calls.append(int(inbound_id))
@@ -347,6 +396,10 @@ def _patch_xui_client(monkeypatch):
     FakeXuiClient.clone_inbound_result = None
     FakeXuiClient.clone_inbound_raises = None
     FakeXuiClient.clone_inbound_calls = []
+    FakeXuiClient.xray_template = None
+    FakeXuiClient.xray_updates = []
+    FakeXuiClient.xray_get_raises = None
+    FakeXuiClient.xray_update_raises = None
     from panel.dashboard import router as dashboard_router
 
     monkeypatch.setattr(dashboard_router, "XuiClient", FakeXuiClient)
@@ -1471,142 +1524,3 @@ class TestChangePanelPort:
         r = client.post("/api/dashboard/change-panel-port", json={"new_port": 31001})
         assert r.status_code == 400
         assert "US" in r.json()["detail"]
-
-
-
-class TestEnqueueXrayPatch:
-    """Phase 25 Hotfix #10 unit tests for
-    :func:`panel.dashboard.router._enqueue_xray_patch`.
-
-    Replaces the Hotfix-#9-era ``TestPsiphonXrayRoutingHelpers`` (deleted):
-    the panel no longer edits ``/usr/local/x-ui/bin/config.json`` directly
-    (the file is root:root mode 0600 and 3x-ui regenerates it from
-    ``/etc/x-ui/x-ui.db``, so the unprivileged panel process could never
-    write it anyway). Instead, the panel drops an atomic patch file into
-    ``/opt/psiphon-3x-ui/xray-patch-queue/`` and a root-running
-    systemd oneshot (``psiphon-xray-applier.service``, triggered by the
-    companion ``.path`` unit) consumes it.
-
-    Each test monkey-patches the ``PSIPHON_XRAY_PATCH_QUEUE_DIR`` env var
-    so the queue lands inside ``tmp_path``.
-    """
-
-    def _queue_dir(self, tmp_path: Path, monkeypatch) -> Path:
-        q = tmp_path / "queue"
-        monkeypatch.setenv("PSIPHON_XRAY_PATCH_QUEUE_DIR", str(q))
-        return q
-
-    def _list_patch_files(self, qdir: Path) -> list[Path]:
-        if not qdir.exists():
-            return []
-        return sorted(p for p in qdir.iterdir() if p.suffix == ".json")
-
-    def _read(self, p: Path) -> dict:
-        return json.loads(p.read_text(encoding="utf-8"))
-
-    def test_apply_writes_one_record_with_correct_shape(
-        self, monkeypatch, tmp_path
-    ):
-        """op=apply produces a single ``<CODE>-apply-<8hex>.json`` file
-        whose body matches the applier's expected schema."""
-        from panel.dashboard.router import _enqueue_xray_patch
-
-        qdir = self._queue_dir(tmp_path, monkeypatch)
-        ok, err = _enqueue_xray_patch("apply", "us", 11001, 31001)
-        assert ok, err
-        assert err == ""
-
-        files = self._list_patch_files(qdir)
-        assert len(files) == 1
-        name = files[0].name
-        assert name.startswith("US-apply-")
-        assert name.endswith(".json")
-        # Suffix after `US-apply-` must be exactly 8 lowercase hex chars.
-        core = name[len("US-apply-"):-len(".json")]
-        assert len(core) == 8
-        assert all(c in "0123456789abcdef" for c in core)
-
-        body = self._read(files[0])
-        assert body == {
-            "op": "apply",
-            "country_code": "US",
-            "socks_port": 11001,
-            "public_port": 31001,
-            "inbound_tag": "in-31001-tcp",
-        }
-
-    def test_remove_writes_one_record_with_correct_shape(
-        self, monkeypatch, tmp_path
-    ):
-        """op=remove produces a ``<CODE>-remove-<8hex>.json`` file with
-        ``op="remove"`` and the same public_port-derived inbound_tag."""
-        from panel.dashboard.router import _enqueue_xray_patch
-
-        qdir = self._queue_dir(tmp_path, monkeypatch)
-        ok, err = _enqueue_xray_patch("remove", "DE", 0, 31002)
-        assert ok, err
-
-        files = self._list_patch_files(qdir)
-        assert len(files) == 1
-        name = files[0].name
-        assert name.startswith("DE-remove-")
-        assert name.endswith(".json")
-
-        body = self._read(files[0])
-        assert body["op"] == "remove"
-        assert body["country_code"] == "DE"
-        assert body["public_port"] == 31002
-        assert body["inbound_tag"] == "in-31002-tcp"
-
-    def test_repeated_apply_for_same_country_enqueues_independent_files(
-        self, monkeypatch, tmp_path
-    ):
-        """Two consecutive apply calls for the same country MUST land as
-        TWO distinct queue files (the root-side applier is responsible for
-        last-write-wins dedup against config.json, not the panel)."""
-        from panel.dashboard.router import _enqueue_xray_patch
-
-        qdir = self._queue_dir(tmp_path, monkeypatch)
-        ok1, _ = _enqueue_xray_patch("apply", "US", 11001, 31001)
-        ok2, _ = _enqueue_xray_patch("apply", "US", 11001, 31001)
-        assert ok1 and ok2
-
-        files = self._list_patch_files(qdir)
-        assert len(files) == 2
-        # Filenames differ via the uuid8 component.
-        assert files[0].name != files[1].name
-
-    def test_queue_dir_is_created_on_first_use(self, monkeypatch, tmp_path):
-        """If the queue directory does NOT exist (e.g. pre-install or an
-        operator wiped it), _enqueue_xray_patch must create it on demand
-        rather than error. The applier's .path unit watches the same dir."""
-        from panel.dashboard.router import _enqueue_xray_patch
-
-        qdir = tmp_path / "fresh" / "queue" / "dir"
-        monkeypatch.setenv("PSIPHON_XRAY_PATCH_QUEUE_DIR", str(qdir))
-        assert not qdir.exists()
-
-        ok, err = _enqueue_xray_patch("apply", "JP", 11003, 31003)
-        assert ok, err
-        assert qdir.is_dir()
-        assert len(self._list_patch_files(qdir)) == 1
-
-    def test_enqueue_returns_error_when_parent_unwritable(
-        self, monkeypatch, tmp_path
-    ):
-        """If the queue directory's parent cannot be created (e.g. blocked
-        by a FILE of the same name), the helper returns (False, <err>) and
-        NEVER raises — graceful degradation is the contract; the caller
-        surfaces this via ``routing_result`` on the HTTP response."""
-        from panel.dashboard.router import _enqueue_xray_patch
-
-        blocker = tmp_path / "blocker"
-        blocker.write_text("not a directory", encoding="utf-8")
-        monkeypatch.setenv(
-            "PSIPHON_XRAY_PATCH_QUEUE_DIR",
-            str(blocker / "queue"),
-        )
-
-        ok, err = _enqueue_xray_patch("apply", "US", 11001, 31001)
-        assert ok is False
-        assert "mkdir" in err.lower() or "queue" in err.lower()

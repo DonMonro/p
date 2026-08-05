@@ -32,26 +32,20 @@
 //       units, and the verb scope means it cannot enable/mask/reload them.
 //
 //   (3) The 3x-ui panel's own systemd unit `x-ui.service` — restricted to
-//       the `restart` verb only. Hotfix #10 (Phase 25) moved the actual
-//       restart invocation out of the panel: the new root-side
-//       psiphon-xray-applier.service performs the restart after merging the
-//       per-country outbound+routing patch into
-//       /usr/local/x-ui/bin/config.json. The panel's `_restart_xui_service`
-//       helper is retained for legacy callers (e.g. change_panel_port's
-//       end-of-request bounce) but is no longer the code-path that applies
-//       per-country routing.
+//       the `restart` verb only, so that change_panel_port's end-of-request
+//       bounce can take effect. Per-country Xray routing does NOT use this
+//       path: see the Phase 26 note below.
 //
-//   (4) The root-side Xray applier — `psiphon-xray-applier.service`,
-//       restricted to the `start` verb only. The .path unit
-//       (psiphon-xray-applier.path) normally triggers this on every queue
-//       write, so an explicit `systemctl start` is belt-and-braces for
-//       operators who want to force a drain after a manual config edit
-//       (``systemctl start psiphon-xray-applier.service`` is the exact
-//       recovery action docs/TROUBLESHOOTING.md directive mentions).
+// Phase 26 note: the Hotfix-#9/#10/#11 Xray-patch applier sidecar
+// (psiphon-xray-applier.{path,service}) and its polkit grant have been
+// removed. The panel now writes per-country Xray outbound+routing through
+// 3x-ui's own supported Xray-settings API (POST /panel/api/xray/ to read
+// the template, POST /panel/api/xray/update to validate + persist +
+// hot-reload). 3x-ui reconciles the running core itself, so no root-side
+// unit, no config.json edit, and no polkit escalation are needed for it.
 //
 // The panel can NEVER start/stop arbitrary units. Only its own tunnel fleet
-// plus its own unit restart plus the 3x-ui panel restart plus the Xray
-// applier force-start are authorised.
+// plus its own unit restart plus the 3x-ui panel restart are authorised.
 //
 // The rule is JavaScript (polkit's native rules language) and runs inside
 // polkitd's JS interpreter. The numerical prefix `49-` keeps it ahead of
@@ -89,14 +83,10 @@ polkit.addRule(function(action, subject) {
     var isFleet = unitStr.startsWith("psiphon-tunnel@");
     var isPanelSelf = unitStr === "psiphon-3x-ui.service";
     var isXuiSelf = unitStr === "x-ui.service";
-    var isXrayApplier = unitStr === "psiphon-xray-applier.service";
-    if (!isFleet && !isPanelSelf && !isXuiSelf && !isXrayApplier) {
+    if (!isFleet && !isPanelSelf && !isXuiSelf) {
         return polkit.Result.NOT_HANDLED;
     }
     if ((isPanelSelf || isXuiSelf) && verb !== "restart") {
-        return polkit.Result.NOT_HANDLED;
-    }
-    if (isXrayApplier && verb !== "start") {
         return polkit.Result.NOT_HANDLED;
     }
 

@@ -119,6 +119,30 @@ def _set_wizard_step(client: TestClient, step: str, *, step_data: dict | None = 
 # ---------------------------------------------------------------------------
 # FakeXuiClient — replaces panel.wizard.router.XuiClient for endpoint tests.
 # ---------------------------------------------------------------------------
+def _stock_xray_template() -> dict:
+    """A minimal stand-in for 3x-ui's default ``xrayTemplateConfig``.
+
+    Carries the two pieces the routing binder cares about: a ``direct``
+    freedom outbound that MUST stay at index 0 (Xray's default egress), and
+    the stock trailing catch-all rules a per-country rule must be inserted
+    *before*.
+    """
+    return {
+        "log": {"loglevel": "warning"},
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "blocked", "protocol": "blackhole"},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"},
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
+            ],
+        },
+    }
+
+
 class FakeXuiClient:
     """Async stand-in matching :class:`XuiClient`'s constructor + methods.
 
@@ -142,6 +166,15 @@ class FakeXuiClient:
     deleted: list[int] = []
     clone_calls: list[tuple[int, str, int, int]] = []  # (template_id, code, socks, public)
 
+    # Phase 26: the in-memory Xray template the routing binder reads/writes
+    # through get_xray_setting / update_xray_setting. Starts as a minimal
+    # stock 3x-ui config; every successful update_xray_setting replaces it,
+    # so tests can assert on the accumulated outbounds[] / routing.rules[].
+    xray_template: dict | None = None
+    xray_updates: list[str] = []
+    xray_get_raises: type[Exception] | Exception | None = None
+    xray_update_raises: type[Exception] | Exception | None = None
+
     def __init__(self, base_url: str, username: str, password: str, **kwargs) -> None:
         self.base_url = base_url
         self.username = username
@@ -153,6 +186,23 @@ class FakeXuiClient:
 
     async def aclose(self) -> None:
         FakeXuiClient.closed = True
+
+    async def get_xray_setting(self) -> dict:
+        exc = FakeXuiClient.xray_get_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake get_xray_setting")
+        if FakeXuiClient.xray_template is None:
+            FakeXuiClient.xray_template = _stock_xray_template()
+        # The real panel hands back the template as a JSON *string*.
+        return {"xraySetting": json.dumps(FakeXuiClient.xray_template)}
+
+    async def update_xray_setting(self, xray_setting: str) -> dict:
+        exc = FakeXuiClient.xray_update_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake update_xray_setting")
+        FakeXuiClient.xray_updates.append(xray_setting)
+        FakeXuiClient.xray_template = json.loads(xray_setting)
+        return {"success": True}
 
     async def clone_inbound(
         self,
@@ -192,6 +242,10 @@ def _patch_xui_client(monkeypatch):
     FakeXuiClient.delete_inbound_raises = None
     FakeXuiClient.deleted = []
     FakeXuiClient.clone_calls = []
+    FakeXuiClient.xray_template = None
+    FakeXuiClient.xray_updates = []
+    FakeXuiClient.xray_get_raises = None
+    FakeXuiClient.xray_update_raises = None
     from panel.wizard import router as router_mod
 
     monkeypatch.setattr(router_mod, "XuiClient", FakeXuiClient)
@@ -334,12 +388,15 @@ class TestCloneDataclasses:
             spec.country_code = "DE"  # type: ignore[misc]
 
     def test_clone_event_as_dict_shape(self):
+        # Phase 26: ``inbound_tag`` carries the tag 3x-ui actually assigned so
+        # the routing rule can reference it verbatim.
         ev = CloneEvent(
             country_code="US",
             status="cloned",
             progress=100,
             inbound_id=31002,
             message="cloned inbound 31002 for US",
+            inbound_tag="in-31002-tcp",
         )
         d = ev.as_dict()
         assert d == {
@@ -348,8 +405,14 @@ class TestCloneDataclasses:
             "status": "cloned",
             "progress": 100,
             "inbound_id": 31002,
+            "inbound_tag": "in-31002-tcp",
             "message": "cloned inbound 31002 for US",
         }
+
+    def test_clone_event_inbound_tag_defaults_to_none(self):
+        ev = CloneEvent(country_code="US", status="working", progress=0)
+        assert ev.inbound_tag is None
+        assert ev.as_dict()["inbound_tag"] is None
 
     def test_clone_event_failed_has_null_inbound_id(self):
         ev = CloneEvent(
@@ -570,19 +633,10 @@ class TestCloneEndpoint:
     def test_clone_happy_stream_advances_to_done_and_flips_wizard_completed(
         self, clone_client, monkeypatch
     ):
-        # Hotfix #10 (Phase 25): stub the ENQUEUE helper so the SSE handler's
-        # per-country routing records are emitted deterministically (and so
-        # the test never writes to the real queue dir). The Hotfix-#9
-        # direct-file-write helper was deleted; this stub stands in for the
-        # root-side applier trigger.
-        from panel.dashboard import router as _dr
-
-        monkeypatch.setattr(
-            _dr,
-            "_enqueue_xray_patch",
-            lambda op, code, socks, public: (True, ""),
-        )
-
+        # Phase 26: routing now goes through the panel's own Xray settings API
+        # (get_xray_setting / update_xray_setting on the client), which
+        # FakeXuiClient implements against an in-memory template — so there is
+        # nothing left to stub here.
         _advance_to_clone(clone_client)
         # Default FakeXuiClient clone_inbound returns per-public-port ids.
         with clone_client.stream("POST", "/api/wizard/clone") as r:
@@ -617,6 +671,86 @@ class TestCloneEndpoint:
         assert summary["rolled_back"] == []
         assert summary["wizard_state"]["current_step"] == "done"
         assert summary["wizard_state"]["is_completed"] is True
+
+    def test_clone_writes_outbound_and_routing_rule_per_country(
+        self, clone_client, monkeypatch
+    ):
+        """Phase 26 regression: the batch clone must leave the Xray template
+        carrying ONE socks outbound + ONE routing rule per country.
+
+        Before this fix only the inbound was created — no ``outbounds[]``
+        entry and no ``routing.rules[]`` rule existed, so Xray fell through to
+        the default freedom outbound and every user egressed on the server's
+        own IP regardless of which country they picked.
+        """
+        _advance_to_clone(clone_client)
+        with clone_client.stream("POST", "/api/wizard/clone") as r:
+            assert r.status_code == 200
+            events = _parse_sse_stream(r)
+
+        # The panel must have actually POSTed the template back (once per
+        # country — each write adds that country's pair).
+        assert len(FakeXuiClient.xray_updates) == 3
+
+        template = FakeXuiClient.xray_template
+        assert template is not None
+        by_tag = {o["tag"]: o for o in template["outbounds"]}
+        rules = template["routing"]["rules"]
+
+        for code, socks in (("DE", 11001), ("JP", 11002), ("US", 11003)):
+            out_tag = f"psiphon-out-{code}"
+            assert out_tag in by_tag, f"no outbound for {code}"
+            ob = by_tag[out_tag]
+            assert ob["protocol"] == "socks"
+            server = ob["settings"]["servers"][0]
+            assert server["address"] == "127.0.0.1"
+            assert server["port"] == socks
+
+            matching = [r for r in rules if r.get("outboundTag") == out_tag]
+            assert len(matching) == 1, f"expected exactly one rule for {code}"
+            rule = matching[0]
+            assert rule["type"] == "field"
+            # The rule must reference the tag the panel reported for the clone.
+            tag_event = next(
+                e for e in events if e["country"] == code and e["status"] == "routing"
+            )
+            assert rule["inboundTag"] == [tag_event["inbound_tag"]]
+
+        # The freedom outbound stays FIRST — Xray uses outbounds[0] as the
+        # default egress for traffic no rule matched.
+        assert template["outbounds"][0]["tag"] == "direct"
+        # Per-country rules precede the stock catch-alls (first match wins).
+        first_catch_all = next(
+            i for i, r in enumerate(rules) if r.get("outboundTag") == "blocked"
+        )
+        last_country = max(
+            i for i, r in enumerate(rules) if str(r.get("outboundTag", "")).startswith("psiphon-out-")
+        )
+        assert last_country < first_catch_all
+
+    def test_clone_routing_failure_is_non_fatal(self, clone_client, monkeypatch):
+        """A routing write that fails must NOT unwind the clone — the inbound
+        already exists, so the failure surfaces as a ``routing_failed`` record
+        while the batch still completes."""
+        from panel.dashboard.xui_client import XuiClientError
+
+        FakeXuiClient.xray_update_raises = XuiClientError("template rejected")
+
+        _advance_to_clone(clone_client)
+        with clone_client.stream("POST", "/api/wizard/clone") as r:
+            assert r.status_code == 200
+            events = _parse_sse_stream(r)
+
+        routing = [e for e in events if e["status"].startswith("routing")]
+        assert len(routing) == 3
+        assert all(e["status"] == "routing_failed" for e in routing)
+        assert all("template rejected" in e["message"] for e in routing)
+        # The clones themselves survived and the wizard still completed.
+        assert [e["status"] for e in events if e["status"] == "cloned"] == [
+            "cloned"
+        ] * 3
+        assert events[-1]["status"] == "done"
+        assert events[-1]["rolled_back"] == []
 
         # Settings row + wizard row persisted the finalize flip.
         from sqlalchemy.orm import Session

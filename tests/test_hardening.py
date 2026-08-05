@@ -5796,127 +5796,79 @@ class TestHotfix22PostReleaseRegressions:
     falls back to the default ``freedom`` outbound (``outbounds[0]``
     tag=``direct``).
 
-    The fix (this Hotfix) edits ``/usr/local/x-ui/bin/config.json``
-    directly to inject:
+    The fix has been through three designs. Hotfix #9 edited
+    ``/usr/local/x-ui/bin/config.json`` in-process (EACCES — the file is
+    root:root 0600). Hotfix #10/#11 queued patches for a root-side applier
+    sidecar. Phase 26 replaced both with 3x-ui's own supported Xray-settings
+    API, which injects the same two things but with validation + hot-reload
+    and without any privilege escalation:
 
     1. One SOCKS outbound per enabled country, keyed by
-       ``tag == "psiphon-out-<CODE>"``.
+       ``tag == "psiphon-out-<CODE>"``, APPENDED so ``outbounds[0]``
+       (the default egress) stays put.
     2. One routing rule per enabled country, keyed by
-       ``inboundTag == ["in-<public_port>-tcp"]`` →
+       ``inboundTag == [<the tag 3x-ui actually assigned>]`` →
        ``outboundTag == "psiphon-out-<CODE>"``, inserted BEFORE the
        existing ``bittorrent``/``geoip:private`` catch-alls.
-    3. ``systemctl restart x-ui.service`` so Xray picks up the new config.
 
-    These grep tests pin the static contract; the behavioural unit tests
-    for the idempotent apply/remove helpers live in
-    ``tests/test_dashboard.py::TestPsiphonXrayRoutingHelpers``.
+    These grep tests pin the static contract; the behavioural tests live in
+    ``tests/test_xray_routing.py`` and the clone/dashboard suites.
     """
 
     PANEL_ROOT = Path(__file__).resolve().parents[1] / "panel"
 
-    # NOTE (Hotfix #10 / Phase 25): the original Hotfix-#9 grep tests in
-    # this class referenced
-    # ``_apply_psiphon_xray_outbound_and_rule`` /
-    # ``_remove_psiphon_xray_outbound_and_rule`` /
-    # the panel's old direct-write behaviour. Those helpers were DELETED by
-    # Hotfix #10 in favour of the queue+applier sidecar
-    # (``_enqueue_xray_patch``). The rewritten greps live in
-    # ``TestHotfix23PostReleaseRegressions`` (below) to keep the "what
-    # shipped" / "how it's wired" contracts separable per-hotfix.
+    # NOTE (Phase 26): the Hotfix-#9 direct-edit helpers
+    # (``_apply_psiphon_xray_outbound_and_rule`` /
+    # ``_remove_psiphon_xray_outbound_and_rule``) and their Hotfix-#10
+    # queue-based successor (``_enqueue_xray_patch``) have all been deleted.
+    # The current greps live in ``TestHotfix23PostReleaseRegressions``
+    # (below), which also pins that the sidecar stays removed.
+
 
 class TestHotfix23PostReleaseRegressions:
-    """Static-source grep tests for Phase 25 Hotfix #10 — the queue+applier
-    sidecar that ACTUALLY applies the per-country Xray outbound+routing
-    binding Hotfix #9 set out to write.
+    """Static-source grep tests for Phase 26 — per-country Xray routing bound
+    through 3x-ui's OWN supported Xray-settings API.
 
-    Hotfix #9 introduced `_apply_psiphon_xray_outbound_and_rule` /
-    `_remove_psiphon_xray_outbound_and_rule` on `panel/dashboard/router.py`
-    which attempted to read+write `/usr/local/x-ui/bin/config.json` in-process.
-    The operator verified on a live install that the file is owned
-    `root:root` mode 0600 (NOT group-readable) and that the unprivileged
-    `psiphon3xui` panel user cannot even READ it — every helper call
-    silently returned EACCES and surfaced an empty `routing_result` payload.
+    The underlying defect (originally Hotfix #9) is unchanged and worth
+    restating, because it is the whole reason this class exists: a cloned
+    inbound's ``streamSettings.outbound`` IS persisted by 3x-ui but is NOT
+    honoured by Xray core. Xray decides egress by matching the top-level
+    ``routing.rules[]`` on ``inboundTag``; without a matching rule + a
+    top-level ``outbounds[]`` entry, every country's traffic falls through
+    to ``outbounds[0]`` (the ``direct``/freedom outbound) and leaves on the
+    server's own IP.
 
-    Hotfix #10 replaces the in-process edit with a cross-privilege queue +
-    root-side oneshot systemd service. These greps pin the wiring.
+    Hotfix #9 tried to fix that by editing ``/usr/local/x-ui/bin/config.json``
+    in-process; that file is ``root:root`` mode 0600 so the unprivileged
+    panel user got EACCES every time. Hotfix #10/#11 then routed the edit
+    through a root-side queue+applier sidecar. Phase 26 retires all of it:
+    ``POST /panel/api/xray/`` reads the template and ``POST
+    /panel/api/xray/update`` validates + persists + hot-reloads it, so the
+    panel needs no root, no systemd units, and never races 3x-ui's own
+    regeneration of ``config.json`` from ``/etc/x-ui/x-ui.db``.
+
+    These greps pin the wiring; the behavioural tests live in
+    ``tests/test_xray_routing.py`` (pure transforms) and the clone/dashboard
+    suites (end-to-end through the fake panel).
     """
 
     REPO_ROOT = Path(__file__).resolve().parents[1]
     PANEL_ROOT = REPO_ROOT / "panel"
 
-    def test_applier_path_unit_ships_and_watches_queue_dir(self):
-        """``systemd/psiphon-xray-applier.path`` must exist (shipped by the
-        installer) and ``PathChanged=`` must point at the panel's queue
-        directory so the path unit edge-triggers on each new patch file."""
-        p = self.REPO_ROOT / "systemd" / "psiphon-xray-applier.path"
-        assert p.exists(), f"missing {p}"
-        text = p.read_text(encoding="utf-8")
-        assert "[Path]" in text
-        assert (
-            "PathChanged=/opt/psiphon-3x-ui/xray-patch-queue" in text
-        )
-        assert "WantedBy=multi-user.target" in text
+    def test_panel_router_uses_api_routing_not_legacy_helpers(self):
+        """``panel/dashboard/router.py`` must bind routing through the
+        supported Xray settings API, not the deleted Hotfix-#9 direct-edit
+        helpers nor the Hotfix-#10 queue sidecar.
 
-    def test_applier_service_unit_runs_applier_script(self):
-        """``systemd/psiphon-xray-applier.service`` must exist, run the
-        bash driver via ExecStart, and have [Install] so it can be enabled
-        alongside the .path unit."""
-        p = self.REPO_ROOT / "systemd" / "psiphon-xray-applier.service"
-        assert p.exists(), f"missing {p}"
-        text = p.read_text(encoding="utf-8")
-        assert "Type=oneshot" in text
-        assert "User=root" in text
-        assert (
-            "ExecStart=/usr/local/libexec/psiphon-3x-ui/xray-applier.sh"
-            in text
-        )
-
-    def test_applier_script_uses_flock_and_invokes_python_helper(self):
-        """``installer/xray_applier.sh`` must serialise concurrent runs
-        via flock on a known lockfile path and invoke the python helper
-        for each queued patch."""
-        p = self.REPO_ROOT / "installer" / "xray_applier.sh"
-        assert p.exists(), f"missing {p}"
-        text = p.read_text(encoding="utf-8")
-        assert "flock -x 9" in text
-        assert "/opt/psiphon-3x-ui/xray-applier.lock" in text
-        assert "xray_apply.py" in text
-        assert 'systemctl restart "${XUI_SERVICE_NAME}"' in text or (
-            "systemctl restart" in text and "x-ui.service" in text
-        )
-
-    def test_xray_apply_py_has_outbound_tag_and_rule_shape(self):
-        """``installer/xray_apply.py`` must reference the per-country
-        outbound tag pattern AND the inboundTag rule shape so the applier
-        writes the exact keys Hotfix #9 documented."""
-        p = self.REPO_ROOT / "installer" / "xray_apply.py"
-        assert p.exists(), f"missing {p}"
-        text = p.read_text(encoding="utf-8")
-        assert 'f"psiphon-out-{code}"' in text
-        assert '"inboundTag"' in text
-        assert '"outboundTag"' in text
-        assert '"type": "field"' in text or "'type': 'field'" in text or (
-            '"type": "field"' in text.replace("'", '"')
-        )
-        # Stdlib-only assurance: no pydantic / sqlalchemy IMPORTS (the
-        # docstring legitimately mentions them by name in the "no pydantic
-        # / no sqlalchemy / no panel imports" rationale — match actual
-        # import statements only).
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("import ", "from ")):
-                assert "pydantic" not in stripped
-                assert "sqlalchemy" not in stripped
-
-    def test_panel_router_uses_enqueue_not_legacy_apply(self):
-        """``panel/dashboard/router.py`` must NO LONGER call
-        ``_apply_psiphon_xray_outbound_and_rule`` (the deleted direct-edit
-        helper) anywhere in its body; the enqueue helper must be the only
-        write path used by patch_country / reclone_country / delete_country."""
+        Phase 26: every handler that can leave a country's routing stale
+        (``patch_country`` on disable, ``reclone_country``,
+        ``delete_country``) must call ``remove_country_binding`` so no rule
+        is left pointing at an inbound that no longer exists.
+        """
         text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
         assert "_apply_psiphon_xray_outbound_and_rule(" not in text
         assert "_remove_psiphon_xray_outbound_and_rule(" not in text
-        # Spot-check each wired handler references the new helper.
+        assert "from .xray_routing import remove_country_binding" in text
         for fn in ("patch_country", "reclone_country", "delete_country"):
             m = re.search(
                 rf"async\s+def\s+{fn}\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
@@ -5924,62 +5876,111 @@ class TestHotfix23PostReleaseRegressions:
                 flags=re.DOTALL,
             )
             assert m, f"{fn} handler missing"
-            assert "_enqueue_xray_patch(" in m.group(0), (
-                f"{fn} does not call _enqueue_xray_patch"
+            body = m.group(0)
+            assert "remove_country_binding(" in body, (
+                f"{fn} does not strip the country's Xray routing binding"
+            )
+            assert "_enqueue_xray_patch(" not in body, (
+                f"{fn} still uses the superseded queue sidecar"
             )
 
-    def test_panel_clone_helper_uses_enqueue(self):
-        """``panel/wizard/clone.py``'s clone_for_country must call the new
-        enqueue helper (the wizard batch path in panel/wizard/router.py
-        uses the same helper)."""
+    def test_panel_clone_helper_binds_routing_via_api(self):
+        """``panel/wizard/clone.py``'s clone_for_country must apply the
+        per-country outbound + routing rule through
+        ``apply_country_binding`` (the Xray settings API), keyed on the tag
+        3x-ui actually assigned to the new inbound."""
         text = (self.PANEL_ROOT / "wizard" / "clone.py").read_text(encoding="utf-8")
-        assert "_enqueue_xray_patch(" in text
+        assert "apply_country_binding(" in text
+        assert "_enqueue_xray_patch(" not in text
         assert "_apply_psiphon_xray_outbound_and_rule(" not in text
+        # The clone must surface the panel-assigned tag rather than assuming
+        # "in-<port>-tcp" — upstream's resolveInboundTag() may hand back a
+        # collision-suffixed or udp/tcpudp variant.
+        assert 'clone_obj.get("tag")' in text
+        assert "inbound_tag" in text
 
-    def test_wizard_router_batch_clone_uses_enqueue(self):
-        """The wizard's batch-clone SSE handler must enqueue per-country
-        patches; routing failures remain non-fatal (``routing_failed`` SSE
-        status is still emitted)."""
+    def test_wizard_router_batch_clone_binds_routing_via_api(self):
+        """The wizard's batch-clone SSE handler must bind each country's
+        routing through the API using the tag from the clone event; routing
+        failures remain non-fatal (``routing_failed`` SSE status)."""
         text = (self.PANEL_ROOT / "wizard" / "router.py").read_text(encoding="utf-8")
-        assert "_enqueue_xray_patch(" in text
+        assert "apply_country_binding(" in text
+        assert "_enqueue_xray_patch(" not in text
         assert '"routing_failed"' in text
+        assert "clone_event.inbound_tag" in text
 
-    def test_panel_install_installs_applier_bits_and_enables_path_unit(self):
-        """``installer/panel_install.sh`` must install the two new systemd
-        units + the bash driver + the python helper, create the queue dir,
-        and enable+start the .path unit."""
-        p = self.REPO_ROOT / "installer" / "panel_install.sh"
-        assert p.exists()
-        text = p.read_text(encoding="utf-8")
-        assert "installer/xray_applier.sh" in text
-        assert "installer/xray_apply.py" in text
-        assert "systemd/psiphon-xray-applier.path" in text
-        assert "systemd/psiphon-xray-applier.service" in text
-        assert "/opt/psiphon-3x-ui/xray-patch-queue" in text
-        assert (
-            "systemctl enable --now psiphon-xray-applier.path" in text
+    def test_xui_client_exposes_xray_settings_endpoints(self):
+        """``panel/dashboard/xui_client.py`` must call the upstream 3x-ui
+        Xray-settings endpoints — ``POST /panel/api/xray/`` to read the
+        template and ``POST /panel/api/xray/update`` (form field
+        ``xraySetting``) to write it.
+
+        These are the supported API that made the root-side sidecar
+        unnecessary; a regression here would silently strand the panel back
+        on inbound-only creation.
+        """
+        text = (self.PANEL_ROOT / "dashboard" / "xui_client.py").read_text(encoding="utf-8")
+        assert "async def get_xray_setting" in text
+        assert "async def update_xray_setting" in text
+        assert '"panel/api/xray/"' in text
+        assert '"panel/api/xray/update"' in text
+        assert '"xraySetting"' in text
+
+    def test_sidecar_queue_and_applier_are_fully_removed(self):
+        """Phase 26: the Hotfix #9/#10/#11 queue+applier sidecar must be GONE.
+
+        Its whole reason for existing was the belief that no JSON API could
+        write ``outbounds[]`` / ``routing.rules[]``. 3x-ui does expose one
+        (``POST /panel/api/xray/`` + ``POST /panel/api/xray/update``), so the
+        privileged sidecar is now dead weight AND a liability: it patched
+        root-owned ``config.json`` out-of-band from 3x-ui's own DB, which
+        3x-ui then regenerated. Leaving it installed would race the API path.
+
+        Pinned so a future revert cannot resurrect half of it: no shipped
+        files, no installer wiring, no panel-side enqueue helpers.
+        """
+        for rel in (
+            "installer/xray_applier.sh",
+            "installer/xray_apply.py",
+            "installer/xray_db_apply.py",
+            "systemd/psiphon-xray-applier.path",
+            "systemd/psiphon-xray-applier.service",
+            "tests/test_xray_db_apply.py",
+        ):
+            assert not (self.REPO_ROOT / rel).exists(), f"{rel} should be deleted"
+
+        install_sh = (self.REPO_ROOT / "installer" / "panel_install.sh").read_text(
+            encoding="utf-8"
         )
+        for needle in (
+            "installer/xray_applier.sh",
+            "installer/xray_apply.py",
+            "installer/xray_db_apply.py",
+            "systemd/psiphon-xray-applier.path",
+            "systemd/psiphon-xray-applier.service",
+            "systemctl enable --now psiphon-xray-applier.path",
+            "/usr/local/libexec/psiphon-3x-ui",
+        ):
+            assert needle not in install_sh, f"panel_install.sh still wires {needle}"
+        # The queue dir must not be created any more (the bare
+        # /opt/psiphon-3x-ui parent for panel.db is still expected).
+        assert "xray-patch-queue" not in install_sh
 
-    def test_enqueue_xray_patch_helper_atomic_write_pattern(self):
-        """``_enqueue_xray_patch`` must write the patch file with
-        ``tempfile.mkstemp`` in the queue dir followed by ``os.replace``
-        (rename) so inotify only ever publishes fully-formed files."""
-        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
-        m = re.search(
-            r"def\s+_enqueue_xray_patch\b.*?(?=\ndef\s|\nclass\s|\n@router|\Z)",
-            text,
-            flags=re.DOTALL,
-        )
-        assert m, "_enqueue_xray_patch helper missing"
-        body = m.group(0)
-        assert "tempfile.mkstemp(" in body
-        assert "os.replace(" in body
-        assert "PSIPHON_XRAY_PATCH_QUEUE_DIR" in text
+        router = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        for needle in (
+            "def _enqueue_xray_patch",
+            "def _xray_patch_queue_dir",
+            "def _restart_xui_service",
+            "PSIPHON_XRAY_PATCH_QUEUE_DIR",
+        ):
+            assert needle not in router, f"router.py still defines {needle}"
 
-    def test_polkit_rules_authorises_xray_applier_start(self):
-        """polkit rule must ALSO authorise ``systemctl start
-        psiphon-xray-applier.service`` for the panel service user
-        (belt-and-braces alongside the .path unit's auto-trigger)."""
+    def test_polkit_rules_no_longer_authorise_xray_applier(self):
+        """The polkit rule must not authorise the deleted applier unit.
+
+        A stale grant would let the panel user start a unit that no longer
+        exists — harmless in practice but a lingering privilege reference.
+        """
         p = self.REPO_ROOT / "systemd" / "49-psiphon-3x-ui.rules"
         text = p.read_text(encoding="utf-8")
-        assert "psiphon-xray-applier.service" in text
+        assert "psiphon-xray-applier.service" not in text

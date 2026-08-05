@@ -272,6 +272,51 @@ class XuiClient:
         data = await self._require_ok(r, what=f"delete_inbound({inbound_id})")
         return data
 
+    async def get_xray_setting(self) -> dict:
+        """Fetch the current Xray configuration template.
+
+        Returns the response from POST /panel/api/xray/ which includes:
+        - xraySetting: the xrayTemplateConfig JSON string
+        - inboundTags: array of existing inbound tags
+        - outboundTestUrl: the test URL
+        - (optionally) subscriptionOutbounds and subscriptionOutboundTags
+
+        Phase 26: this is the supported API for reading the Xray config
+        template (the source of truth that 3x-ui uses to regenerate
+        config.json). Replaces the root-privileged DB read in Hotfix #11.
+        """
+        r = await self._client.post(
+            self.base_url + "panel/api/xray/",
+            headers=self._headers(),
+        )
+        data = await self._require_ok(r, what="get_xray_setting")
+        return data.get("obj") or {}
+
+    async def update_xray_setting(self, xray_setting: str) -> dict:
+        """Update the Xray configuration template and live-reload Xray.
+
+        Args:
+            xray_setting: The new xrayTemplateConfig JSON string (top-level
+                object with outbounds[], routing{}, log{}, etc.).
+
+        The upstream endpoint (POST /panel/api/xray/update) accepts a
+        form-encoded field 'xraySetting', persists it to the DB setting
+        'xrayTemplateConfig', and restarts/hot-reloads the running Xray core
+        (via gRPC when only inbounds/outbounds/routing changed, with a full
+        restart otherwise).
+
+        Phase 26: this is the supported API for updating the Xray config
+        template. Replaces the root-privileged DB+config.json sidecar from
+        Hotfix #10/#11.
+        """
+        r = await self._client.post(
+            self.base_url + "panel/api/xray/update",
+            data={"xraySetting": xray_setting},
+            headers=self._headers(),
+        )
+        data = await self._require_ok(r, what="update_xray_setting")
+        return data
+
     # ------------------------------------------------------------------
     # clone engine (VLESS v1)
     # ------------------------------------------------------------------
