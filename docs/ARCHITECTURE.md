@@ -101,17 +101,50 @@ the root-owned on-disk config:
    driver:
    * flock -x 9's `/opt/psiphon-3x-ui/xray-applier.lock` so two
      appliers never race config.json.
-   * Iterates pending `*.json` in sorted order and hands each to
-     `/usr/local/libexec/psiphon-3x-ui/xray_apply.py` (stdlib-only — no
-     venv needed at install-time).
+   * Iterates pending `*.json` in sorted order and hands each to TWO
+     stdlib-only helpers (no venv needed at install-time), **in this
+     order**:
+     1. `/usr/local/libexec/psiphon-3x-ui/xray_db_apply.py` — patches the
+        `xrayTemplateConfig` row in 3x-ui's SQLite DB.
+     2. `/usr/local/libexec/psiphon-3x-ui/xray_apply.py` — patches the live
+        `/usr/local/x-ui/bin/config.json` **and consumes (unlinks) the
+        patch file**.
    * After ALL patches are processed, runs `systemctl restart
-     x-ui.service` exactly once IF at least one patch mutated the config
-     (the helper exits 0 = mutated / 10 = idempotent-no-op, so the
-     restart is skipped on pure re-apply storms).
+     x-ui.service` exactly once IF at least one patch mutated the DB or
+     the config (each helper exits 0 = mutated / 10 = idempotent-no-op, so
+     the restart is skipped on pure re-apply storms).
+
+##### Why BOTH targets are patched (Hotfix #11)
+
+Hotfix #10 patched only `config.json` and was verified **ineffective in
+production**: 3x-ui **regenerates** `/usr/local/x-ui/bin/config.json` from
+its SQLite DB on every service start, so the `systemctl restart
+x-ui.service` at the end of the applier wiped the outbounds and routing
+rules it had just written. Clones fell back to `outbounds[0]` (the stock
+`freedom`/`direct` outbound) and egressed on the server's own IP instead
+of the country's Psiphon exit.
+
+The DB is therefore the **source of truth**: patching
+`settings.xrayTemplateConfig` makes the regeneration *reproduce* our
+entries. The `config.json` write is kept as belt-and-braces so the binding
+also takes effect on the currently-running Xray process generation.
+
+> **Ordering is load-bearing.** `xray_apply.py` unlinks the patch file on
+> every exit path (its `main()`: *"Remove (consume) the patch file
+> regardless"*). Running it first would leave nothing on disk for
+> `xray_db_apply.py` to read, silently reverting this hotfix. The DB helper
+> deliberately does **not** unlink.
+
+`xray_db_apply.py` honours `PSIPHON_XUI_DB_PATH` (tests); otherwise it
+probes `/usr/local/x-ui/x-ui.db` then `/etc/x-ui/x-ui.db`. Writes go
+through a `BEGIN IMMEDIATE` transaction so a concurrent 3x-ui write is
+serialised rather than lost. If the `xrayTemplateConfig` key is absent it
+is seeded with a minimal `direct`/`block` skeleton and INSERTed.
 
 The polkit rule (`systemd/49-psiphon-3x-ui.rules`) authorises the panel
 service user to ALSO `systemctl start psiphon-xray-applier.service` as a
 belt-and-braces force-drain path; the path unit is the primary trigger.
 
 See `docs/XUI_API.md` ("Why the panel uses a queue+applier instead of a
-3x-ui JSON API") for the upstream-side rationale.
+3x-ui JSON API") for the upstream-side rationale, and
+`tests/test_xray_db_apply.py` for the DB-helper contract tests.

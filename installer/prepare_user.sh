@@ -53,20 +53,28 @@ run_prepare_user() {
     # Make sure the prefix tree is owned by our service user/group so the panel
     # can write to it without root. Idempotent: chown -R is safe to re-run.
     #
-    # Phase 25 Hotfix #11: instead ofs bare chmod 0770 without a setgid
-    # bit, install -d with mode 2775 (setgid: files inherit the group of the
-    # parent dir). This is the LAST mode fix for Hotfix #12 — on the
-    # operator's box the prior version of this script's chmod 0770 (no
-    # setgid) lost the setgid bit because prior mkdir -p had created the
-    # dir without it. Files created inside end up with the caller's primary
-    # group instead of psiphon3xui — panel.db becomes root:root 0644 and
-    # sqlite's WAL can't write sidecars next to it (the "attempt to write
-    # a readonly database" traceback the operator pasted). install -d
-    # applies setgid AND the right mode in one shot; it also already does
-    # the chown+chmod work (via -o root -g) so no separate chown -R call.
+    # Phase 25 Hotfix #11: changed from bare chmod 0770 (no setgid) to the
+    # explicit-mode form 2775 (setgid + group-writable). Without setgid,
+    # files created inside inherit the invoking process's primary group
+    # — on the operator's v3 box, the prior mkdir+chmod had left the parent
+    # as mode 0755 root:root (no setgid). Sqlite then created panel.db AS
+    # root:root (0644) and the panel service (running as psiphon3xui)
+    # couldn't write WAL/journal sidecars next to it. 2775 keeps group
+    # write on the parent dir AND forces every new sub-/file created inside
+    # to inherit the psiphon3xui group.
+    # Phase 26 HARDENING (post-Hotfix #13): the ExecStartPre of
+    # psiphon-tunnel@.service calls `mkdir -p /opt/psiphon-3x-ui/data/<COUNTRY>`
+    # — which creates `data` first under parent `/opt/psiphon-3x-ui` and
+    # then the per-country subdir. For that mkdir to succeed without the
+    # ExecStartPre calling chown (which would EPERM under
+    # `NoNewPrivileges=true` + CAP_CHOWN stripped by the sandbox), the
+    # parent dir must already be `group=psiphon3xui` writable + the set-GID
+    # bit applied so `mkdir`'s leading component inherits the same group.
+    # We deliberately use chmod 2775 (setgid) instead of install -d (which
+    # would replace the inode and break any pre-existing hardlinks in a
+    # re-install). chmod does NOT clear the setgid bit on an existing dir.
     mkdir -p "${CONFIG_DIR}" "${BIN_DIR}" "${VENV_DIR}"
-    install -d -m 2775 -o root -g "${PSIPHON3XUI_GROUP}" "${INSTALL_PREFIX}" 2>/dev/null || true
-    chown -R "root:${PSIPHON3XUI_GROUP}" "${INSTALL_PREFIX}" 2>/dev/null || true
+    chown -R root:"${PSIPHON3XUI_GROUP}" "${INSTALL_PREFIX}" 2>/dev/null || true
     chmod 2775 "${INSTALL_PREFIX}" 2>/dev/null || true
     chmod 2775 "${CONFIG_DIR}" 2>/dev/null || true
     chmod 0750 "${BIN_DIR}" 2>/dev/null || true
