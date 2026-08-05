@@ -119,8 +119,57 @@ entire Xray template as one document:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /panel/api/xray/` | Read the current template. Returns `{"obj": {"xraySetting": "<json string>"}}`. |
+| `POST /panel/api/xray/` | Read the current template. **`obj` is a JSON *string*, not an object — see below.** |
 | `POST /panel/api/xray/update` | Write it back. Form field `xraySetting` carries the full JSON document as a string. |
+
+### ⚠ `obj` is double-encoded on the read endpoint
+
+This is a genuine upstream wart and it is the single easiest way to break
+per-country routing. `internal/web/controller/xray_setting.go::getXraySetting`
+builds a map, marshals it, and hands the resulting Go **string** to `jsonObj`:
+
+```go
+xrayResponse := map[string]any{
+    "xraySetting":       json.RawMessage(xraySetting),
+    "inboundTags":       json.RawMessage(inboundTags),
+    "clientReverseTags": json.RawMessage(clientReverseTags),
+    "outboundTestUrl":   outboundTestUrl,
+}
+result, err := json.Marshal(xrayResponse)
+...
+jsonObj(c, string(result), nil)   // <-- string, and jsonObj does NOT re-decode
+```
+
+`jsonObj` → `jsonMsgObj` merely sets `Obj: obj`, so the wire shape is:
+
+```json
+{"success": true, "msg": "", "obj": "{\"xraySetting\":{…},\"inboundTags\":[…]}"}
+```
+
+`obj` is a **JSON string** here, unlike every other endpoint in this API
+(`list_inbounds`, for instance, returns a real array). One decode of `obj`
+yields the map; the `xraySetting` *inside* it came from `json.RawMessage(...)`
+and is therefore already a real **dict**. So: exactly one decode, on the
+outer layer only.
+
+`XuiClient.get_xray_setting` absorbs this and always returns the decoded
+inner map (it accepts an already-decoded `obj` too, in case a future 3x-ui
+release fixes the wart). Callers get a dict either way.
+
+**How this bit us (Phase 26 Bug #1, fixed in Hotfix #14):** the client
+originally returned `obj` raw. `_mutate_template` then called
+`setting.get("xraySetting")` on a `str`, raising `AttributeError`, which
+`apply_country_binding`'s broad `except Exception` swallowed into a
+`(False, msg)` return that nothing logged. The inbound clone reported
+success and the outbound + routing rule were silently never written — so
+every country egressed on the server's own IP. Two changes prevent a
+repeat: the client decodes defensively, and both binding helpers now log at
+ERROR level on failure.
+
+**Test fakes must model this.** 469 tests passed while this bug shipped
+because `FakeXuiClient.get_xray_setting` returned a dict of *its own*
+shape. The real boundary is now pinned against the exact upstream envelope
+in `tests/test_xui_client.py::test_get_xray_setting_decodes_double_encoded_obj`.
 
 `update` validates the candidate config before persisting, writes it to
 the `xrayTemplateConfig` row in 3x-ui's settings table, and then

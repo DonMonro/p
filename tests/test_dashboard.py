@@ -15,6 +15,7 @@ replaces the router-level ``XuiClient`` for the 3x-ui clone/delete paths.
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import tarfile
@@ -357,8 +358,25 @@ class FakeXuiClient:
             raise exc if isinstance(exc, Exception) else exc("fake get_xray_setting")
         if FakeXuiClient.xray_template is None:
             FakeXuiClient.xray_template = _stock_xray_template()
-        # The real panel returns the template as a JSON *string*.
-        return {"xraySetting": json.dumps(FakeXuiClient.xray_template)}
+        # Model the REAL contract, post-decode. Hotfix #14: upstream's
+        # getXraySetting marshals its map and passes the resulting Go *string*
+        # to jsonObj(), so `obj` arrives over the wire double-encoded. The real
+        # XuiClient.get_xray_setting decodes that outer layer and returns the
+        # inner map — in which `xraySetting` came from json.RawMessage(...) and
+        # is therefore a real **dict**, not a string.
+        #
+        # The previous version of this fake returned
+        # {"xraySetting": json.dumps(...)} — encoding an assumption instead of
+        # the panel's actual behaviour. That is precisely what let the
+        # double-encoding bug ship green through 469 tests. The real
+        # boundary is now pinned in
+        # tests/test_xui_client.py::test_get_xray_setting_decodes_double_encoded_obj.
+        return {
+            "xraySetting": copy.deepcopy(FakeXuiClient.xray_template),
+            "inboundTags": [],
+            "clientReverseTags": [],
+            "outboundTestUrl": "https://www.google.com/generate_204",
+        }
 
     async def update_xray_setting(self, xray_setting: str) -> dict:
         exc = FakeXuiClient.xray_update_raises

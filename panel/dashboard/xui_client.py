@@ -22,6 +22,7 @@ raises :class:`XuiClientError` for unsupported protocols until then.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -275,8 +276,8 @@ class XuiClient:
     async def get_xray_setting(self) -> dict:
         """Fetch the current Xray configuration template.
 
-        Returns the response from POST /panel/api/xray/ which includes:
-        - xraySetting: the xrayTemplateConfig JSON string
+        Returns a dict with:
+        - xraySetting: the xrayTemplateConfig (already-decoded object)
         - inboundTags: array of existing inbound tags
         - outboundTestUrl: the test URL
         - (optionally) subscriptionOutbounds and subscriptionOutboundTags
@@ -284,13 +285,50 @@ class XuiClient:
         Phase 26: this is the supported API for reading the Xray config
         template (the source of truth that 3x-ui uses to regenerate
         config.json). Replaces the root-privileged DB read in Hotfix #11.
+
+        Phase 26 Hotfix #14 — ``obj`` is DOUBLE-ENCODED. Upstream's
+        ``getXraySetting`` builds a map, ``json.Marshal``s it, and passes the
+        result to ``jsonObj`` as a Go *string*
+        (``jsonObj(c, string(result), nil)`` in
+        ``internal/web/controller/xray_setting.go``), so the wire response is::
+
+            {"success": true, "obj": "{\\"xraySetting\\": {...}, ...}"}
+
+        i.e. ``obj`` is a JSON string, NOT an object — unlike every other
+        endpoint on this client (``list_inbounds`` etc. return a real array).
+        Returning it undecoded made ``xray_routing._mutate_template`` call
+        ``.get()`` on a ``str``; the resulting ``AttributeError`` was caught by
+        ``apply_country_binding``'s catch-all and surfaced only as a
+        ``routing_error`` string, so every clone silently ended up with an
+        inbound and NO outbound/routing rule and egressed on the server's own
+        IP — the exact bug Phase 26 set out to fix.
+
+        Decode defensively: accept an already-decoded object too, so a future
+        upstream fix to ``jsonObj`` doesn't break us again in the other
+        direction.
         """
         r = await self._client.post(
             self.base_url + "panel/api/xray/",
             headers=self._headers(),
         )
         data = await self._require_ok(r, what="get_xray_setting")
-        return data.get("obj") or {}
+        obj = data.get("obj")
+        if isinstance(obj, str):
+            if not obj.strip():
+                return {}
+            try:
+                obj = json.loads(obj)
+            except (TypeError, ValueError) as exc:
+                raise XuiClientError(
+                    f"get_xray_setting: obj is not valid JSON: {exc}"
+                ) from exc
+        if obj is None:
+            return {}
+        if not isinstance(obj, dict):
+            raise XuiClientError(
+                f"get_xray_setting: obj decoded to {type(obj).__name__}, expected object"
+            )
+        return obj
 
     async def update_xray_setting(self, xray_setting: str) -> dict:
         """Update the Xray configuration template and live-reload Xray.

@@ -320,8 +320,28 @@ async def apply_country_binding(
             lambda t: upsert_binding(t, country_code, socks_port, inbound_tag),
         )
     except XuiClientError as exc:
+        # Hotfix #14: LOG, don't just return. The silent-return design is what
+        # let the double-encoded-`obj` bug ship — the clone reported success
+        # and the missing routing was invisible in journalctl.
+        _log.error(
+            "xray routing FAILED for %s (inbound_tag=%s, socks=%s): %s — "
+            "the inbound exists but has NO outbound/routing rule, so it will "
+            "egress on the server's own IP",
+            country_code,
+            inbound_tag,
+            socks_port,
+            exc,
+        )
         return False, str(exc)
     except Exception as exc:  # noqa: BLE001 — transport/JSON errors vary
+        _log.exception(
+            "xray routing FAILED for %s (inbound_tag=%s, socks=%s) — the "
+            "inbound exists but has NO outbound/routing rule, so it will "
+            "egress on the server's own IP",
+            country_code,
+            inbound_tag,
+            socks_port,
+        )
         return False, f"{type(exc).__name__}: {exc}"
     _log.info(
         "xray routing %s for %s (inbound_tag=%s, socks=%s)",
@@ -345,8 +365,19 @@ async def remove_country_binding(
             lambda t: strip_binding(t, country_code, inbound_tag),
         )
     except XuiClientError as exc:
+        _log.error(
+            "xray routing removal FAILED for %s (inbound_tag=%s): %s",
+            country_code,
+            inbound_tag,
+            exc,
+        )
         return False, str(exc)
     except Exception as exc:  # noqa: BLE001
+        _log.exception(
+            "xray routing removal FAILED for %s (inbound_tag=%s)",
+            country_code,
+            inbound_tag,
+        )
         return False, f"{type(exc).__name__}: {exc}"
     _log.info(
         "xray routing %s for %s",
