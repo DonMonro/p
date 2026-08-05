@@ -515,3 +515,39 @@ sidecar:**
 See `docs/ARCHITECTURE.md` § "Xray applier sidecar" and
 `docs/XUI_API.md` § "Per-country routing via the queue+applier sidecar"
 for the full contract.
+
+**Phase 26 supersedes Hotfix #9/#10/#11 and DELETES the sidecar.**
+
+The sidecar existed only because the project believed 3x-ui had no JSON
+API for top-level `outbounds[]` / `routing.rules[]`. The original probe
+enumerated *per-entity* endpoints (`/panel/api/xray/outbound/add`, …) —
+all genuinely 404 — but never tried the *whole-document* endpoint 3x-ui
+actually ships:
+
+* `POST /panel/api/xray/` — read the current Xray template.
+* `POST /panel/api/xray/update` (form field `xraySetting`) — validate,
+  persist to the `xrayTemplateConfig` DB setting, and reconcile the
+  running core (gRPC hot-reload when only inbounds/outbounds/routing
+  changed).
+
+Because 3x-ui performs the write and the reload itself, the panel needs
+no root, no polkit escalation, no systemd units, and never touches
+`config.json` — which also removes the Hotfix-#10 race where 3x-ui
+regenerated that file from its DB and wiped the out-of-band edits.
+
+Deleted: `installer/xray_applier.sh`, `installer/xray_apply.py`,
+`installer/xray_db_apply.py`, `systemd/psiphon-xray-applier.{path,service}`,
+`tests/test_xray_db_apply.py`, the panel's `_xray_patch_queue_dir` /
+`_enqueue_xray_patch` / `_restart_xui_service` helpers, the installer's
+sidecar block, and the polkit grant for the applier unit.
+
+Also fixed in Phase 26: routing rules now bind to the inbound tag
+**returned by the clone** rather than an assumed `in-<port>-tcp`. 3x-ui's
+`resolveInboundTag()` may append a collision suffix (`-2`) or change the
+protocol segment (`udp`/`tcpudp`), so a guessed tag produced a rule that
+matched nothing and reproduced the original symptom.
+
+New implementation: `panel/dashboard/xray_routing.py`. See
+`docs/ARCHITECTURE.md` § "Per-country traffic flow at the Xray routing
+layer (Phase 26)" and `docs/XUI_API.md` § "Per-country routing via the
+Xray-settings API (Phase 26)".

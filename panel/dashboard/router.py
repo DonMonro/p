@@ -26,15 +26,12 @@ import contextlib
 import io
 import json
 import logging
-import os
 import re
 import subprocess
 import tarfile
-import tempfile
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -69,6 +66,7 @@ from ..wizard.apply import PortAssignmentSpec, apply_country
 # Phase 25 (Feature A/C/D): single-country clone helper — shared by the
 # extended PATCH (enable-with-inbound) and the new _reclone endpoint.
 from ..wizard.clone import clone_for_country
+from .xray_routing import remove_country_binding
 from .xui_client import XuiClient, XuiClientError
 
 _log = logging.getLogger(__name__)
@@ -79,140 +77,17 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-_XUI_SERVICE_NAME = "x-ui.service"
-
-# Phase 25 Hotfix #10: the panel CANNOT read/write the root-owned
-# /usr/local/x-ui/bin/config.json directly (Hotfix #9's helpers always
-# returned EACCES and the operator's traffic kept egressing via the default
-# freedom outbound). Hotfix #10 flips the direction: the panel DROPS a
-# queue file into a shared directory and a root-side systemd oneshot
-# service (psiphon-xray-applier.service, triggered by the companion
-# .path unit watching the same directory) does the privileged merge.
-_XRAY_PATCH_QUEUE_DIR_DEFAULT = "/opt/psiphon-3x-ui/xray-patch-queue"
-
-
-def _xray_patch_queue_dir() -> Path:
-    """Return the on-disk directory the panel writes patch files into.
-
-    The path-unit watches this same directory; the applier service (running
-    as root) consumes every ``*.json`` file it finds there. The directory
-    is created at install time with ownership ``root:psiphon3xui`` + mode
-    ``0755`` so the panel user can ``mktemp`` inside it, and the queue is
-    world-readable (no other-user write bit) so multiple panel workers can
-    enqueue concurrently.
-
-    Honours the ``PSIPHON_XRAY_PATCH_QUEUE_DIR`` env var so the test-suite
-    can redirect the queue into ``tmp_path``.
-    """
-    env = os.environ.get("PSIPHON_XRAY_PATCH_QUEUE_DIR", "").strip()
-    if env:
-        return Path(env)
-    return Path(_XRAY_PATCH_QUEUE_DIR_DEFAULT)
-
-
-def _enqueue_xray_patch(
-    op: Literal["apply", "remove"],
-    country_code: str,
-    socks_port: int,
-    public_port: int,
-) -> tuple[bool, str]:
-    """Atomically drop a per-country Xray outbound+routing patch onto the
-    root-side applier's queue directory.
-
-    Replaces Hotfix #9's direct ``_apply/_remove_psiphon_xray_outbound_and_rule``
-    file-edit helpers (both deleted — they always failed with EACCES against
-    the root-owned live ``/usr/local/x-ui/bin/config.json``). The queue file
-    naming is::
-
-        <COUNTRY_CODE>-<op>-<uuid8>.json
-
-    so multiple in-flight edits for the same country can land independently
-    and the applier (which consumes the directory in shell-glob sorted order)
-    sees them deterministically. The write pattern is
-    ``tempfile.mkstemp`` + ``os.replace`` so the path-unit's inotify watch
-    only ever sees fully-formed ``*.json`` files (never partial writes), and
-    the atomic rename is the ONLY syscall that publishes the file.
-
-    Returns ``(True, "")`` on successful queue write or
-    ``(False, <diagnostic>)`` on any IO error (the caller logs + surfaces
-    ``routing_result``; the FastAPI response MUST be able to return even
-    when the applier's queue cannot be reached). Never raises.
-    """
-    queue_dir = _xray_patch_queue_dir()
-    code = country_code.strip().upper()
-    body = {
-        "op": op,
-        "country_code": code,
-        "socks_port": int(socks_port),
-        "public_port": int(public_port),
-        "inbound_tag": f"in-{int(public_port)}-tcp",
-    }
-    try:
-        queue_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return False, f"mkdir {queue_dir} failed: {type(exc).__name__}: {exc}"
-    fname = f"{code}-{op}-{uuid.uuid4().hex[:8]}.json"
-    final = queue_dir / fname
-    tmp_path: Path | None = None
-    try:
-        # mkstemp in the SAME directory so os.replace() is a same-filesystem
-        # rename (atomic) — cross-device renames would silently degrade to
-        # copy+unlink which IS NOT atomic.
-        fd, tmp_str = tempfile.mkstemp(prefix=".xray-patch-", dir=str(queue_dir))
-        tmp_path = Path(tmp_str)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(body, indent=2) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, final)
-    except OSError as exc:
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
-        return False, f"write {final} failed: {type(exc).__name__}: {exc}"
-    return True, ""
-
-
-def _restart_xui_service() -> tuple[bool, str]:
-    """Restart ``x-ui.service`` so Xray picks up the new config.
-
-    Synchronous (NOT detached) — the panel service is NOT the unit being
-    restarted here, so the in-flight HTTP response survives. Authorised by
-    the extended polkit rule (``systemd/49-psiphon-3x-ui.rules``).
-
-    Returns ``(ok, error_msg)`` — never raises.
-    """
-    try:
-        proc = subprocess.run(  # noqa: S603 — system binary, trusted args
-            ["systemctl", "restart", _XUI_SERVICE_NAME],
-            capture_output=True,
-            text=True,
-            timeout=30.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"systemctl restart {_XUI_SERVICE_NAME}: {type(exc).__name__}: {exc}"
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip() or (proc.stdout or "").strip()
-        return False, (
-            f"systemctl restart {_XUI_SERVICE_NAME} -> exit {proc.returncode}: "
-            f"{stderr or '(no stderr)'}"
-        )
-    return True, ""
-
-
-# ── Hotfix #10 (Phase 25): the direct Hotfix-#9 apply/remove helpers
-# (_apply_psiphon_xray_outbound_and_rule / _remove_psiphon_xray_outbound_and_rule)
-# have been REPLACED by _enqueue_xray_patch() above. The old helpers tried
-# to read + write /usr/local/x-ui/bin/config.json directly from the panel
-# process (running as the unprivileged psiphon3xui user) — every such
-# attempt returned EACCES because 3x-ui installs that file mode 0600
-# root:root and periodically REGENERATES it from /etc/x-ui/x-ui.db every
-# time its inbound API is touched, so even a successful direct write would
-# race 3x-ui's own writes. The queue+applier sidecar keeps the panel
-# unprivileged while the root-side applier service does the merge + restart.
-# The hotfix-#9 direct-edit design-and-fail is recorded in
-# docs/ARCHITECTURE.md "Xray applier sidecar".
+# ── Phase 26: per-country Xray outbound+routing binding is written through
+# 3x-ui's OWN supported Xray-settings API (POST /panel/api/xray/ to read the
+# template, POST /panel/api/xray/update to validate + persist + hot-reload) —
+# see panel/dashboard/xray_routing.py. That replaced the Hotfix #9/#10/#11
+# sidecar entirely: the panel no longer needs root, no longer touches the
+# root-owned /usr/local/x-ui/bin/config.json, and no longer restarts
+# x-ui.service — 3x-ui validates the config before persisting it and
+# reconciles the running core itself (gRPC hot-reload when only
+# inbounds/outbounds/routing changed). The dead helpers
+# (_xray_patch_queue_dir / _enqueue_xray_patch / _restart_xui_service) and
+# the queue+applier units they fed have been removed.
 
 
 def _require_wizard_completed(db: Session) -> Settings:
@@ -784,18 +659,28 @@ async def patch_country(
             _log.warning("stop_unit(%s) failed during disable: %s", country.code, exc)
             # Best-effort — the dashboard's disable should still flip the flag
             # so the operator isn't stuck with a half-stopped unit.
-        # Hotfix #10 (Phase 25): enqueue the per-country Xray outbound+rule
-        # removal — the root-side applier consumes it and restarts x-ui. The
-        # panel itself never touches /usr/local/x-ui/bin/config.json directly
-        # (it CAN'T — the file is root:root 0600). Best-effort, surfaced as
-        # routing_result on the response.
+        # Phase 26: remove the per-country Xray outbound + routing rule(s)
+        # through the panel's own Xray settings API. A disabled country must
+        # stop routing traffic into a Psiphon listener that is no longer
+        # running — otherwise the rule points at a dead SOCKS5 port. The tag
+        # is left unspecified so EVERY rule targeting this country's outbound
+        # is dropped (the country may have been re-cloned onto a different
+        # public port since the rule was first written). Best-effort,
+        # surfaced as routing_result on the response.
         if assignment is not None:
-            mok, merr = _enqueue_xray_patch(
-                "remove",
-                country.code,
-                0,
-                int(assignment.public_port),
-            )
+            rm_client: XuiClient | None = None
+            try:
+                rm_client = await _async_get_xui_client(db)
+                if rm_client is None:
+                    mok, merr = False, "no cached 3x-ui creds — cannot remove routing"
+                else:
+                    mok, merr = await remove_country_binding(rm_client, country.code)
+            except Exception as exc:  # noqa: BLE001  never block the disable
+                mok, merr = False, f"{type(exc).__name__}: {exc}"
+            finally:
+                if rm_client is not None:
+                    with contextlib.suppress(Exception):
+                        await rm_client.aclose()
             if not mok:
                 _log.warning(
                     "patch_country disable routing_cleanup for %s failed: %s",
@@ -853,31 +738,24 @@ async def patch_country(
                 with contextlib.suppress(Exception):
                     await client.aclose()
 
-        # Hotfix #10 (Phase 25): enqueue the outbound+rule apply patch. The
-        # root-side applier service merges it into
-        # /usr/local/x-ui/bin/config.json and restarts x-ui.service once at
-        # the end. streamSettings.outbound is persisted by 3x-ui but is NOT
-        # honoured by Xray's routing engine — that's why this patch
-        # mechanism exists at all. Don't fail the clone on queue errors;
-        # surface as routing_result.
+        # Phase 26: clone_for_country already wrote the outbound + routing
+        # rule via the Xray settings API (using the tag 3x-ui actually
+        # assigned to the new inbound), so this handler just surfaces that
+        # outcome instead of enqueueing a second, redundant patch.
+        # streamSettings.outbound is persisted by 3x-ui but is NOT honoured by
+        # Xray's routing engine — the top-level binding is what makes traffic
+        # egress through Psiphon.
         if clone_result is not None and clone_result.get("success"):
-            pa = (
-                db.query(PortAssignment)
-                .filter(PortAssignment.country_code == country.code)
-                .first()
-            )
-            if pa is not None:
-                rok, rerr = _enqueue_xray_patch(
-                    "apply",
-                    country.code,
-                    int(pa.socks_port),
-                    int(pa.public_port),
+            routing_result = {
+                "applied": bool(clone_result.get("routing_applied")),
+                "error": clone_result.get("routing_error"),
+                "inbound_tag": clone_result.get("inbound_tag"),
+            }
+            if not routing_result["applied"]:
+                _log.warning(
+                    "patch_country routing for %s failed: %s",
+                    country.code, clone_result.get("routing_error"),
                 )
-                routing_result = {"applied": rok, "error": None if rok else rerr}
-                if not rok:
-                    _log.warning(
-                        "patch_country routing for %s failed: %s", country.code, rerr
-                    )
 
     response = _country_card(country, db)
     if apply_event is not None:
@@ -948,9 +826,8 @@ async def reclone_country(
     existing = db.query(CloneRecord).filter(CloneRecord.country_code == country.code).first()
     deleted_prior: int | None = None
     delete_error: str | None = None
-    prior_public_port: int | None = None  # Hotfix #9: old inbound's public port
-    if existing is not None:
-        prior_public_port = int(existing.public_port)
+    # Phase 26: populated only when the pre-clone stale-rule strip fails.
+    routing_remove_result: dict[str, Any] | None = None
 
     client: XuiClient | None = None
     clone_result: dict[str, Any]
@@ -972,7 +849,32 @@ async def reclone_country(
             db.delete(existing)
             db.commit()
 
+            # Phase 26: drop every routing rule pointing at this country's
+            # outbound BEFORE re-cloning. The routing rule is keyed on the
+            # inbound tag, and the replacement inbound may well get a
+            # different one (3x-ui appends a collision suffix when the
+            # natural "in-<port>-tcp" tag is taken — and the tag we just
+            # freed can still be held by the deleted row's transaction).
+            # Stripping first means the country ends up with exactly one
+            # rule instead of an orphan pointing at the deleted inbound.
+            try:
+                sok, serr = await remove_country_binding(client, country.code)
+                if not sok:
+                    routing_remove_result = {"removed": False, "error": serr}
+                    _log.warning(
+                        "reclone: stale routing cleanup for %s failed: %s",
+                        country.code, serr,
+                    )
+            except Exception as exc:  # noqa: BLE001  best-effort cleanup
+                routing_remove_result = {
+                    "removed": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                _log.exception("reclone: stale routing cleanup raised for %s", country.code)
+
         # ── 2. Clone the new template ─────────────────────────────────────
+        # clone_for_country re-adds the outbound + a rule bound to the tag
+        # 3x-ui actually assigned to the new inbound.
         clone_result = await clone_for_country(
             country.code,
             int(body.inbound_id),
@@ -992,35 +894,22 @@ async def reclone_country(
     )
     apply_event = apply_country(spec)
 
-    # ── Hotfix #10 (Phase 25): queue the Xray outbound+routing patch ──────
-    # The root-side applier consumes the queue file, merges it into
-    # /usr/local/x-ui/bin/config.json, and restarts x-ui ONCE per trigger.
-    # streamSettings.outbound is persisted by 3x-ui but NOT routed on by
-    # the Xray core — the applier-side json merge writes the top-level
-    # outbounds[] + routing.rules[] entries. On re-clone the same
-    # (socks_port, public_port) pair is re-applied (the new inbound has the
-    # same listen port as the old one) and the prior binding is enqueued
-    # for removal when it differs (paranoia — normally unchanged).
+    # ── Phase 26: report the Xray outbound + routing rule outcome ─────────
+    # The stale rule was stripped before the clone (step 1) and
+    # clone_for_country re-added the binding against the new inbound's real
+    # tag, so there is nothing left to write here.
     routing_result: dict[str, Any] | None = None
-    routing_remove_result: dict[str, Any] | None = None
     if clone_result.get("success"):
-        rok, rerr = _enqueue_xray_patch(
-            "apply",
-            country.code,
-            int(assignment.socks_port),
-            int(assignment.public_port),
-        )
-        routing_result = {"applied": rok, "error": None if rok else rerr}
-        if prior_public_port is not None and int(prior_public_port) != int(
-            assignment.public_port
-        ):
-            mok, merr = _enqueue_xray_patch(
-                "remove",
-                country.code,
-                0,
-                int(prior_public_port),
+        routing_result = {
+            "applied": bool(clone_result.get("routing_applied")),
+            "error": clone_result.get("routing_error"),
+            "inbound_tag": clone_result.get("inbound_tag"),
+        }
+        if not routing_result["applied"]:
+            _log.warning(
+                "reclone routing for %s failed: %s",
+                country.code, clone_result.get("routing_error"),
             )
-            routing_remove_result = {"removed": mok, "error": None if mok else merr}
 
     response = _country_card(country, db)
     response["apply_result"] = {
@@ -1084,52 +973,55 @@ async def delete_country(
         db.commit()
         summary["removed_clone_record"] = True
 
-    # 3. Delete the matching 3x-ui inbound via cached XuiClient.
-    if inbound_id is not None:
-        client: XuiClient | None = None
-        try:
-            client = await _async_get_xui_client(db)
-            if client is None:
+    # 3. Delete the matching 3x-ui inbound, then strip the country's Xray
+    #    outbound + routing rule(s) — both over the same client session.
+    #
+    #    Phase 26: the routing strip is unconditional (not gated on the
+    #    inbound delete succeeding) because a rule pointing at a
+    #    non-existent inbound is exactly what we must not leave behind. No
+    #    tag is passed, so EVERY rule targeting this country's outbound goes.
+    client: XuiClient | None = None
+    try:
+        client = await _async_get_xui_client(db)
+        if client is None:
+            if inbound_id is not None:
                 summary["deleted_inbound_error"] = "no cached 3x-ui creds"
-            else:
-                await client.delete_inbound(inbound_id)
-                summary["deleted_inbound"] = True
-        except XuiClientError as exc:
-            summary["deleted_inbound_error"] = str(exc)
-        except Exception as exc:  # noqa: BLE001
-            summary["deleted_inbound_error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await client.aclose()
+            summary["removed_xray_routing"] = False
+            summary["removed_xray_routing_error"] = "no cached 3x-ui creds"
+        else:
+            if inbound_id is not None:
+                try:
+                    await client.delete_inbound(inbound_id)
+                    summary["deleted_inbound"] = True
+                except XuiClientError as exc:
+                    summary["deleted_inbound_error"] = str(exc)
+                except Exception as exc:  # noqa: BLE001
+                    summary["deleted_inbound_error"] = f"{type(exc).__name__}: {exc}"
+            rok, rerr = await remove_country_binding(client, country.code)
+            summary["removed_xray_routing"] = rok
+            if not rok:
+                summary["removed_xray_routing_error"] = rerr
+                _log.warning(
+                    "delete_country routing cleanup for %s failed: %s",
+                    country.code, rerr,
+                )
+    except Exception as exc:  # noqa: BLE001  teardown must always return
+        summary["removed_xray_routing"] = False
+        summary["removed_xray_routing_error"] = f"{type(exc).__name__}: {exc}"
+        _log.exception("delete_country routing cleanup raised for %s", country.code)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.aclose()
 
     # 4. Remove the PortAssignment row (the wizard wrote exactly one).
     assignment = (
         db.query(PortAssignment).filter(PortAssignment.country_code == country.code).first()
     )
-    prior_public_port: int | None = None
     if assignment is not None:
-        prior_public_port = int(assignment.public_port)
         db.delete(assignment)
         db.commit()
         summary["removed_assignment"] = True
-
-    # Hotfix #10 (Phase 25): enqueue the removal of the per-country Xray
-    # outbound+routing rule. The applier removes them from
-    # /usr/local/x-ui/bin/config.json and restarts x-ui. Best-effort —
-    # failures are noted in the summary so the operator can re-run
-    # `sudo systemctl start psiphon-xray-applier.service` by hand if the
-    # queue write itself was lost.
-    if prior_public_port is not None:
-        mok, merr = _enqueue_xray_patch(
-            "remove",
-            country.code,
-            0,
-            int(prior_public_port),
-        )
-        summary["removed_xray_routing"] = mok
-        if not mok:
-            summary["removed_xray_routing_error"] = merr
 
     # 5. Flip Country.enabled = False (preserved as a selectable row).
     if country.enabled:

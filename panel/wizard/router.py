@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from ..auth import decrypt_creds, encrypt_creds, get_current_user
 from ..config import get_settings, load_countries
+from ..dashboard.xray_routing import apply_country_binding
 from ..dashboard.xui_client import XuiClient, XuiClientError
 from ..db import get_db
 from ..models import (
@@ -1182,56 +1183,62 @@ async def submit_clone(
                 )
                 # Inline per-country clone — we use the orchestrator helper
                 # only for the rollback loop after this batch finishes.
-                events.append(await clone_country(spec, client, db=db))
-                yield _sse(events[-1].as_dict())
+                clone_event = await clone_country(spec, client, db=db)
+                events.append(clone_event)
+                yield _sse(clone_event.as_dict())
 
-                # Hotfix #10 (Phase 25): enqueue the per-country Xray outbound +
-                # routing patch so the root-side applier merges it into
-                # /usr/local/x-ui/bin/config.json. The clone itself succeeded
-                # already — enqueue failures are non-fatal and surfaced as
-                # extra SSE records.
-                if events[-1].status == "cloned":
+                # Phase 26: bind the freshly-created inbound to this country's
+                # Psiphon SOCKS5 outbound through the supported 3x-ui Xray
+                # settings API (POST /panel/api/xray/update). Without this the
+                # inbound exists but no routing rule points at Psiphon, so
+                # end-user traffic falls through to the default freedom
+                # outbound and egresses on the server's own IP — the bug this
+                # phase fixes. Replaces the Hotfix #10 root-side queue sidecar.
+                #
+                # The rule MUST reference the tag 3x-ui actually assigned
+                # (clone_event.inbound_tag) — upstream's resolveInboundTag()
+                # only honours our requested tag when it is still free, and
+                # otherwise generates one (possibly with a "-2" collision
+                # suffix, or a udp/tcpudp transport suffix).
+                #
+                # Routing failures are non-fatal: the clone already landed, so
+                # they surface as an extra SSE record rather than unwinding it.
+                if clone_event.status == "cloned":
+                    inbound_tag = clone_event.inbound_tag or f"in-{spec.public_port}-tcp"
                     try:
-                        # Lazy local import to avoid a module-level cycle with
-                        # panel.dashboard.router (dashboard already imports
-                        # clone_for_country from this same module).
-                        from ..dashboard.router import (  # noqa: PLC0415
-                            _enqueue_xray_patch,
-                        )
-
-                        rok, rerr = _enqueue_xray_patch(
-                            "apply",
+                        rok, rerr = await apply_country_binding(
+                            client,
                             spec.country_code,
                             int(spec.socks_port),
-                            int(spec.public_port),
+                            inbound_tag,
                         )
-                        events.append(
-                            CloneEvent(
-                                country_code=spec.country_code,
-                                status="routing" if rok else "routing_failed",
-                                progress=100,
-                                inbound_id=events[-1].inbound_id,
-                                message=(
-                                    f"xray routing applied for {spec.country_code}"
-                                    if rok
-                                    else f"xray routing for {spec.country_code} failed: {rerr}"
-                                ),
-                            )
+                        routing_event = CloneEvent(
+                            country_code=spec.country_code,
+                            status="routing" if rok else "routing_failed",
+                            progress=100,
+                            inbound_id=clone_event.inbound_id,
+                            inbound_tag=inbound_tag,
+                            message=(
+                                f"xray routing applied for {spec.country_code} "
+                                f"({inbound_tag} → psiphon-out-{spec.country_code})"
+                                if rok
+                                else f"xray routing for {spec.country_code} failed: {rerr}"
+                            ),
                         )
                     except Exception as exc:  # noqa: BLE001  defensive
-                        events.append(
-                            CloneEvent(
-                                country_code=spec.country_code,
-                                status="routing_failed",
-                                progress=100,
-                                inbound_id=events[-1].inbound_id,
-                                message=(
-                                    f"xray routing for {spec.country_code} raised "
-                                    f"{type(exc).__name__}: {exc}"
-                                ),
-                            )
+                        routing_event = CloneEvent(
+                            country_code=spec.country_code,
+                            status="routing_failed",
+                            progress=100,
+                            inbound_id=clone_event.inbound_id,
+                            inbound_tag=inbound_tag,
+                            message=(
+                                f"xray routing for {spec.country_code} raised "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
                         )
-                    yield _sse(events[-1].as_dict())
+                    events.append(routing_event)
+                    yield _sse(routing_event.as_dict())
 
             # Drive rollback through the orchestrator's rollback helper. We
             # pass ONLY the actual clone events (filtering out the Hotfix #9

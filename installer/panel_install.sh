@@ -491,116 +491,27 @@ EOF
         warn "Missing ${POLKIT_RULE_SRC} — the panel user will not be able to start tunnels (Bug #2 will persist)."
     fi
 
-    # ── 7c. Phase 25 Hotfix #10 — install the Xray-patch applier sidecar ──
-    # The panel service runs as the UNPRIVILEGED psiphon3xui user and
-    # therefore CANNOT read or write /usr/local/x-ui/bin/config.json
-    # directly (stock 3x-ui ships it mode 0600 root:root AND 3x-ui
-    # regenerates it from /etc/x-ui/x-ui.db every time its inbound API is
-    # touched, so a lucky chown'd write would race 3x-ui's own rewrites).
+    # ── 7c. Phase 26 — /opt/psiphon-3x-ui directory setup ──
+    # The panel's panel.db lives at /opt/psiphon-3x-ui/panel.db and must be
+    # writable by the psiphon3xui user (the panel service runs as that
+    # unprivileged user). Create the parent with mode 2775 (group-writable
+    # + setgid bit) so files created inside inherit the psiphon3xui group.
     #
-    # Hotfix #9 tried to rewrite the config in-process anyway and silently
-    # no-op'd every time with EACCES (operator's live install verified the
-    # panel user could not even READ the file). The fix is a privileged
-    # sidecar pair:
+    # Phase 25 Hotfix #12 context: the prior install wrote mode 0755 here,
+    # which blocked `_get_wizard_row() INSERT into panel.db` with
+    # `sqlite3.OperationalError: attempt to write a readonly database` —
+    # psiphon3xui could read but not write. The 2775 fix persists here.
     #
-    #   (a) systemd/psiphon-xray-applier.path  — watches the queue dir for
-    #       incoming patch files dropped by the panel's _enqueue_xray_patch()
-    #       (PathChanged triggers on the atomic-rename edge, not on tmp files).
-    #
-    #   (b) systemd/psiphon-xray-applier.service — Type=oneshot, User=root,
-    #       ExecStart=/usr/local/libexec/psiphon-3x-ui/xray-applier.sh. The
-    #       bash script flock()s a lockfile, walks the queue in sorted order,
-    #       delegates every patch file to installer/xray_apply.py (stdlib-only
-    #       — no venv interpreter required), and ONLY when at least one patch
-    #       actually mutated config.json does it `systemctl restart
-    #       x-ui.service` once at the very end (multi-country bursts land as
-    #       a single restart, not N restarts).
-    #
-    #   (c) The shared queue directory /opt/psiphon-3x-ui/xray-patch-queue/
-    #       is owned root:psiphon3xui mode 0755 so the panel user can
-    #       mktemp+rename inside it but no other unprivileged user can write.
-    #
-    # We install the pair of unit files + the two libexec helpers idempotently
-    # (re-runs overwrite in place); the path unit needs `daemon-reload` +
-    # `enable --now` for .path activation.
-    local APPLIER_LIBEXEC_DIR="/usr/local/libexec/psiphon-3x-ui"
-    local APPLIER_QUEUE_DIR="/opt/psiphon-3x-ui/xray-patch-queue"
-
-    # libexec directory (root-owned; helpers are mode 0755).
-    install -d -m 0755 -o root -g root "${APPLIER_LIBEXEC_DIR}" \
-        || warn "mkdir ${APPLIER_LIBEXEC_DIR} failed (applier sidecar will not work)."
-
-    if [[ -f "${SCRIPT_DIR}/installer/xray_applier.sh" ]]; then
-        install -m 0755 -o root -g root \
-            "${SCRIPT_DIR}/installer/xray_applier.sh" \
-            "${APPLIER_LIBEXEC_DIR}/xray-applier.sh" \
-            || warn "install of xray-applier.sh failed (continuing)."
-    else
-        warn "Missing ${SCRIPT_DIR}/installer/xray_applier.sh — the applier sidecar will not be installed (re-clone the repo)."
-    fi
-    if [[ -f "${SCRIPT_DIR}/installer/xray_apply.py" ]]; then
-        install -m 0755 -o root -g root \
-            "${SCRIPT_DIR}/installer/xray_apply.py" \
-            "${APPLIER_LIBEXEC_DIR}/xray_apply.py" \
-            || warn "install of xray_apply.py failed (continuing)."
-    fi
-    if [[ -f "${SCRIPT_DIR}/installer/xray_db_apply.py" ]]; then
-        install -m 0755 -o root -g root \
-            "${SCRIPT_DIR}/installer/xray_db_apply.py" \
-            "${APPLIER_LIBEXEC_DIR}/xray_db_apply.py" \
-            || warn "install of xray_db_apply.py failed (continuing)."
-    else
-        warn "Missing ${SCRIPT_DIR}/installer/xray_apply.py — the applier sidecar will not be installed (re-clone the repo)."
-    fi
-
-    if [[ -f "${SCRIPT_DIR}/systemd/psiphon-xray-applier.path" ]]; then
-        install -m 0644 "${SCRIPT_DIR}/systemd/psiphon-xray-applier.path" \
-            /etc/systemd/system/psiphon-xray-applier.path \
-            || warn "install of psiphon-xray-applier.path failed (continuing)."
-    else
-        warn "Missing ${SCRIPT_DIR}/systemd/psiphon-xray-applier.path (re-clone the repo)."
-    fi
-    if [[ -f "${SCRIPT_DIR}/systemd/psiphon-xray-applier.service" ]]; then
-        install -m 0644 "${SCRIPT_DIR}/systemd/psiphon-xray-applier.service" \
-            /etc/systemd/system/psiphon-xray-applier.service \
-            || warn "install of psiphon-xray-applier.service failed (continuing)."
-    else
-        warn "Missing ${SCRIPT_DIR}/systemd/psiphon-xray-applier.service (re-clone the repo)."
-    fi
-
-    # Queue dir: root:psiphon3xui mode 0775 (group-writable). The panel
-    # service runs as ${PSIPHON3XUI_USER} whose PRIMARY group is
-    # ${PSIPHON3XUI_GROUP}, so the group-write bit lets the panel process
-    # mkstemp()+rename() inside the queue dir (the only write access it
-    # needs). Other unprivileged users are neither owner nor group members
-    # → they get r-x (read+execute, no write) per the mode. The lock file
-    # the applier bash script flock()s lives one level UP at
-    # /opt/psiphon-3x-ui/xray-applier.lock and is created on first
-    # applier run with default umask (root-owned mode 0644) — the panel
-    # never needs to open it.
-    install -d -m 0775 -o root -g "${PSIPHON3XUI_GROUP}" "${APPLIER_QUEUE_DIR}" \
-        || warn "mkdir ${APPLIER_QUEUE_DIR} failed (applier sidecar will not work)."
-    # Belt-and-braces: make sure the parent /opt/psiphon-3x-ui root is
-    #:
-    #   (a) traversable by the panel user (so the path-unit can inotify the
-    #       queue dir contents)
-    #   (b) GROUP-WRITABLE (mode 2775) — the panel.db file sits ONE LEVEL
-    #       UP from the queue dir and must stay writable by the panel
-    #       service. Phase 25 Hotfix #12 (status quo): the prior install
-    #       wrote mode 0755 here — the panel service's _get_wizard_row()
-    #       INSERT into panel.db was then blocked with
-    #       `sqlite3.OperationalError: attempt to write a readonly
-    #       database` (the panel user — psiphon3xui — can read but not
-    #       write under mode 0755 with owner=root). Fix here: invoke
-    #       install with mode 2775 (group-writable) + the setgid bit so
-    #       any files created inside inherit the psiphon3xui group.
+    # Phase 26 note: the Hotfix #9/#10/#11 Xray-patch applier sidecar (its
+    # bash driver, the two stdlib-only python patchers, the .path/.service
+    # unit pair, and the on-disk patch queue under /opt/psiphon-3x-ui) has
+    # been REMOVED. The panel now binds per-country Xray outbounds+routing
+    # through 3x-ui's own supported API (POST /panel/api/xray/ to read the
+    # template, POST /panel/api/xray/update to validate + persist +
+    # hot-reload) — no root privilege, no systemd units, no queue. See
+    # panel/dashboard/xray_routing.py.
     install -d -m 2775 -o root -g "${PSIPHON3XUI_GROUP}" "/opt/psiphon-3x-ui" \
         || warn "mkdir /opt/psiphon-3x-ui failed (continuing)."
-
-    # Enable + start the .path unit so it watches the queue dir from boot.
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now psiphon-xray-applier.path >/dev/null 2>&1 \
-        || warn "systemctl enable --now psiphon-xray-applier.path failed (continuing)."
 
     # ── 8. Pre-flight: ensure PANEL_PORT is free for the new unit ──
     # Phase 24 Hotfix #2 (Bug: "Failed to restart psiphon-3x-ui.service:
