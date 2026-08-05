@@ -22,6 +22,7 @@ No real 3x-ui network — every clone / delete happens through
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 
@@ -193,8 +194,19 @@ class FakeXuiClient:
             raise exc if isinstance(exc, Exception) else exc("fake get_xray_setting")
         if FakeXuiClient.xray_template is None:
             FakeXuiClient.xray_template = _stock_xray_template()
-        # The real panel hands back the template as a JSON *string*.
-        return {"xraySetting": json.dumps(FakeXuiClient.xray_template)}
+        # Model the REAL contract, post-decode (Hotfix #14): the panel's
+        # getXraySetting double-encodes `obj`, XuiClient.get_xray_setting peels
+        # that outer layer off, and the `xraySetting` inside came from
+        # json.RawMessage(...) — so it is a real **dict**. Returning a JSON
+        # string here (as this fake used to) modelled an assumption rather than
+        # the panel, which is how the routing bug shipped green. See
+        # tests/test_xui_client.py::test_get_xray_setting_decodes_double_encoded_obj.
+        return {
+            "xraySetting": copy.deepcopy(FakeXuiClient.xray_template),
+            "inboundTags": [],
+            "clientReverseTags": [],
+            "outboundTestUrl": "https://www.google.com/generate_204",
+        }
 
     async def update_xray_setting(self, xray_setting: str) -> dict:
         exc = FakeXuiClient.xray_update_raises

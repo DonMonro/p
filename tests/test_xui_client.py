@@ -501,3 +501,144 @@ async def test_base_url_normalisation_strips_panel_SPA_route():
         XuiClient("http:///panel", username="u", password="p")
     with pytest.raises(ValueError, match=r"include.*host"):
         XuiClient("http://panel", username="u", password="p")
+
+
+# ---------------------------------------------------------------------------
+# Xray Settings API — the Phase 26 / Hotfix #14 endpoints.
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_get_xray_setting_decodes_double_encoded_obj(client: XuiClient):
+    """Hotfix #14: get_xray_setting must decode the double-encoded `obj`.
+
+    Upstream `internal/web/controller/xray_setting.go::getXraySetting` builds
+    a map, calls `json.Marshal(xrayResponse)`, then `jsonObj(c, string(result),
+    nil)` — passing a Go **string**. `jsonObj` → `jsonMsgObj` sets `Obj: obj`
+    with no re-decode, so the wire shape is:
+
+        {"success": true, "msg": "", "obj": "{\"xraySetting\":{...},\"inboundTags\":[...]}"}
+
+    i.e. `obj` is a JSON *string*, unlike every other endpoint (e.g.
+    `list_inbounds` returns a real array). Inside that decoded map,
+    `xraySetting` itself is `json.RawMessage(...)` → decodes to a real dict.
+
+    This is the root cause of Phase 26 Bug #1 ("only the inbound is created —
+    no outbound, route or routing path"): `_mutate_template` called
+    `setting.get("xraySetting")` on a `str` → `AttributeError` →
+    `apply_country_binding`'s broad `except Exception` swallowed it into a
+    return value that nothing logged, so routing silently never got written.
+    """
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(
+        json={"success": True, "msg": ""},
+        cookies={"session": "test-session"},
+    )
+
+    # The real upstream envelope: obj is a JSON **string**.
+    inner_map = {
+        "xraySetting": {
+            "log": {"loglevel": "warning"},
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": []},
+        },
+        "inboundTags": ["in-30001-tcp", "in-30002-tcp"],
+        "clientReverseTags": [],
+        "outboundTestUrl": "https://www.google.com/generate_204",
+    }
+    double_encoded_obj = json.dumps(inner_map)
+    respx.post(BASE + "panel/api/xray/").respond(
+        json={"success": True, "msg": "", "obj": double_encoded_obj}
+    )
+
+    result = await client.get_xray_setting()
+
+    # After decoding, it's a real dict whose xraySetting is usable.
+    assert isinstance(result, dict)
+    assert "xraySetting" in result
+    assert isinstance(result["xraySetting"], dict)
+    assert result["xraySetting"]["log"]["loglevel"] == "warning"
+    assert result["inboundTags"] == ["in-30001-tcp", "in-30002-tcp"]
+
+
+@respx.mock
+async def test_get_xray_setting_handles_already_decoded_obj(client: XuiClient):
+    """Defensive: some 3x-ui builds or future fixes may return `obj` as a dict."""
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(
+        json={"success": True, "msg": ""},
+        cookies={"session": "test-session"},
+    )
+
+    # A hypothetical fixed upstream that returns obj as a real dict.
+    inner_map = {
+        "xraySetting": {
+            "log": {"loglevel": "warning"},
+            "outbounds": [],
+            "routing": {"rules": []},
+        },
+        "inboundTags": [],
+    }
+    respx.post(BASE + "panel/api/xray/").respond(
+        json={"success": True, "msg": "", "obj": inner_map}
+    )
+
+    result = await client.get_xray_setting()
+
+    assert isinstance(result, dict)
+    assert "xraySetting" in result
+    assert result["xraySetting"]["log"]["loglevel"] == "warning"
+
+
+@respx.mock
+async def test_get_xray_setting_rejects_malformed_json_string(client: XuiClient):
+    """When obj is a string but not valid JSON, raise XuiClientError."""
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(
+        json={"success": True, "msg": ""},
+        cookies={"session": "test-session"},
+    )
+
+    respx.post(BASE + "panel/api/xray/").respond(
+        json={"success": True, "msg": "", "obj": "not valid json"}
+    )
+
+    with pytest.raises(XuiClientError, match=r"obj is not valid JSON"):
+        await client.get_xray_setting()
+
+
+@respx.mock
+async def test_get_xray_setting_handles_empty_obj_string(client: XuiClient):
+    """An empty or whitespace-only obj string returns {}."""
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(
+        json={"success": True, "msg": ""},
+        cookies={"session": "test-session"},
+    )
+
+    respx.post(BASE + "panel/api/xray/").respond(
+        json={"success": True, "msg": "", "obj": "   "}
+    )
+
+    result = await client.get_xray_setting()
+    assert result == {}
+
+
+@respx.mock
+async def test_update_xray_setting_posts_form_data(client: XuiClient):
+    """update_xray_setting POSTs xraySetting as form data, not JSON."""
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(
+        json={"success": True, "msg": ""},
+        cookies={"session": "test-session"},
+    )
+
+    template = {"log": {"loglevel": "debug"}, "outbounds": [], "routing": {"rules": []}}
+    respx.post(BASE + "panel/api/xray/update").respond(
+        json={"success": True, "msg": ""}
+    )
+
+    await client.update_xray_setting(json.dumps(template, indent=2))
+
+    # Verify the POST used form data, not application/json.
+    assert respx.calls.last.request.headers.get("content-type").startswith(
+        "application/x-www-form-urlencoded"
+    )
