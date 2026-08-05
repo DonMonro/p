@@ -674,17 +674,53 @@ and the helper strips BOTH entries in one pass. The applier script
 restarts `x-ui.service` exactly once per trigger batch (only if at least
 one patch mutated the config).
 
+### Hotfix #11 — the same patch must ALSO be written to `x-ui.db`
+
+Hotfix #10 (above) wrote only `/usr/local/x-ui/bin/config.json` and was
+verified **ineffective in production**. 3x-ui **regenerates** that file
+from its SQLite DB on every service start — so the `systemctl restart
+x-ui.service` that the applier issues at the end of its own run wiped the
+outbounds and routing rules it had just written. Traffic kept falling
+through to `outbounds[0]` (`freedom`/`direct`) and egressed on the
+server's own IP.
+
+The fix: the applier now patches the **source of truth** first. 3x-ui
+stores its Xray template in the `settings` table (columns `id, key,
+value`) under the key `xrayTemplateConfig` — a JSON string holding the
+top-level `outbounds[]` and `routing{}`. `installer/xray_db_apply.py`
+applies the exact same upsert/strip logic to that template, so the
+regeneration *reproduces* our entries instead of dropping them. The
+`config.json` write is retained as belt-and-braces for the
+currently-running Xray process.
+
+DB path resolution: `PSIPHON_XUI_DB_PATH` (tests) → `/usr/local/x-ui/x-ui.db`
+→ `/etc/x-ui/x-ui.db`. Writes use a `BEGIN IMMEDIATE` transaction so a
+concurrent 3x-ui write is serialised rather than lost.
+
+> ⚠️ **Helper order is load-bearing.** `xray_apply.py` unlinks the patch
+> file on every exit path, so `xray_db_apply.py` MUST run first — it
+> deliberately does not unlink. Reversing the two silently reverts this
+> hotfix (the DB helper would find no file to read, and nothing would
+> survive the restart).
+
 ### See also
 
 * `panel/dashboard/router.py::_enqueue_xray_patch` — panel-side queue
   writer (`tempfile.mkstemp` + `os.replace`; honours
   `PSIPHON_XRAY_PATCH_QUEUE_DIR` for tests).
-* `installer/xray_applier.sh` + `installer/xray_apply.py` — root-side
-  consumer + stdlib-only JSON merger.
+* `installer/xray_applier.sh` — root-side consumer; runs
+  `xray_db_apply.py` then `xray_apply.py` per patch, then restarts x-ui
+  once.
+* `installer/xray_db_apply.py` — stdlib-only patcher for the DB's
+  `xrayTemplateConfig` (the durable write).
+* `installer/xray_apply.py` — stdlib-only JSON merger for the live
+  `config.json` (also consumes the patch file).
 * `systemd/psiphon-xray-applier.path` + `.service` — trigger + oneshot
   runner.
 * `tests/test_dashboard.py::TestEnqueueXrayPatch` — panel-side contract
   tests.
+* `tests/test_xray_db_apply.py` — DB-helper contract tests (apply /
+  remove / idempotency / exit codes / missing-key seeding).
 * `tests/test_hardening.py::TestHotfix23PostReleaseRegressions` — source
   greps pinning the applier wiring.
 

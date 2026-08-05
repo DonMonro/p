@@ -543,6 +543,12 @@ EOF
             "${SCRIPT_DIR}/installer/xray_apply.py" \
             "${APPLIER_LIBEXEC_DIR}/xray_apply.py" \
             || warn "install of xray_apply.py failed (continuing)."
+    fi
+    if [[ -f "${SCRIPT_DIR}/installer/xray_db_apply.py" ]]; then
+        install -m 0755 -o root -g root \
+            "${SCRIPT_DIR}/installer/xray_db_apply.py" \
+            "${APPLIER_LIBEXEC_DIR}/xray_db_apply.py" \
+            || warn "install of xray_db_apply.py failed (continuing)."
     else
         warn "Missing ${SCRIPT_DIR}/installer/xray_apply.py — the applier sidecar will not be installed (re-clone the repo)."
     fi
