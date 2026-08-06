@@ -66,7 +66,7 @@ from ..wizard.apply import PortAssignmentSpec, apply_country
 # Phase 25 (Feature A/C/D): single-country clone helper — shared by the
 # extended PATCH (enable-with-inbound) and the new _reclone endpoint.
 from ..wizard.clone import clone_for_country
-from .xray_routing import remove_country_binding
+from .xray_routing import apply_country_binding, remove_country_binding
 from .xui_client import XuiClient, XuiClientError
 
 _log = logging.getLogger(__name__)
@@ -756,6 +756,85 @@ async def patch_country(
                     "patch_country routing for %s failed: %s",
                     country.code, clone_result.get("routing_error"),
                 )
+    elif body.enabled:
+        # ── Phase 26 Hotfix #15 ──────────────────────────────────────────────
+        # Enabling WITHOUT a fresh clone still has to restore the routing
+        # binding, because disabling strips it.
+        #
+        # The disable branch above calls remove_country_binding (dropping the
+        # outbound + rule) but deliberately does NOT delete the inbound. So a
+        # plain disable → re-enable cycle used to end with the inbound present
+        # and its outbound/rule gone, and the SPA's bare toggle sends no
+        # inbound_id when the country already has ports (see
+        # dashboard.html::toggleEnabled) — which is exactly the reported
+        # "adding a country from the panel only creates an inbound" symptom:
+        # traffic falls through to the default freedom outbound and egresses on
+        # the server's own IP.
+        #
+        # Re-bind from the CloneRecord, using the tag the panel currently holds
+        # for that inbound rather than a guessed "in-<port>-tcp" —
+        # resolveInboundTag() may have assigned a collision suffix when the
+        # inbound was first created, and a rule naming the wrong tag matches
+        # nothing. Best-effort: never block the enable.
+        existing_clone = (
+            db.query(CloneRecord).filter(CloneRecord.country_code == country.code).first()
+        )
+        if existing_clone is not None and assignment is not None:
+            rb_client: XuiClient | None = None
+            try:
+                rb_client = await _async_get_xui_client(db)
+                if rb_client is None:
+                    routing_result = {
+                        "applied": False,
+                        "error": "no cached 3x-ui creds — cannot restore routing",
+                    }
+                else:
+                    inbound_id = int(existing_clone.inbound_id)
+                    tag: str | None = None
+                    try:
+                        # get_inbound returns the UNWRAPPED obj, not the
+                        # {"obj": ...} envelope.
+                        inbound = await rb_client.get_inbound(inbound_id)
+                        if isinstance(inbound, dict) and isinstance(inbound.get("tag"), str):
+                            tag = inbound["tag"] or None
+                    except Exception as exc:  # noqa: BLE001
+                        _log.warning(
+                            "patch_country could not read tag for inbound %d (%s): %s",
+                            inbound_id, country.code, exc,
+                        )
+                    if tag is None:
+                        tag = f"in-{int(assignment.public_port)}-tcp"
+                    rok, rerr = await apply_country_binding(
+                        rb_client,
+                        country.code,
+                        int(assignment.socks_port),
+                        tag,
+                    )
+                    routing_result = {
+                        "applied": rok,
+                        "error": None if rok else rerr,
+                        "inbound_tag": tag,
+                    }
+                    if rok:
+                        _log.info(
+                            "patch_country restored routing for %s (inbound_tag=%s)",
+                            country.code, tag,
+                        )
+                    else:
+                        _log.warning(
+                            "patch_country routing restore for %s failed: %s",
+                            country.code, rerr,
+                        )
+            except Exception as exc:  # noqa: BLE001  never block the enable
+                routing_result = {
+                    "applied": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                _log.exception("patch_country routing restore raised for %s", country.code)
+            finally:
+                if rb_client is not None:
+                    with contextlib.suppress(Exception):
+                        await rb_client.aclose()
 
     response = _country_card(country, db)
     if apply_event is not None:
@@ -1188,6 +1267,13 @@ async def edit_country_ports(
                 if template_id is None:
                     summary["reclone_error"] = "template_inbound_id missing from Wizard.step_data"
                 else:
+                    # Phase 26 Hotfix #15: drop the stale routing rule BEFORE
+                    # re-cloning. The rule is keyed on the inbound tag, which
+                    # is derived from the PUBLIC PORT — and the public port is
+                    # exactly what this endpoint just changed. Leaving the old
+                    # rule behind would orphan it against a deleted inbound.
+                    with contextlib.suppress(Exception):
+                        await remove_country_binding(client, country.code)
                     new_inbound = await client.clone_inbound(
                         template_id=template_id,
                         country=country_dict,
@@ -1208,6 +1294,29 @@ async def edit_country_ports(
                     )
                     db.commit()
                     summary["recloned_inbound"] = True
+
+                    # Phase 26 Hotfix #15: re-bind the outbound + routing rule.
+                    # This handler re-clones the inbound directly via
+                    # client.clone_inbound() rather than going through
+                    # clone_for_country(), so it never inherited the routing
+                    # binding that helper performs. Without this the country
+                    # ends up with an inbound and no outbound/rule — traffic
+                    # falls through to the default freedom outbound and
+                    # egresses on the server's own IP.
+                    #
+                    # Bind against the tag 3x-ui ACTUALLY assigned: upstream's
+                    # resolveInboundTag() only honours a requested tag when it
+                    # is still free, otherwise it appends a collision suffix
+                    # ("-2") or swaps the protocol segment. A guessed
+                    # "in-<port>-tcp" would produce a rule matching nothing.
+                    new_tag = new_inbound["obj"].get("tag") or f"in-{public_port}-tcp"
+                    rok, rerr = await apply_country_binding(
+                        client, country.code, socks_port, new_tag
+                    )
+                    summary["xray_routing"] = rok
+                    summary["inbound_tag"] = new_tag
+                    if not rok:
+                        summary["xray_routing_error"] = rerr
         except XuiClientError as exc:
             summary["reclone_error"] = str(exc)
         except Exception as exc:  # noqa: BLE001
@@ -1356,10 +1465,20 @@ async def reapply_all(
                             continue
                         try:
                             old_id = int(clone.inbound_id)
+                            # Capture before db.delete(clone) — reading a
+                            # deleted row's attributes is fragile once the
+                            # session flushes.
+                            c_socks = int(clone.socks_port)
+                            c_public = int(clone.public_port)
                             try:
                                 await client.delete_inbound(old_id)
                             except XuiClientError as exc:
                                 _log.warning("reapply delete_inbound(%s) failed: %s", old_id, exc)
+                            # Phase 26 Hotfix #15: strip the stale rule bound
+                            # to the inbound we just deleted, so the re-bind
+                            # below leaves exactly one rule for this country.
+                            with contextlib.suppress(Exception):
+                                await remove_country_binding(client, country.code)
                             new_inbound = await client.clone_inbound(
                                 template_id=template_id,
                                 country={
@@ -1367,8 +1486,8 @@ async def reapply_all(
                                     "name": country.name,
                                     "flag": country.flag_emoji or "",
                                 },
-                                socks_port=int(clone.socks_port),
-                                public_port=int(clone.public_port),
+                                socks_port=c_socks,
+                                public_port=c_public,
                             )
                             new_id = int(new_inbound["obj"]["id"])
                             db.delete(clone)
@@ -1376,19 +1495,42 @@ async def reapply_all(
                                 CloneRecord(
                                     inbound_id=new_id,
                                     country_code=country.code,
-                                    public_port=int(clone.public_port),
-                                    socks_port=int(clone.socks_port),
+                                    public_port=c_public,
+                                    socks_port=c_socks,
                                     healthy=True,
                                 )
                             )
                             db.commit()
+                            # Phase 26 Hotfix #15: re-bind the outbound +
+                            # routing rule against the tag 3x-ui actually
+                            # assigned. Like the _ports handler, this path
+                            # clones directly instead of via clone_for_country,
+                            # so it never inherited the binding step — a
+                            # "reapply" would otherwise resurrect the inbound
+                            # while leaving the country egressing on the
+                            # server's own IP.
+                            new_tag = (
+                                new_inbound["obj"].get("tag") or f"in-{c_public}-tcp"
+                            )
+                            rok, rerr = await apply_country_binding(
+                                client, country.code, c_socks, new_tag
+                            )
                             summary["recloned"].append(
                                 {
                                     "code": country.code,
                                     "old_inbound_id": old_id,
                                     "new_inbound_id": new_id,
+                                    "inbound_tag": new_tag,
+                                    "routing_applied": rok,
                                 }
                             )
+                            if not rok:
+                                summary["reclone_errors"].append(
+                                    {
+                                        "code": country.code,
+                                        "error": f"routing bind failed: {rerr}",
+                                    }
+                                )
                         except XuiClientError as exc:
                             summary["reclone_errors"].append(
                                 {

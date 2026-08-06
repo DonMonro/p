@@ -5868,7 +5868,14 @@ class TestHotfix23PostReleaseRegressions:
         text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
         assert "_apply_psiphon_xray_outbound_and_rule(" not in text
         assert "_remove_psiphon_xray_outbound_and_rule(" not in text
-        assert "from .xray_routing import remove_country_binding" in text
+        # Match the import by name rather than by exact line: Hotfix #15 added
+        # apply_country_binding to the same `from .xray_routing import ...`
+        # statement, and a literal-string pin would fail on that purely
+        # cosmetic change while still passing if the symbol were dropped.
+        imports = re.findall(r"from \.xray_routing import ([^\n(]+)", text)
+        imported = {n.strip() for line in imports for n in line.split(",")}
+        assert "remove_country_binding" in imported
+        assert "apply_country_binding" in imported
         for fn in ("patch_country", "reclone_country", "delete_country"):
             m = re.search(
                 rf"async\s+def\s+{fn}\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
@@ -5882,6 +5889,37 @@ class TestHotfix23PostReleaseRegressions:
             )
             assert "_enqueue_xray_patch(" not in body, (
                 f"{fn} still uses the superseded queue sidecar"
+            )
+
+    def test_panel_router_handlers_that_create_inbounds_bind_routing(self):
+        """Phase 26 Hotfix #15: every handler that can leave a country with a
+        live inbound must also (re-)write that country's outbound + routing
+        rule.
+
+        ``streamSettings.outbound`` is persisted by 3x-ui but ignored by Xray's
+        routing engine, so an inbound with no top-level binding silently
+        egresses on the server's own IP — the reported symptom. Three handlers
+        create or revive an inbound without going through
+        ``clone_for_country`` (which binds internally):
+
+        * ``patch_country`` — a bare re-enable after a disable, where the
+          disable stripped the binding but left the inbound in place
+        * ``edit_country_ports`` — re-clones directly; the tag is derived from
+          the public port, so changing the port orphans the old rule
+        * ``reapply_all`` — re-clones unhealthy inbounds directly
+
+        Each must call ``apply_country_binding``.
+        """
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        for fn in ("patch_country", "edit_country_ports", "reapply_all"):
+            m = re.search(
+                rf"async\s+def\s+{fn}\b.*?(?=\n@router\.|\nasync\s+def|\ndef\s|\nclass\s|\Z)",
+                text,
+                flags=re.DOTALL,
+            )
+            assert m, f"{fn} handler missing"
+            assert "apply_country_binding(" in m.group(0), (
+                f"{fn} can leave a live inbound with no outbound/routing rule"
             )
 
     def test_panel_clone_helper_binds_routing_via_api(self):

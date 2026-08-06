@@ -331,6 +331,9 @@ class FakeXuiClient:
     clone_inbound_result: dict | None = None
     clone_inbound_raises: type[Exception] | Exception | None = None
     clone_inbound_calls: list[tuple[int, dict, int, int]] = []
+    get_inbound_result: dict | None = None
+    get_inbound_raises: type[Exception] | Exception | None = None
+    get_inbound_calls: list[int] = []
 
     # Phase 26: the in-memory Xray template the routing binder reads/writes
     # via get_xray_setting / update_xray_setting. Replaces the Hotfix #10
@@ -393,6 +396,21 @@ class FakeXuiClient:
             raise exc if isinstance(exc, Exception) else exc("fake delete_inbound")
         return {"obj": ""}
 
+    async def get_inbound(self, inbound_id: int) -> dict:
+        """Return the inbound object, UNWRAPPED — matching the real client.
+
+        ``XuiClient.get_inbound`` returns ``data["obj"]``, not the envelope.
+        Phase 26 Hotfix #15 uses this to recover the tag 3x-ui actually
+        assigned when re-binding routing on a bare re-enable.
+        """
+        FakeXuiClient.get_inbound_calls.append(int(inbound_id))
+        exc = FakeXuiClient.get_inbound_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake get_inbound")
+        if FakeXuiClient.get_inbound_result is not None:
+            return FakeXuiClient.get_inbound_result
+        return {"id": int(inbound_id), "tag": f"fake-tag-{inbound_id}", "enable": True}
+
     async def clone_inbound(
         self, *, template_id: int, country: dict, socks_port: int, public_port: int
     ) -> dict:
@@ -402,8 +420,14 @@ class FakeXuiClient:
         if self.clone_inbound_raises is not None:
             raise_ = self.clone_inbound_raises
             raise raise_ if isinstance(raise_, Exception) else raise_("fake clone_inbound")
-        # Default success response mirrors the real 3x-ui add shape.
-        return FakeXuiClient.clone_inbound_result or {"obj": {"id": 31001}}
+        # Default success response mirrors the real 3x-ui add shape — including
+        # the `tag` field, which upstream's resolveInboundTag() always sets and
+        # which the routing binder must key its rule on. Omitting it here would
+        # let a caller that guesses "in-<port>-tcp" pass the test while writing
+        # a rule that matches nothing in production.
+        return FakeXuiClient.clone_inbound_result or {
+            "obj": {"id": 31001, "tag": "in-31001-tcp"}
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -414,6 +438,9 @@ def _patch_xui_client(monkeypatch):
     FakeXuiClient.clone_inbound_result = None
     FakeXuiClient.clone_inbound_raises = None
     FakeXuiClient.clone_inbound_calls = []
+    FakeXuiClient.get_inbound_result = None
+    FakeXuiClient.get_inbound_raises = None
+    FakeXuiClient.get_inbound_calls = []
     FakeXuiClient.xray_template = None
     FakeXuiClient.xray_updates = []
     FakeXuiClient.xray_get_raises = None
@@ -1542,3 +1569,278 @@ class TestChangePanelPort:
         r = client.post("/api/dashboard/change-panel-port", json={"new_port": 31001})
         assert r.status_code == 400
         assert "US" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 26 Hotfix #15 — routing binding on the DASHBOARD (post-wizard) paths.
+# ---------------------------------------------------------------------------
+def _us_rule(template: dict) -> dict | None:
+    """The routing rule bound to psiphon-out-US, or None."""
+    rules = template.get("routing", {}).get("rules", [])
+    for r in rules:
+        if isinstance(r, dict) and r.get("outboundTag") == "psiphon-out-US":
+            return r
+    return None
+
+
+def _us_outbound(template: dict) -> dict | None:
+    """The psiphon-out-US outbound entry, or None."""
+    for ob in template.get("outbounds", []):
+        if isinstance(ob, dict) and ob.get("tag") == "psiphon-out-US":
+            return ob
+    return None
+
+
+class TestDashboardRoutingBinding:
+    """Every dashboard surface that leaves an inbound in place must also leave
+    a matching outbound + routing rule in place.
+
+    The wizard path was fixed in Phase 26 / Hotfix #14. These cover the
+    *post-wizard* panel surfaces, which is where the operator reported
+    "only an inbound is created - no outbound, no route", leaving the country
+    egressing on the server's own IP.
+    """
+
+    def test_reenable_after_disable_restores_outbound_and_rule(
+        self, monkeypatch, tmp_path
+    ):
+        """THE reported bug: disable then re-enable loses the routing binding.
+
+        The disable branch calls remove_country_binding (stripping the outbound
+        + rule) but deliberately does NOT delete the inbound. The SPA's bare
+        toggle sends no inbound_id once a country already has ports
+        (dashboard.html::toggleEnabled), so the re-enable used to clone nothing
+        and re-bind nothing - leaving exactly the reported end state.
+        """
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _seed_xui_link()
+        # 3x-ui handed this inbound a collision-suffixed tag, so a guessed
+        # "in-31001-tcp" would bind a rule that matches nothing.
+        FakeXuiClient.get_inbound_result = {"id": 31001, "tag": "in-31001-tcp-2"}
+        # Start from a template that already carries the binding.
+        FakeXuiClient.xray_template = _stock_xray_template()
+        FakeXuiClient.xray_template["outbounds"].append(
+            {
+                "tag": "psiphon-out-US",
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{"address": "127.0.0.1", "port": 11001, "users": []}]
+                },
+            }
+        )
+        FakeXuiClient.xray_template["routing"]["rules"].insert(
+            0,
+            {
+                "type": "field",
+                "inboundTag": ["in-31001-tcp-2"],
+                "outboundTag": "psiphon-out-US",
+            },
+        )
+
+        # 1. Disable - strips the outbound + rule, keeps the inbound.
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": False})
+        assert r.status_code == 200
+        assert _us_outbound(FakeXuiClient.xray_template) is None
+        assert _us_rule(FakeXuiClient.xray_template) is None
+        assert 31001 not in FakeXuiClient.delete_inbound_calls  # inbound survives
+
+        # 2. Re-enable with a BARE toggle (no inbound_id) - must restore both.
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+
+        ob = _us_outbound(FakeXuiClient.xray_template)
+        assert ob is not None, "re-enable left the country with no outbound"
+        assert ob["settings"]["servers"][0]["port"] == 11001
+
+        rule = _us_rule(FakeXuiClient.xray_template)
+        assert rule is not None, "re-enable left the country with no routing rule"
+        # Bound to the tag the panel ACTUALLY holds, not a guess.
+        assert rule["inboundTag"] == ["in-31001-tcp-2"]
+        assert 31001 in FakeXuiClient.get_inbound_calls
+
+        body = r.json()
+        assert body["routing_result"]["applied"] is True
+        assert body["routing_result"]["inbound_tag"] == "in-31001-tcp-2"
+
+    def test_reenable_rule_precedes_catch_alls(self, monkeypatch, tmp_path):
+        """The restored rule must sit above bittorrent/geoip:private.
+
+        Xray evaluates rules top-to-bottom and stops at the first hit, so a
+        rule appended after the stock catch-alls would never be reached.
+        """
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _seed_xui_link()
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+
+        rules = FakeXuiClient.xray_template["routing"]["rules"]
+        assert rules[0]["outboundTag"] == "psiphon-out-US"
+        assert rules[1]["protocol"] == ["bittorrent"]
+
+    def test_reenable_keeps_direct_outbound_first(self, monkeypatch, tmp_path):
+        """outbounds[0] is Xray's default egress - it must stay `direct`."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _seed_xui_link()
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+        assert FakeXuiClient.xray_template["outbounds"][0]["tag"] == "direct"
+
+    def test_reenable_without_clone_record_is_a_no_op(self, monkeypatch, tmp_path):
+        """A country with no inbound has nothing to bind - must not 500."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_xui_link()
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+        assert r.json()["enabled"] is True
+        assert FakeXuiClient.xray_updates == []
+
+    def test_reenable_routing_failure_does_not_block_enable(
+        self, monkeypatch, tmp_path
+    ):
+        """A routing failure is reported, never fatal - the inbound already
+        exists, so unwinding the enable would strand the operator."""
+        from panel.dashboard.xui_client import XuiClientError
+
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _seed_xui_link()
+        FakeXuiClient.xray_get_raises = XuiClientError
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+        assert r.json()["enabled"] is True
+        assert r.json()["routing_result"]["applied"] is False
+        assert r.json()["routing_result"]["error"]
+
+    def test_reenable_falls_back_to_derived_tag_when_get_inbound_fails(
+        self, monkeypatch, tmp_path
+    ):
+        """If the tag cannot be read, still bind rather than skipping entirely -
+        a derived tag is a guess, but no rule at all is a guaranteed failure."""
+        from panel.dashboard.xui_client import XuiClientError
+
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _seed_xui_link()
+        FakeXuiClient.get_inbound_raises = XuiClientError
+
+        r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
+        assert r.status_code == 200
+        rule = _us_rule(FakeXuiClient.xray_template)
+        assert rule is not None
+        assert rule["inboundTag"] == ["in-31001-tcp"]
+
+    def test_edit_ports_rebinds_routing_to_new_tag(self, monkeypatch, tmp_path):
+        """Changing the public port changes the inbound tag - the rule must
+        follow, and exactly one rule must remain."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
+        )
+        _set_wizard_step_data({"template": {"template_inbound_id": 17}})
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {
+            "obj": {"id": 31002, "tag": "in-31099-tcp"}
+        }
+        # Pre-existing binding on the OLD port/tag.
+        FakeXuiClient.xray_template = _stock_xray_template()
+        FakeXuiClient.xray_template["routing"]["rules"].insert(
+            0,
+            {
+                "type": "field",
+                "inboundTag": ["in-31001-tcp"],
+                "outboundTag": "psiphon-out-US",
+            },
+        )
+
+        r = client.post(
+            "/api/dashboard/countries/US/_ports",
+            json={"socks_port": 11099, "public_port": 31099},
+        )
+        assert r.status_code == 200
+
+        rule = _us_rule(FakeXuiClient.xray_template)
+        assert rule is not None, "edit-ports left the country with no routing rule"
+        assert rule["inboundTag"] == ["in-31099-tcp"]
+
+        ob = _us_outbound(FakeXuiClient.xray_template)
+        assert ob is not None
+        assert ob["settings"]["servers"][0]["port"] == 11099
+
+        # Exactly one rule - no stale entry pointing at the deleted inbound.
+        us_rules = [
+            x
+            for x in FakeXuiClient.xray_template["routing"]["rules"]
+            if x.get("outboundTag") == "psiphon-out-US"
+        ]
+        assert len(us_rules) == 1
+
+    def test_reapply_rebinds_routing_after_reclone(self, monkeypatch, tmp_path):
+        """The reapply sweep re-clones unhealthy inbounds - it must re-bind
+        them too, otherwise "reapply" resurrects the inbound and leaves the
+        country egressing on the server's own IP."""
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        _seed_clone(
+            country_code="US",
+            inbound_id=31001,
+            socks_port=11001,
+            public_port=31001,
+            healthy=False,
+        )
+        _set_wizard_step_data({"template": {"template_inbound_id": 17}})
+        _seed_xui_link()
+        FakeXuiClient.clone_inbound_result = {
+            "obj": {"id": 31002, "tag": "in-31001-tcp-2"}
+        }
+
+        r = client.post("/api/dashboard/reapply")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["recloned"]) == 1
+        assert body["recloned"][0]["routing_applied"] is True
+        assert body["recloned"][0]["inbound_tag"] == "in-31001-tcp-2"
+
+        rule = _us_rule(FakeXuiClient.xray_template)
+        assert rule is not None, "reapply left the country with no routing rule"
+        assert rule["inboundTag"] == ["in-31001-tcp-2"]
+        assert _us_outbound(FakeXuiClient.xray_template) is not None
