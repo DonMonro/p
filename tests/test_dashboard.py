@@ -335,6 +335,11 @@ class FakeXuiClient:
     get_inbound_raises: type[Exception] | Exception | None = None
     get_inbound_calls: list[int] = []
 
+    # Phase 27 (item 2): ports already held by 3x-ui inbounds, which
+    # _gather_claimed_ports must treat as unavailable.
+    list_inbounds_result: list[dict] | None = None
+    list_inbounds_raises: type[Exception] | Exception | None = None
+
     # Phase 26: the in-memory Xray template the routing binder reads/writes
     # via get_xray_setting / update_xray_setting. Replaces the Hotfix #10
     # queue-file stubbing — routing now goes through the panel's own API.
@@ -411,6 +416,18 @@ class FakeXuiClient:
             return FakeXuiClient.get_inbound_result
         return {"id": int(inbound_id), "tag": f"fake-tag-{inbound_id}", "enable": True}
 
+    async def list_inbounds(self) -> list[dict]:
+        """Return the inbounds 3x-ui currently holds.
+
+        Phase 27 (item 2): ``_gather_claimed_ports`` calls this to reject ports
+        already bound by a 3x-ui inbound — including inbounds the operator
+        created by hand, which no PortAssignment row knows about.
+        """
+        exc = FakeXuiClient.list_inbounds_raises
+        if exc is not None:
+            raise exc if isinstance(exc, Exception) else exc("fake list_inbounds")
+        return list(FakeXuiClient.list_inbounds_result or [])
+
     async def clone_inbound(
         self, *, template_id: int, country: dict, socks_port: int, public_port: int
     ) -> dict:
@@ -446,6 +463,8 @@ def _patch_xui_client(monkeypatch):
     FakeXuiClient.get_inbound_result = None
     FakeXuiClient.get_inbound_raises = None
     FakeXuiClient.get_inbound_calls = []
+    FakeXuiClient.list_inbounds_result = None
+    FakeXuiClient.list_inbounds_raises = None
     FakeXuiClient.xray_template = None
     FakeXuiClient.xray_updates = []
     FakeXuiClient.xray_get_raises = None
@@ -798,7 +817,7 @@ class TestPatchCountryWithInbound:
 
     def test_enable_with_inbound_falls_back_to_smart_ports(self, monkeypatch, tmp_path):
         """socks_port/public_port omitted → smart-recommendation defaults are
-        used (≥11000 / ≥31000, not colliding with other assignments)."""
+        used (≥11000 / ≥11050, unified floors in Phase 27)."""
         self._stub_apply(monkeypatch)
         client = _client(monkeypatch, tmp_path)
         _login(client)
@@ -812,7 +831,7 @@ class TestPatchCountryWithInbound:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["socks_port"] >= 11000
-        assert body["public_port"] >= 31000
+        assert body["public_port"] >= 11050
 
     def test_enable_existing_assignment_with_inbound_applies_and_clones(
         self, monkeypatch, tmp_path,
@@ -1293,6 +1312,133 @@ class TestEditPorts:
             json={"socks_port": 12002, "public_port": 32002},
         )
         assert r.status_code == 404
+
+
+# ===========================================================================
+# 5b. Phase 27 (item 2): universal pre-creation port-conflict checking
+# ===========================================================================
+class TestPortConflictChecking:
+    """Ports must be checked against EVERY claimant before being created.
+
+    A PortAssignment scan alone is not enough: the operator can create inbounds
+    by hand in 3x-ui, and unrelated processes can hold ports on the host. The
+    reported scenario is disable-one-country-then-enable-another, where the
+    freed port is silently reissued to something that already owns it.
+    """
+
+    def test_edit_ports_rejects_port_held_by_a_3xui_inbound(self, monkeypatch, tmp_path):
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_xui_link()
+        # An inbound the operator made by hand — no PortAssignment row knows of it.
+        FakeXuiClient.list_inbounds_result = [{"id": 55, "port": 32002}]
+
+        r = client.post(
+            "/api/dashboard/countries/US/_ports",
+            json={"socks_port": 12002, "public_port": 32002},
+        )
+        assert r.status_code == 409, r.text
+        assert "32002" in r.json()["detail"]
+
+    def test_edit_ports_allows_ports_no_one_holds(self, monkeypatch, tmp_path):
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_xui_link()
+        FakeXuiClient.list_inbounds_result = [{"id": 55, "port": 40404}]
+
+        r = client.post(
+            "/api/dashboard/countries/US/_ports",
+            json={"socks_port": 12002, "public_port": 32002},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_edit_ports_ignores_the_countrys_own_current_ports(self, monkeypatch, tmp_path):
+        """Re-submitting a country's existing ports is a no-op, not a conflict.
+
+        _gather_claimed_ports excludes the calling country, so US keeping its
+        own socks port while moving only the public port must still succeed.
+        """
+        client = _seed_us_full(monkeypatch, tmp_path)  # US holds 11001 / 31001
+        _seed_xui_link()
+
+        r = client.post(
+            "/api/dashboard/countries/US/_ports",
+            json={"socks_port": 11001, "public_port": 32002},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_enable_rejects_supplied_port_held_by_a_3xui_inbound(self, monkeypatch, tmp_path):
+        """The enable-with-ports modal must not create a conflicting inbound."""
+        from types import SimpleNamespace
+
+        from panel.dashboard import router as dashboard_router
+
+        monkeypatch.setattr(
+            dashboard_router,
+            "apply_country",
+            lambda spec: SimpleNamespace(status="healthy", message="ok"),
+        )
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+        FakeXuiClient.list_inbounds_result = [{"id": 55, "port": 31234}]
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 7, "socks_port": 11234, "public_port": 31234},
+        )
+        assert r.status_code == 409, r.text
+        assert "31234" in r.json()["detail"]
+
+    def test_smart_pick_skips_ports_held_by_3xui_inbounds(self, monkeypatch, tmp_path):
+        """The picker must walk past a 3x-ui-held port, not hand it out.
+
+        11000 and 11050 are the unified floors, so a bare enable would pick
+        exactly those. With both held by inbounds, the picker must move on.
+        """
+        from types import SimpleNamespace
+
+        from panel.dashboard import router as dashboard_router
+
+        monkeypatch.setattr(
+            dashboard_router,
+            "apply_country",
+            lambda spec: SimpleNamespace(status="healthy", message="ok", progress=100),
+        )
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="JP", enabled=False)
+        _seed_xui_link()
+        FakeXuiClient.list_inbounds_result = [
+            {"id": 1, "port": 11000},
+            {"id": 2, "port": 11050},
+        ]
+
+        r = client.patch(
+            "/api/dashboard/countries/JP",
+            json={"enabled": True, "inbound_id": 7},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["socks_port"] != 11000
+        assert body["public_port"] != 11050
+        assert body["socks_port"] >= 11000
+        assert body["public_port"] >= 11050
+
+    def test_port_probe_failure_does_not_block_creation(self, monkeypatch, tmp_path):
+        """A panel that is down must not wedge port allocation.
+
+        The 3x-ui probe is best-effort by design: the PortAssignment scan still
+        runs, so we degrade to the pre-Phase-27 guarantee rather than failing shut.
+        """
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_xui_link()
+        FakeXuiClient.list_inbounds_raises = RuntimeError("panel unreachable")
+
+        r = client.post(
+            "/api/dashboard/countries/US/_ports",
+            json={"socks_port": 12002, "public_port": 32002},
+        )
+        assert r.status_code == 200, r.text
 
 
 # ===========================================================================

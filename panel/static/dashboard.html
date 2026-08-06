@@ -436,7 +436,7 @@
 
         openPorts(c) {
           this.ports = { open: true, code: c.code,
-                         socks: c.socks_port || 11000, public: c.public_port || 31000 };
+                         socks: c.socks_port || 11000, public: c.public_port || 11050 };
         },
         closePorts() { this.ports.open = false; },
 

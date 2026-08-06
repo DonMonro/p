@@ -66,6 +66,8 @@ from .ports import (
     NoFreeRangeError,
     PortRange,
     PortRangeError,
+    SOCKS_PORT_FLOOR,
+    PUBLIC_PORT_FLOOR,
     WizardPortsInput,
     _listening_ports_sync,
     recommend_port_range,
@@ -338,17 +340,20 @@ def submit_ports(
         busy = set()
 
     # Smart-recommendation path: ignore incoming ranges, return computed ones.
+    # Phase 27: SOCKS from 11000+, Public from 11050+, unified with the panel.
     if body.use_recommendation:
         try:
             socks_range = recommend_port_range(
                 num_countries,
                 busy=busy,
                 extra_reserved={panel_port},
+                start_at=SOCKS_PORT_FLOOR,
             )
             public_range = recommend_port_range(
                 num_countries,
                 busy=busy,
                 extra_reserved={panel_port} | set(range(socks_range.start, socks_range.end + 1)),
+                start_at=PUBLIC_PORT_FLOOR,
             )
         except NoFreeRangeError as exc:
             raise HTTPException(
