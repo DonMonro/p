@@ -1280,7 +1280,8 @@ async def edit_country_ports(
                         socks_port=socks_port,
                         public_port=public_port,
                     )
-                    new_id = int(new_inbound["obj"]["id"])
+                    new_obj = _clone_response_obj(new_inbound)
+                    new_id = int(new_obj["id"])
                     # Swap the CloneRecord row to the new inbound id.
                     db.delete(clone)
                     db.add(
@@ -1309,7 +1310,7 @@ async def edit_country_ports(
                     # is still free, otherwise it appends a collision suffix
                     # ("-2") or swaps the protocol segment. A guessed
                     # "in-<port>-tcp" would produce a rule matching nothing.
-                    new_tag = new_inbound["obj"].get("tag") or f"in-{public_port}-tcp"
+                    new_tag = new_obj.get("tag") or f"in-{public_port}-tcp"
                     rok, rerr = await apply_country_binding(
                         client, country.code, socks_port, new_tag
                     )
@@ -1327,6 +1328,38 @@ async def edit_country_ports(
                     await client.aclose()
 
     return summary
+
+
+def _clone_response_obj(resp: Any) -> dict[str, Any]:
+    """Normalise a ``clone_inbound`` / ``add_inbound`` response to the inbound dict.
+
+    :meth:`XuiClient.add_inbound` already returns ``data["obj"]`` — the
+    **unwrapped** inbound object (``{"id": ..., "tag": ...}``), not the
+    ``{"obj": {...}}`` envelope — and ``clone_inbound`` returns that verbatim.
+    Indexing ``resp["obj"]`` therefore raises ``KeyError`` against the real
+    panel.
+
+    That is not hypothetical: it is the Phase 26 Hotfix #16 bug. Both re-clone
+    sites did ``int(new_inbound["obj"]["id"])``, the KeyError was swallowed by
+    the handler's blanket ``except Exception`` into ``reclone_error``, the
+    endpoint still returned HTTP 200 — and because the exception fired
+    *between* the successful ``clone_inbound`` and the routing bind, the
+    inbound was created in 3x-ui while its outbound and routing rule never
+    were. That is exactly the reported "only an inbound is created" symptom.
+
+    The tests missed it because the fakes were stubbed with the envelope shape
+    at these two call sites (and the unwrapped shape everywhere else), so they
+    asserted against the bug rather than the client's contract.
+
+    Accept either shape so a future 3x-ui build that does return an envelope
+    cannot resurrect this.
+    """
+    if not isinstance(resp, dict):
+        raise XuiClientError(f"clone response is {type(resp).__name__}, not an object")
+    inner = resp.get("obj")
+    if isinstance(inner, dict):
+        return inner
+    return resp
 
 
 def _read_template_id_from_wizard(wizard: Wizard | None) -> int | None:
@@ -1489,7 +1522,8 @@ async def reapply_all(
                                 socks_port=c_socks,
                                 public_port=c_public,
                             )
-                            new_id = int(new_inbound["obj"]["id"])
+                            new_obj = _clone_response_obj(new_inbound)
+                            new_id = int(new_obj["id"])
                             db.delete(clone)
                             db.add(
                                 CloneRecord(
@@ -1510,7 +1544,7 @@ async def reapply_all(
                             # while leaving the country egressing on the
                             # server's own IP.
                             new_tag = (
-                                new_inbound["obj"].get("tag") or f"in-{c_public}-tcp"
+                                new_obj.get("tag") or f"in-{c_public}-tcp"
                             )
                             rok, rerr = await apply_country_binding(
                                 client, country.code, c_socks, new_tag

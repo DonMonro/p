@@ -43,6 +43,7 @@ its own dedicated test class:
 
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
@@ -5890,6 +5891,42 @@ class TestHotfix23PostReleaseRegressions:
             assert "_enqueue_xray_patch(" not in body, (
                 f"{fn} still uses the superseded queue sidecar"
             )
+
+    def test_panel_router_never_indexes_obj_on_a_clone_response(self):
+        """Phase 26 Hotfix #16: ``clone_inbound`` returns the UNWRAPPED inbound.
+
+        ``XuiClient.add_inbound`` ends with ``return data.get("obj") or {}`` and
+        ``clone_inbound`` returns that verbatim, so the caller already holds
+        ``{"id": ..., "tag": ...}``. Indexing ``["obj"]`` on it raises KeyError
+        against the real panel.
+
+        That is not a cosmetic slip. Both re-clone sites did it, the blanket
+        ``except Exception`` in each handler swallowed the KeyError into a
+        ``reclone_error`` field, and the endpoint still returned HTTP 200 — so
+        the failure was invisible. Because it fired *between* the successful
+        clone and ``apply_country_binding``, 3x-ui ended up with an inbound
+        that had no outbound and no routing rule, and that country's users
+        egressed on the server's own IP.
+        """
+        text = (self.PANEL_ROOT / "dashboard" / "router.py").read_text(encoding="utf-8")
+        # Walk the AST rather than grepping: _clone_response_obj's docstring
+        # quotes the buggy expression verbatim to explain it, and a text scan
+        # cannot tell prose from code.
+        tree = ast.parse(text)
+        offenders = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in {"new_inbound", "clone_obj", "inbound"}
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "obj"
+            ):
+                offenders.append(f"{node.value.id}[\"obj\"] at line {node.lineno}")
+        assert not offenders, (
+            "router.py indexes ['obj'] on an already-unwrapped clone/inbound "
+            f"response, which raises KeyError in production: {offenders}"
+        )
 
     def test_panel_router_handlers_that_create_inbounds_bind_routing(self):
         """Phase 26 Hotfix #15: every handler that can leave a country with a

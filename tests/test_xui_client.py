@@ -642,3 +642,42 @@ async def test_update_xray_setting_posts_form_data(client: XuiClient):
     assert respx.calls.last.request.headers.get("content-type").startswith(
         "application/x-www-form-urlencoded"
     )
+
+
+@respx.mock
+async def test_clone_inbound_returns_unwrapped_obj_not_the_envelope(
+    client, template_json, clone_response_json
+):
+    """Phase 26 Hotfix #16: clone_inbound returns the inbound object ITSELF.
+
+    ``add_inbound`` ends with ``return data.get("obj") or {}``, so the caller
+    receives ``{"id": ..., "tag": ...}`` and NOT ``{"obj": {...}}``. Two
+    dashboard re-clone sites indexed ``resp["obj"]["id"]`` and raised KeyError
+    against the real panel; the swallowed exception fired between the
+    successful clone and the routing bind, leaving an inbound with no outbound
+    and no routing rule. Pin the contract at the HTTP boundary so a mis-shaped
+    in-process fake can never hide it again.
+    """
+    respx.get(BASE).respond(text=login_html())
+    respx.post(BASE + "login").respond(json={"success": True, "msg": "ok", "obj": None})
+    respx.get(BASE + f"panel/api/inbounds/get/{TEMPLATE_ID}").respond(
+        json={"success": True, "msg": "", "obj": template_json}
+    )
+    respx.post(BASE + "panel/api/inbounds/add").respond(
+        json={"success": True, "msg": "created", "obj": clone_response_json}
+    )
+
+    async with client:
+        clone = await client.clone_inbound(
+            template_id=TEMPLATE_ID,
+            country=COUNTRY,
+            socks_port=SOCKS_PORT,
+            public_port=PUBLIC_PORT,
+        )
+
+    # The envelope is gone: no "obj" key, and the id sits at the top level.
+    assert "obj" not in clone
+    assert clone["id"] == clone_response_json["id"]
+    # Indexing ["obj"] — the shipped bug — must blow up rather than silently work.
+    with pytest.raises(KeyError):
+        clone["obj"]  # noqa: B018
