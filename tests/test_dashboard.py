@@ -420,13 +420,18 @@ class FakeXuiClient:
         if self.clone_inbound_raises is not None:
             raise_ = self.clone_inbound_raises
             raise raise_ if isinstance(raise_, Exception) else raise_("fake clone_inbound")
-        # Default success response mirrors the real 3x-ui add shape — including
+        # add_inbound returns data["obj"] — the UNWRAPPED inbound object, NOT
+        # the {"obj": {...}} envelope — and clone_inbound returns it verbatim.
+        # Stubbing the envelope here is what hid Hotfix #16: the two re-clone
+        # sites indexed resp["obj"] and only passed because the fake matched
+        # the bug instead of the client. Mirrors the real shape — including
         # the `tag` field, which upstream's resolveInboundTag() always sets and
         # which the routing binder must key its rule on. Omitting it here would
         # let a caller that guesses "in-<port>-tcp" pass the test while writing
         # a rule that matches nothing in production.
         return FakeXuiClient.clone_inbound_result or {
-            "obj": {"id": 31001, "tag": "in-31001-tcp"}
+            "id": 31001,
+            "tag": "in-31001-tcp",
         }
 
 
@@ -1089,7 +1094,7 @@ class TestDeleteCountry:
     def test_full_teardown_summary(self, monkeypatch, tmp_path):
         client = _seed_us_full(monkeypatch, tmp_path)
         _seed_xui_link()
-        FakeXuiClient.clone_inbound_result = {"obj": {"id": 99999}}
+        FakeXuiClient.clone_inbound_result = {"id": 99999}
 
         r = client.delete("/api/dashboard/countries/US")
         assert r.status_code == 200
@@ -1168,7 +1173,7 @@ class TestEditPorts:
     def test_happy_rewrites_and_reclones(self, monkeypatch, tmp_path):
         client = _seed_us_full(monkeypatch, tmp_path)
         _seed_xui_link()
-        FakeXuiClient.clone_inbound_result = {"obj": {"id": 99998}}
+        FakeXuiClient.clone_inbound_result = {"id": 99998}
 
         r = client.post(
             "/api/dashboard/countries/US/_ports",
@@ -1380,7 +1385,7 @@ class TestReapply:
         )
         _set_wizard_step_data({"template": {"template_inbound_id": 17}})
         _seed_xui_link()
-        FakeXuiClient.clone_inbound_result = {"obj": {"id": 31002}}
+        FakeXuiClient.clone_inbound_result = {"id": 31002}
 
         r = client.post("/api/dashboard/reapply")
         assert r.status_code == 200
@@ -1776,9 +1781,7 @@ class TestDashboardRoutingBinding:
         )
         _set_wizard_step_data({"template": {"template_inbound_id": 17}})
         _seed_xui_link()
-        FakeXuiClient.clone_inbound_result = {
-            "obj": {"id": 31002, "tag": "in-31099-tcp"}
-        }
+        FakeXuiClient.clone_inbound_result = {"id": 31002, "tag": "in-31099-tcp"}
         # Pre-existing binding on the OLD port/tag.
         FakeXuiClient.xray_template = _stock_xray_template()
         FakeXuiClient.xray_template["routing"]["rules"].insert(
@@ -1829,9 +1832,7 @@ class TestDashboardRoutingBinding:
         )
         _set_wizard_step_data({"template": {"template_inbound_id": 17}})
         _seed_xui_link()
-        FakeXuiClient.clone_inbound_result = {
-            "obj": {"id": 31002, "tag": "in-31001-tcp-2"}
-        }
+        FakeXuiClient.clone_inbound_result = {"id": 31002, "tag": "in-31001-tcp-2"}
 
         r = client.post("/api/dashboard/reapply")
         assert r.status_code == 200
