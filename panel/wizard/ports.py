@@ -29,9 +29,16 @@ import asyncio
 from dataclasses import dataclass
 
 # ----- Tunables ---------------------------------------------------------
-PORT_MIN = 1024  # don't recommend privileged ports; inbound binds need CAP_NET_BIND_SERVICE
+PORT_MIN = 1024  # validation floor; inbound binds below 1024 need CAP_NET_BIND_SERVICE
 PORT_MAX = 65535
 PANEL_PORT_RESERVED = 8080  # default; callers pass the actual panel port
+
+# Phase 27: unified port allocation floors (wizard + panel).
+# SOCKS listeners for Psiphon start at 11000; public inbound ports start at 11050.
+# This keeps them non-overlapping (validate_port_ranges enforces disjoint ranges) and
+# leaves 50-port headroom for SOCKS-only deployments before the public floor.
+SOCKS_PORT_FLOOR = 11000
+PUBLIC_PORT_FLOOR = 11050
 
 
 # ----- Errors -----------------------------------------------------------
@@ -173,19 +180,21 @@ def recommend_port_range(
     *,
     busy: set[int] | None = None,
     extra_reserved: set[int] | None = None,
+    start_at: int | None = None,
 ) -> PortRange:
     """Return the smallest contiguous port range of size ``needed`` that has
     no overlap with any busy port or any extra reserved port.
 
-    Searches upward from :data:`PORT_MIN`. Raises :class:`NoFreeRangeError`
-    if no contiguous window of the requested size is free.
+    Searches upward from *start_at* (defaults to :data:`PORT_MIN`). Raises
+    :class:`NoFreeRangeError` if no contiguous window of the requested size
+    is free.
     """
     if needed <= 0:
         raise PortRangeError(f"needed must be positive, got {needed}")
     needed = min(needed, PORT_MAX - PORT_MIN + 1)
     reserved = (busy or set()) | (extra_reserved or set())
 
-    cur = PORT_MIN
+    cur = start_at if start_at is not None else PORT_MIN
     while cur + needed - 1 <= PORT_MAX:
         end = cur + needed - 1
         chunk = set(range(cur, end + 1))
@@ -197,7 +206,8 @@ def recommend_port_range(
         cur = first_blocker + 1
     raise NoFreeRangeError(
         f"no contiguous range of {needed} free ports available in "
-        f"[{PORT_MIN}, {PORT_MAX}] (excluding reserved: {sorted(reserved)[:10]}{'…' if len(reserved) > 10 else ''})"
+        f"[{start_at if start_at is not None else PORT_MIN}, {PORT_MAX}] "
+        f"(excluding reserved: {sorted(reserved)[:10]}{'…' if len(reserved) > 10 else ''})"
     )
 
 

@@ -62,6 +62,7 @@ from ..psiphon import (
 # Hotfix #10 (Bug #3): apply_country / PortAssignmentSpec power the inline
 # enable-without-existing-PortAssignment branch inside patch_country.
 from ..wizard.apply import PortAssignmentSpec, apply_country
+from ..wizard.ports import listening_ports
 
 # Phase 25 (Feature A/C/D): single-country clone helper — shared by the
 # extended PATCH (enable-with-inbound) and the new _reclone endpoint.
@@ -203,6 +204,60 @@ async def _async_get_xui_client(db: Session) -> XuiClient | None:
     return client
 
 
+# Phase 27 (item 2): universal pre-creation port-conflict checking.
+async def _gather_claimed_ports(
+    db: Session,
+    *,
+    exclude_country: str | None = None,
+) -> set[int]:
+    """Return every port claimed by PortAssignments, 3x-ui inbounds, or OS listeners.
+
+    *exclude_country* omits that country's PortAssignment ports from the set, so a
+    caller can check whether a proposed new port would conflict with OTHER countries.
+
+    Phase 27 (item 2): before creating any port (wizard, panel enable-with-inbound,
+    edit-ports, re-apply), call this and reject overlaps. Best-effort: 3x-ui and OS
+    probes are swallowed on error; the DB scan always runs.
+    """
+    claimed: set[int] = set()
+
+    # 1. PortAssignment rows (other countries + panel port).
+    query = db.query(PortAssignment)
+    if exclude_country is not None:
+        query = query.filter(PortAssignment.country_code != exclude_country)
+    for pa in query.all():
+        claimed.add(int(pa.socks_port))
+        claimed.add(int(pa.public_port))
+    settings = db.get(Settings, {"id": 1})
+    if settings:
+        claimed.add(int(settings.panel_port))
+
+    # 2. 3x-ui inbounds (user-created + panel-managed entries).
+    client = await _async_get_xui_client(db)
+    if client is not None:
+        try:
+            inbounds = await client.list_inbounds()
+            for ib in inbounds:
+                if isinstance(ib, dict) and ib.get("port"):
+                    claimed.add(int(ib["port"]))
+        except Exception:  # noqa: BLE001  panel not reachable; proceed
+            pass
+        finally:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 3. OS listening ports (best-effort).
+    try:
+        busy = await listening_ports()
+        claimed |= busy
+    except Exception:  # noqa: BLE001
+        pass
+
+    return claimed
+
+
 def _journalctl_lines(unit: str, lines: int) -> list[str]:
     """Run ``journalctl -u <unit> -n <lines> --no-pager`` and split on newlines.
 
@@ -249,34 +304,48 @@ def _validate_port(value: int, *, name: str) -> int:
     return int(value)
 
 
-def _pick_free_socks_port(db: Session) -> int:
+def _pick_free_socks_port(db: Session, claimed: set[int] | None = None) -> int:
     """Hotfix #10 (Bug #3): smart-recommend a free SOCKS port.
 
-    Walks from 11000 upwards, skipping any port already claimed by an existing
-    PortAssignment row. Returns the first free integer.
+    Phase 27: Walks from 11000 upwards (unified floor for SOCKS across wizard
+    and panel), skipping any port already claimed by an existing PortAssignment
+    row. Returns the first free integer.
+
+    Phase 27 (item 2): *claimed* — when supplied (from
+    :func:`_gather_claimed_ports`) the walk also skips ports held by 3x-ui
+    inbounds and by other OS listeners, not just PortAssignment rows. This is
+    what stops a disable-one-country / enable-another sequence from handing out
+    a port some other process already owns.
     """
     used_rows = db.query(PortAssignment).all()
     used: set[int] = {int(r.socks_port) for r in used_rows}
     panel_port = int(db.get(Settings, {"id": 1}).panel_port) if db.get(Settings, {"id": 1}) else 0
     used.add(panel_port)
+    if claimed:
+        used |= claimed
     candidate = 11000
     while candidate in used or candidate < 1024:
         candidate += 1
     return candidate
 
 
-def _pick_free_public_port(db: Session) -> int:
+def _pick_free_public_port(db: Session, claimed: set[int] | None = None) -> int:
     """Hotfix #10 (Bug #3): smart-recommend a free public port.
 
-    Walks from 31000 upwards, skipping any port already claimed by an existing
+    Phase 27: Walks from 11050 upwards (unified floor for public inbound ports
+    across wizard and panel), skipping any port already claimed by an existing
     PortAssignment row OR the panel port.
+
+    Phase 27 (item 2): *claimed* — see :func:`_pick_free_socks_port`.
     """
     used_rows = db.query(PortAssignment).all()
     used: set[int] = {int(r.public_port) for r in used_rows}
     settings_row = db.get(Settings, {"id": 1})
     panel_port = int(settings_row.panel_port) if settings_row else 0
     used.add(panel_port)
-    candidate = 31000
+    if claimed:
+        used |= claimed
+    candidate = 11050
     while candidate in used or candidate < 1024:
         candidate += 1
     return candidate
@@ -588,8 +657,34 @@ async def patch_country(
         # Hotfix #10: enable a country with no PortAssignment yet by
         # accepting socks_port + public_port (or smart defaults) and running
         # apply_country inline.
-        socks_port = int(body.socks_port) if body.socks_port else _pick_free_socks_port(db)
-        public_port = int(body.public_port) if body.public_port else _pick_free_public_port(db)
+        # Phase 27 (item 2): gather claimed ports before picking, so a
+        # disable→enable sequence doesn't hand out a port already held by
+        # another listener.
+        claimed = await _gather_claimed_ports(db, exclude_country=country.code)
+        socks_port = (
+            int(body.socks_port) if body.socks_port else _pick_free_socks_port(db, claimed)
+        )
+        public_port = (
+            int(body.public_port) if body.public_port else _pick_free_public_port(db, claimed)
+        )
+        # Phase 27 (item 2): an OPERATOR-SUPPLIED port bypasses the picker, so
+        # validate it explicitly — otherwise the enable modal can still create a
+        # conflicting inbound. The picker's own output is conflict-free by
+        # construction, so only supplied values need re-checking.
+        for supplied, label in ((body.socks_port, "socks_port"), (body.public_port, "public_port")):
+            if supplied and int(supplied) in claimed:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"{label} {int(supplied)} is already in use (by another country's "
+                        f"assignment, a 3x-ui inbound, or another process on this host)"
+                    ),
+                )
+        if socks_port == public_port:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="socks_port and public_port must not be equal",
+            )
         spec = PortAssignmentSpec(
             country_code=country.code,
             socks_port=socks_port,
@@ -1180,6 +1275,21 @@ async def edit_country_ports(
                 f"(socks={clashes.socks_port}, public={clashes.public_port})"
             ),
         )
+
+    # Phase 27 (item 2): check proposed ports against 3x-ui inbounds + OS listeners
+    # too, not just other PortAssignment rows. A disable→enable sequence must not
+    # hand out a port held by another listener. Runs AFTER the PortAssignment scan
+    # above so a country-to-country clash keeps its more specific 400 message.
+    claimed = await _gather_claimed_ports(db, exclude_country=country.code)
+    for port, label in ((socks_port, "socks_port"), (public_port, "public_port")):
+        if port in claimed:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"{label} {port} is already in use (by a 3x-ui inbound or "
+                    f"another process on this host)"
+                ),
+            )
 
     summary: dict[str, Any] = {
         "code": country.code,

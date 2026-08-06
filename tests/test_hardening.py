@@ -635,6 +635,31 @@ class TestUninstallFlag:
         assert "run_uninstall" in text
         assert "Uninstall cancelled" in text
 
+    def test_uninstall_invokes_the_3xui_cleanup_module(self):
+        """Phase 27 (item 3): ``install.sh --uninstall`` must run
+        ``panel.uninstall`` so the inbounds/outbounds/routing rules this panel
+        created are removed from 3x-ui. Without this call the module is dead
+        code and the debris (plus the 'outbound reappears' trap) survives the
+        uninstall."""
+        text = self._install_path.read_text(encoding="utf-8")
+        assert "-m panel.uninstall" in text, (
+            "install.sh --uninstall must invoke `python -m panel.uninstall` to "
+            "clean up the 3x-ui entries this panel created"
+        )
+
+    def test_uninstall_cleanup_runs_before_the_service_is_stopped(self):
+        """The cleanup shells out to the venv interpreter and reads panel.db,
+        so it has to happen while both still exist — i.e. before
+        ``systemctl stop`` and before the install prefix is deleted."""
+        text = self._install_path.read_text(encoding="utf-8")
+        cleanup_at = text.index("-m panel.uninstall")
+        run_uninstall_at = text.index("run_uninstall()")
+        stop_at = text.index("systemctl stop", run_uninstall_at)
+        assert cleanup_at < stop_at, (
+            "the panel.uninstall cleanup must run before `systemctl stop` — "
+            "afterwards the venv/DB may already be gone"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Packaging regression tests — guard against the two real install-time bugs
@@ -2483,10 +2508,26 @@ class TestHotfix10PostReleaseRegressions:
             "re-enter the inline-enable branch."
         )
         # Negative: the pre-Hotfix-#10 409-conflict branch is REmoved.
-        assert "HTTP_409_CONFLICT" not in body or "409" not in body, (
+        #
+        # Phase 27 note: this used to ban the substring "409" outright, which
+        # was a proxy for "the missing-PortAssignment branch is gone". That
+        # proxy became wrong once patch_country grew a *different*, legitimate
+        # 409 — the port-conflict rejection for an operator-supplied port that
+        # another country, a 3x-ui inbound, or another process already holds.
+        # Pin the assertion to the actual regression instead: the enable path
+        # must not bail out because a PortAssignment is missing, since creating
+        # that row is exactly what the inline-enable branch is for.
+        assert "has no PortAssignment" not in body, (
             "Bug #3 — patch_country must NOT raise 409 on missing-PortAssignment "
             "enable; the pre-Hotfix-#10 hardcoded 409 must be gone."
         )
+        # Any surviving 409 must be a port conflict, never a missing assignment.
+        for match in re.finditer(r"HTTP_409_CONFLICT(.{0,400})", body, re.DOTALL):
+            assert "already in use" in match.group(1), (
+                "patch_country raises a 409 that is not the Phase 27 "
+                "port-conflict rejection — check it is not a re-introduced "
+                f"missing-PortAssignment bail-out: {match.group(1)[:200]!r}"
+            )
 
     # ─── Bug #4: installer adds psiphon3xui to systemd-journal + adm ────
     def test_prepare_user_adds_user_to_journal_and_adm_groups(self):

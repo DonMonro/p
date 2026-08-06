@@ -21,8 +21,9 @@
 #   - final summary: server IP + browser login URL + credentials (shown once)
 #
 # Idempotent: re-running install.sh upgrades in place; session secret + DB row
-# are preserved. Use `--uninstall` to stop the service and remove the install
-# prefix (3x-ui inbounds in the panel stay intact with a warning).
+# are preserved. Use `--uninstall` to stop the service, remove the 3x-ui
+# inbounds/outbounds/routing rules this panel created, and remove the install
+# prefix (3x-ui itself and any entries the operator made by hand stay intact).
 # ============================================================================
 
 set -euo pipefail
@@ -182,13 +183,24 @@ ensure_helpers_present() {
 run_uninstall() {
     echo "${COLOR_INFO}== Psiphon-3X-UI uninstaller ==${COLOR_RESET}"
     warn "This will STOP and remove the psiphon-3x-ui service and the ${INSTALL_PREFIX} tree."
-    warn "3x-ui's own inbounds installed by THIS panel are NOT touched — you must delete them from 3x-ui's UI/API manually."
+    warn "3x-ui entries created by this panel (inbounds, outbounds, routing rules) will be removed automatically."
     printf '%sType "yes" to confirm: %s' "${COLOR_WARN}" "${COLOR_RESET}"
     local confirm
     read -r confirm || confirm=""
     if [[ "${confirm}" != "yes" ]]; then
         info "Uninstall cancelled."
         exit 0
+    fi
+
+    # ── Phase 27 (item 3): clean the 3x-ui entries this panel created ──────
+    # Run BEFORE stopping the service so the venv + DB are still intact.
+    if [[ -x "${VENV_DIR}/bin/python" && -f "${DB_PATH}" ]]; then
+        info "Cleaning 3x-ui entries created by this panel …"
+        "${VENV_DIR}/bin/python" -m panel.uninstall --db "${DB_PATH}" || {
+            warn "3x-ui cleanup reported warnings (see above); continuing uninstall."
+        }
+    else
+        warn "Skipping 3x-ui cleanup: venv or panel.db not found."
     fi
 
     systemctl stop psiphon-3x-ui.service 2>/dev/null || true
@@ -247,7 +259,7 @@ run_uninstall() {
     fi
 
     rm -rf "${INSTALL_PREFIX}"
-    ok "Psiphon-3X-UI uninstalled (3x-ui itself is untouched)."
+    ok "Psiphon-3X-UI uninstalled (3x-ui itself is untouched; entries this panel created were removed)."
     exit 0
 }
 
