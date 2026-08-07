@@ -89,11 +89,36 @@
               </td>
               <td data-col="actions">
                 <button class="outline secondary" @click="viewLogs(c)">Logs</button>
-                <button class="outline" @click="openPorts(c)">Edit ports</button>
+                <!-- Phase 28 (item 4): every mutating/testing action is frozen
+                     while the country is disabled, so a stray click cannot hit
+                     a country that has no tunnel. Logs stay reachable — reading
+                     a disabled country's log is exactly how you find out why. -->
+                <button class="outline" @click="openPorts(c)"
+                        :disabled="!c.enabled">Edit ports</button>
                 <!-- Phase 25 (Feature D): swap the 3x-ui template inbound for
                      this country. Opens a modal listing all available
                      inbounds so the operator picks a different template. -->
-                <button class="outline" @click="openEditInbound(c)">Edit inbound</button>
+                <button class="outline" @click="openEditInbound(c)"
+                        :disabled="!c.enabled">Edit inbound</button>
+                <!-- Phase 28 (item 3): ping THIS country's tunnel. After the
+                     country is enabled a 5 s cooldown runs so the operator
+                     cannot ping before Psiphon has finished establishing the
+                     tunnel (which would report a false failure). -->
+                <button class="outline" @click="pingCountry(c)"
+                        :disabled="!c.enabled || busy.ping === c.code || (cooldown[c.code] ?? 0) > 0"
+                        :aria-busy="busy.ping === c.code"
+                        x-text="busy.ping === c.code ? 'Pinging…'
+                                : ((cooldown[c.code] ?? 0) > 0
+                                   ? `Ping test (${cooldown[c.code]})`
+                                   : 'Ping test')"></button>
+                <!-- Last ping outcome for this country, kept next to the
+                     button so a multi-country comparison is readable at a
+                     glance rather than only in the transient toast. -->
+                <span x-show="pingResult[c.code]"
+                      :class="pingResult[c.code]?.ok ? 'healthy-badge' : 'unhealthy-badge'"
+                      x-text="pingResult[c.code]?.ok
+                              ? `${pingResult[c.code].latency_ms} ms`
+                              : 'no egress'"></span>
                 <!-- Hotfix #11 (Bug #4): the Delete button + the deleteCountry()
                      method below were removed at the operator's request — the
                      only country-level actions now are editing ports, editing
@@ -282,10 +307,9 @@
           <label>New panel listen port
             <input type="number" min="1024" max="65535" x-model.number="port.new">
           </label>
-          <small>Hotfix #10 (Bug #5): after change the panel re-runs
-            <code>installer/firewall.sh</code> and restarts itself in-band — no
-            manual action required. The browser must reload the panel at the
-            new port once the request returns.</small>
+          <small>The firewall is updated and the panel restarts automatically.
+            Your browser will reload at the new port — no manual steps
+            needed.</small>
         </fieldset>
         <footer><button @click="changePanelPort()">Change port</button></footer>
       </article>
@@ -298,7 +322,17 @@
       return {
         countries: [],
         busy: { countries: false, ports: false, reapply: false, backup: false,
-                rotate: false, port: false, reclone: false },
+                rotate: false, port: false, reclone: false, ping: "" },
+        // Phase 28 (item 3): per-country ping state.
+        //   cooldown[code] — seconds remaining before Ping test unlocks. Set to
+        //     5 when a country is enabled, so the operator has to wait for the
+        //     tunnel to come up instead of pinging a half-started Psiphon.
+        //   pingResult[code] — last {ok, latency_ms, detail} for that country.
+        //   _timers[code] — the live setInterval handle, cleared on 0 / reload
+        //     so a re-enable never leaves two intervals racing on one counter.
+        cooldown: {},
+        pingResult: {},
+        _timers: {},
         // Hotfix #10 (Bug #3): the ports object now also carries the enable-
         // with-ports modal state. enable_* fields are populated by
         // toggleEnabled() when the operator tries to enable a no-
@@ -424,6 +458,11 @@
               const updated = await r.json();
               this.countries = this.countries.map(x => x.code === c.code ? updated : x);
               this.notify(`${c.code} ${newValue ? "enabled" : "disabled"}`);
+              // Phase 28 (item 3): starting a tunnel is not instant, so hold
+              // Ping test for 5 s after an enable. Disabling clears the timer
+              // and the stale result instead of leaving them on screen.
+              if (newValue) this.startCooldown(c.code);
+              else this.clearCooldown(c.code);
             } else {
               const detail = (await r.json()).detail || r.status;
               this.notify(`failed to toggle ${c.code}: ${detail}`, "err");
@@ -431,6 +470,61 @@
             }
           } catch (e) {
             this.notify(`network error: ${e.message}`, "err");
+          }
+        },
+
+        // ---- Phase 28 (item 3): per-country ping test -------------------
+        // Hold the button for `secs` seconds after an enable. Any in-flight
+        // timer for this country is cleared first, so a rapid disable/enable
+        // cannot leave two intervals decrementing the same counter.
+        startCooldown(code, secs = 5) {
+          this.clearCooldown(code);
+          this.cooldown[code] = secs;
+          this._timers[code] = setInterval(() => {
+            const left = (this.cooldown[code] ?? 0) - 1;
+            this.cooldown[code] = left > 0 ? left : 0;
+            if (left <= 0) {
+              clearInterval(this._timers[code]);
+              delete this._timers[code];
+            }
+          }, 1000);
+        },
+
+        clearCooldown(code) {
+          if (this._timers[code]) {
+            clearInterval(this._timers[code]);
+            delete this._timers[code];
+          }
+          this.cooldown[code] = 0;
+          delete this.pingResult[code];
+        },
+
+        // Probe the country's own tunnel. The backend opens a real SOCKS5
+        // CONNECT through that country's SOCKS port, so a success means that
+        // country is genuinely egressing — not merely that the port is open.
+        async pingCountry(c) {
+          if (!c.enabled || (this.cooldown[c.code] ?? 0) > 0) return;
+          this.busy.ping = c.code;
+          try {
+            const r = await fetch(`/api/dashboard/countries/${c.code}/_ping`, {
+              method: "POST",
+              headers: await this._csrfHeaders(),
+            });
+            const body = await r.json();
+            if (!r.ok) {
+              this.notify(`ping ${c.code} failed: ${body.detail || r.status}`, "err");
+              return;
+            }
+            this.pingResult[c.code] = body;
+            if (body.ok) {
+              this.notify(`${c.code} connected — ${body.latency_ms} ms via ${body.target}`);
+            } else {
+              this.notify(`${c.code} not connected: ${body.detail}`, "err");
+            }
+          } catch (e) {
+            this.notify(`network error: ${e.message}`, "err");
+          } finally {
+            this.busy.ping = "";
           }
         },
 
@@ -487,6 +581,9 @@
               return;
             }
             this.countries = this.countries.map(x => x.code === code ? body : x);
+            // Phase 28 (item 3): this is the second enable path (enable-with-
+            // ports), so it needs the same 5 s Ping test hold as toggleEnabled.
+            this.startCooldown(code);
             // Phase 25 (Feature C): surface apply_result + clone_result in
             // the toast so the operator sees the full outcome inline.
             let msg = `enabled ${code} — socks=${body.socks_port}, public=${body.public_port}`;

@@ -22,10 +22,12 @@ SSE/blob.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import tarfile
@@ -56,6 +58,7 @@ from ..psiphon import (
     restart_unit,
     start_unit,
     stop_unit,
+    tunnel_ping,
     write_config,
 )
 
@@ -351,31 +354,67 @@ def _pick_free_public_port(db: Session, claimed: set[int] | None = None) -> int:
     return candidate
 
 
-def _reload_firewall() -> tuple[bool, str]:
-    """Hotfix #10 (Bug #5): re-run installer/firewall.sh in-band.
+def _reload_firewall(panel_port: int | None = None) -> tuple[bool, str]:
+    """Hotfix #10 (Bug #5) + Hotfix #13 (Bug #1): re-run installer/firewall.sh in-band.
 
     Returns (ok, detail). The installer directory lives adjacent to the
     installed panel. We best-effort locate it via the install prefix (the
     psiphon_install.sh places the repo at /opt/psiphon3xui). If firewall.sh
     is missing or fails, returns (False, error message).
+
+    Hotfix #13 (Bug #1) — TWO compounding defects caused a total lockout when
+    the operator changed the panel port:
+
+    1. The search paths never matched reality. This looked under
+       ``/opt/psiphon3xui`` (no dashes), but ``INSTALL_PREFIX`` is
+       ``/opt/psiphon-3x-ui`` (with dashes) and install.sh clones the repo to
+       ``${INSTALL_PREFIX}/repo-tmp``. So firewall.sh was never found and the
+       step degraded to a logged warning.
+    2. Even when found, ``bash firewall.sh`` only *defined* ``run_firewall``
+       and exited 0 without calling it — so the step reported SUCCESS while
+       doing nothing. firewall.sh now self-invokes when run as a script.
+
+    Net effect: the new port never opened in ufw, yet the panel still
+    restarted onto it — the old port was closed and the new one firewalled,
+    which is exactly the reported "neither port works, panel completely gone".
+
+    The caller passes ``panel_port`` explicitly so the standalone self-invoke
+    path opens the correct port.
     """
-    for repo_path in ("/opt/psiphon3xui", "/usr/local/share/psiphon-3x-ui"):
-        candidate = Path(repo_path) / "installer" / "firewall.sh"
-        if candidate.is_file():
-            try:
-                proc = subprocess.run(  # noqa: S603 — system binary
-                    ["bash", str(candidate)],
-                    capture_output=True,
-                    text=True,
-                    timeout=60.0,
-                    check=False,
-                )
-                ok = proc.returncode == 0
-                detail = proc.stdout.strip() if ok else proc.stderr.strip() or proc.stdout.strip()
-                return ok, detail
-            except (OSError, subprocess.SubprocessError) as exc:
-                return False, f"firewall.sh invocation failed: {type(exc).__name__}: {exc}"
-    return False, "firewall.sh not found under /opt/psiphon3xui or /usr/local/share/psiphon-3x-ui"
+    candidates = [
+        # install.sh clones to ${INSTALL_PREFIX}/repo-tmp and leaves it there.
+        Path("/opt/psiphon-3x-ui/repo-tmp/installer/firewall.sh"),
+        # Derived from the live db_path, so a relocated prefix still resolves.
+        _panel_db_path().parent / "repo-tmp" / "installer" / "firewall.sh",
+        _panel_db_path().parent / "installer" / "firewall.sh",
+        # Legacy paths kept so existing deployments don't regress.
+        Path("/opt/psiphon3xui/installer/firewall.sh"),
+        Path("/usr/local/share/psiphon-3x-ui/installer/firewall.sh"),
+    ]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            env = os.environ.copy()
+            if panel_port is not None:
+                env["PANEL_PORT"] = str(panel_port)
+            proc = subprocess.run(  # noqa: S603 — system binary
+                ["bash", str(candidate)],
+                capture_output=True,
+                text=True,
+                timeout=60.0,
+                check=False,
+                env=env,
+            )
+            ok = proc.returncode == 0
+            detail = proc.stdout.strip() if ok else proc.stderr.strip() or proc.stdout.strip()
+            return ok, detail or f"ran {candidate}"
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"firewall.sh invocation failed: {type(exc).__name__}: {exc}"
+    return False, (
+        "firewall.sh not found — searched "
+        + ", ".join(str(c) for c in candidates)
+    )
 
 
 def _panel_env_path() -> Path:
@@ -1208,6 +1247,57 @@ async def delete_country(
     return summary
 
 
+@router.post("/countries/{code}/_ping", status_code=status.HTTP_200_OK)
+async def ping_country(
+    code: str,
+    user: Annotated[dict, Depends(get_current_user)],
+    db: Session = Depends(get_db),  # noqa: B008  FastAPI idiom
+) -> dict[str, Any]:
+    """Measure round-trip latency through **this country's** Psiphon tunnel.
+
+    Phase 28 (item 3). Runs a full SOCKS5 ``CONNECT`` against the country's own
+    ``socks_port``, so a success proves that specific country's egress is up —
+    unlike the cached ``healthy`` flag, which only ever meant "a listener was
+    accepting connections at clone time".
+
+    Returns ``{"ok": bool, "latency_ms": int|None, "detail": str}``.
+
+    A disabled country, or one with no PortAssignment, has no tunnel to ping and
+    returns 409 rather than a misleading failed ping.
+    """
+    _require_wizard_completed(db)
+    country = _get_country(db, code)
+
+    if not bool(country.enabled):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{country.code} is disabled — enable it before testing ping",
+        )
+
+    assignment = (
+        db.query(PortAssignment)
+        .filter(PortAssignment.country_code == country.code)
+        .first()
+    )
+    if assignment is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{country.code} has no port assignment — nothing to ping",
+        )
+
+    # The probe is blocking (raw socket + timeout); keep the event loop free so
+    # a slow or dead tunnel cannot stall the whole panel.
+    result = await asyncio.to_thread(tunnel_ping, int(assignment.socks_port))
+
+    return {
+        "code": country.code,
+        "socks_port": int(assignment.socks_port),
+        "ok": bool(result.ok),
+        "latency_ms": result.latency_ms,
+        "detail": result.detail,
+    }
+
+
 @router.post("/countries/{code}/_ports", status_code=status.HTTP_200_OK)
 async def edit_country_ports(
     code: str,
@@ -1899,8 +1989,8 @@ def change_panel_port(
     if not env_ok:
         _log.warning("change_panel_port env-file rewrite failed: %s", env_detail)
 
-    # Hotfix #10 (Bug #5) + Hotfix #11 (Bug #3, part 2): re-run
-    # installer/firewall.sh + restart the panel service in-band so the
+    # Hotfix #10 (Bug #5) + Hotfix #11 (Bug #3, part 2) + Hotfix #13 (Bug #1):
+    # re-run installer/firewall.sh + restart the panel service in-band so the
     # operator doesn't have to drop to a shell. The polkit rule
     # (systemd/49-psiphon-3x-ui.rules — extended in 19f5) must authorise the
     # psiphon3xui user to restart `psiphon-3x-ui.service`. If the service
@@ -1909,7 +1999,7 @@ def change_panel_port(
     # We deliberately return the success payload with a browser-self-refresh
     # hint so the operator's tab reloads on the new port once the service
     # comes back.
-    fw_ok, fw_detail = _reload_firewall()
+    fw_ok, fw_detail = _reload_firewall(new_port)
     if not fw_ok:
         _log.warning("change_panel_port firewall reload failed: %s", fw_detail)
     svc_ok, svc_detail = _restart_panel_service()

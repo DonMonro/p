@@ -28,6 +28,7 @@ import os
 import re
 import socket
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -663,3 +664,134 @@ def health_probe(
     finally:
         with contextlib.suppress(OSError):
             sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-country tunnel ping (Phase 28)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TunnelPingResult:
+    """Outcome of an end-to-end ping through ONE country's Psiphon tunnel."""
+
+    ok: bool
+    latency_ms: int | None = None
+    detail: str = ""
+
+
+def tunnel_ping(
+    socks_port: int,
+    *,
+    host: str = "127.0.0.1",
+    target_host: str = "www.google.com",
+    target_port: int = 80,
+    timeout: float = 8.0,
+    _sock_factory: Any = None,
+) -> TunnelPingResult:
+    """Measure round-trip latency THROUGH a country's SOCKS5 tunnel.
+
+    Why this is not :func:`health_probe`
+    ------------------------------------
+    ``health_probe`` stops at SOCKS5 *method negotiation* — it proves a
+    listener is accepting connections on ``127.0.0.1:<socks_port>``, nothing
+    more. Psiphon binds that listener as soon as the process starts, BEFORE a
+    tunnel is established, so a "healthy" probe says nothing about whether the
+    country is actually connected.
+
+    This function issues a full SOCKS5 ``CONNECT`` to *target_host* and waits
+    for the reply. Psiphon only answers ``0x00`` (succeeded) once it has a
+    working tunnel and has relayed the connection out through the exit node —
+    so a success here means that specific country's egress is genuinely up,
+    and the elapsed time is that tunnel's real round-trip latency.
+
+    Returns ``TunnelPingResult(ok=True, latency_ms=N)`` on success, otherwise
+    ``ok=False`` with a human-readable ``detail``.
+    """
+    port = int(socks_port)
+    if not (1024 <= port <= 65535):
+        return TunnelPingResult(
+            ok=False, detail=f"socks_port {port} out of range [1024, 65535]"
+        )
+
+    target = target_host.encode("idna") if target_host else b""
+    if not target or len(target) > 255:
+        return TunnelPingResult(ok=False, detail="invalid target host")
+
+    sock = (
+        _sock_factory()
+        if _sock_factory is not None
+        else socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    )
+    try:
+        sock.settimeout(timeout)
+        started = time.monotonic()
+        try:
+            sock.connect((host, port))
+        except (OSError, TimeoutError) as exc:
+            return TunnelPingResult(
+                ok=False,
+                detail=f"connect {host}:{port} failed: {type(exc).__name__}: {exc}",
+            )
+        try:
+            # 1. Method negotiation: VER=5, NMETHODS=1, METHODS=[no-auth].
+            sock.sendall(bytes([0x05, 0x01, 0x00]))
+            greeting = sock.recv(2)
+            if len(greeting) < 2 or greeting[0] != 0x05:
+                return TunnelPingResult(
+                    ok=False, detail="SOCKS5 negotiation failed (bad greeting)"
+                )
+            if greeting[1] == 0xFF:
+                return TunnelPingResult(
+                    ok=False, detail="listener refused all offered SOCKS5 methods"
+                )
+            # 2. CONNECT request, ATYP=0x03 (domain name) so the exit node does
+            #    the DNS resolution — resolving locally would leak and would also
+            #    measure the wrong path.
+            request = (
+                bytes([0x05, 0x01, 0x00, 0x03, len(target)])
+                + target
+                + int(target_port).to_bytes(2, "big")
+            )
+            sock.sendall(request)
+            reply = sock.recv(4)
+        except (OSError, TimeoutError) as exc:
+            return TunnelPingResult(
+                ok=False,
+                detail=f"tunnel did not complete CONNECT: {type(exc).__name__}: {exc}",
+            )
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        if len(reply) < 2:
+            return TunnelPingResult(
+                ok=False, detail=f"short CONNECT reply ({len(reply)} bytes)"
+            )
+        code = reply[1]
+        if code != 0x00:
+            return TunnelPingResult(
+                ok=False,
+                latency_ms=elapsed_ms,
+                detail=f"tunnel refused CONNECT: {_SOCKS5_REPLY.get(code, f'code {code:#x}')}",
+            )
+        return TunnelPingResult(
+            ok=True,
+            latency_ms=elapsed_ms,
+            detail=f"tunnel reached {target_host}:{target_port} in {elapsed_ms} ms",
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+# SOCKS5 CONNECT reply codes (RFC 1928 §6) — turned into operator-facing text.
+_SOCKS5_REPLY: dict[int, str] = {
+    0x01: "general SOCKS server failure (tunnel not established yet)",
+    0x02: "connection not allowed by ruleset",
+    0x03: "network unreachable",
+    0x04: "host unreachable",
+    0x05: "connection refused",
+    0x06: "TTL expired",
+    0x07: "command not supported",
+    0x08: "address type not supported",
+}

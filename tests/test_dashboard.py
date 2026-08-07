@@ -1991,3 +1991,139 @@ class TestDashboardRoutingBinding:
         assert rule is not None, "reapply left the country with no routing rule"
         assert rule["inboundTag"] == ["in-31001-tcp-2"]
         assert _us_outbound(FakeXuiClient.xray_template) is not None
+
+
+# ===========================================================================
+# 15. POST /api/dashboard/countries/{code}/_ping   (Phase 28, item 3)
+# ===========================================================================
+def _stub_ping(monkeypatch, results):
+    """Swap router-level tunnel_ping with a recording fake.
+
+    ``results`` maps socks_port -> TunnelPingResult. Any port not present
+    yields a generic failure, so a test that pings the WRONG port fails
+    loudly instead of silently passing on a default-ok stub.
+    """
+    from panel.dashboard import router as dashboard_router
+    from panel.psiphon import TunnelPingResult
+
+    calls: list[int] = []
+
+    def _fake(socks_port: int, **kwargs) -> TunnelPingResult:
+        calls.append(int(socks_port))
+        return results.get(
+            int(socks_port),
+            TunnelPingResult(ok=False, detail=f"no stub for port {socks_port}"),
+        )
+
+    monkeypatch.setattr(dashboard_router, "tunnel_ping", _fake)
+    return calls
+
+
+class TestPingCountry:
+    """The operator's question is "is THIS country connected, and how fast?".
+
+    So the endpoint must probe the country's own SOCKS port (not a shared or
+    guessed one), and must report a dead tunnel as a 200 + ``ok: false``
+    rather than an HTTP error — a failed ping is a valid answer, not a
+    broken request.
+    """
+
+    def test_ping_happy_returns_latency_for_that_country(self, monkeypatch, tmp_path):
+        from panel.psiphon import TunnelPingResult
+
+        client = _seed_us_full(monkeypatch, tmp_path)
+        calls = _stub_ping(
+            monkeypatch,
+            {11001: TunnelPingResult(ok=True, latency_ms=42, detail="tunnel reached")},
+        )
+
+        r = client.post("/api/dashboard/countries/US/_ping")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True
+        assert body["latency_ms"] == 42
+        assert body["code"] == "US"
+        # THE point of the feature: the probe went through US's own tunnel.
+        assert body["socks_port"] == 11001
+        assert calls == [11001]
+
+    def test_ping_probes_each_countrys_own_socks_port(self, monkeypatch, tmp_path):
+        """Two countries must not share a probe target, otherwise the badge
+        would report country A's health under country B's row."""
+        from panel.psiphon import TunnelPingResult
+
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _seed_country(code="DE", name="Germany", flag="DE", region="Europe", enabled=True)
+        _seed_assignment(code="DE", socks_port=11002, public_port=31002)
+        calls = _stub_ping(
+            monkeypatch,
+            {
+                11001: TunnelPingResult(ok=True, latency_ms=42),
+                11002: TunnelPingResult(ok=True, latency_ms=98),
+            },
+        )
+
+        us = client.post("/api/dashboard/countries/US/_ping").json()
+        de = client.post("/api/dashboard/countries/DE/_ping").json()
+
+        assert (us["socks_port"], us["latency_ms"]) == (11001, 42)
+        assert (de["socks_port"], de["latency_ms"]) == (11002, 98)
+        assert calls == [11001, 11002]
+
+    def test_dead_tunnel_is_200_with_ok_false(self, monkeypatch, tmp_path):
+        from panel.psiphon import TunnelPingResult
+
+        client = _seed_us_full(monkeypatch, tmp_path)
+        _stub_ping(
+            monkeypatch,
+            {
+                11001: TunnelPingResult(
+                    ok=False, detail="tunnel refused CONNECT: host unreachable"
+                )
+            },
+        )
+
+        r = client.post("/api/dashboard/countries/US/_ping")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is False
+        assert body["latency_ms"] is None
+        assert "host unreachable" in body["detail"]
+
+    def test_disabled_country_returns_409(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=False)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+        calls = _stub_ping(monkeypatch, {})
+
+        r = client.post("/api/dashboard/countries/US/_ping")
+        assert r.status_code == 409, r.text
+        assert "disabled" in r.json()["detail"]
+        assert calls == [], "a disabled country has no tunnel — must not be probed"
+
+    def test_country_without_assignment_returns_409(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _seed_country(code="US", enabled=True)
+        calls = _stub_ping(monkeypatch, {})
+
+        r = client.post("/api/dashboard/countries/US/_ping")
+        assert r.status_code == 409, r.text
+        assert calls == []
+
+    def test_unknown_country_returns_404(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _login(client)
+        _stub_ping(monkeypatch, {})
+
+        r = client.post("/api/dashboard/countries/ZZ/_ping")
+        assert r.status_code == 404, r.text
+
+    def test_ping_requires_auth(self, monkeypatch, tmp_path):
+        client = _client(monkeypatch, tmp_path)
+        _seed_country(code="US", enabled=True)
+        _seed_assignment(code="US", socks_port=11001, public_port=31001)
+
+        r = client.post("/api/dashboard/countries/US/_ping")
+        assert r.status_code in (401, 403), r.text
