@@ -2572,7 +2572,7 @@ class TestHotfix10PostReleaseRegressions:
         )
         assert m is not None, "change_panel_port handler not found"
         body = m.group(0)
-        assert "_reload_firewall()" in body, (
+        assert "_reload_firewall(" in body, (
             "Bug #5 — change_panel_port must invoke _reload_firewall() after "
             "persisting the new panel_port."
         )
@@ -2783,7 +2783,7 @@ class TestHotfix11PostReleaseRegressions:
         assert m is not None, "Bug #3 — change_panel_port def not found."
         body = m.group(0)
         env_call = body.find("_update_panel_env_port(")
-        fw_call = body.find("_reload_firewall()")
+        fw_call = body.find("_reload_firewall(")
         svc_call = body.find("_restart_panel_service()")
         assert env_call != -1 and fw_call != -1 and svc_call != -1, (
             "Bug #3 — change_panel_port must call _update_panel_env_port, "

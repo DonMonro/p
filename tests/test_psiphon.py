@@ -25,6 +25,7 @@ from panel.psiphon import (
     HealthProbeResult,
     PsiphonCredentialError,
     PsiphonUnitError,
+    TunnelPingResult,
     _unit_name,
     health_probe,
     is_unit_active,
@@ -32,6 +33,7 @@ from panel.psiphon import (
     restart_unit,
     start_unit,
     stop_unit,
+    tunnel_ping,
     write_config,
 )
 
@@ -767,4 +769,135 @@ def test_health_probe_result_is_frozen():
 
 def test_health_probe_result_default_detail_empty():
     r = HealthProbeResult(healthy=False)
+    assert r.detail == ""
+
+
+# ---------------------------------------------------------------------------
+# tunnel_ping (Phase 28, item 3) — a full SOCKS5 CONNECT, not just negotiation.
+# ---------------------------------------------------------------------------
+class _ScriptedSocket:
+    """socket-shaped stub that answers each ``recv()`` from a script.
+
+    ``tunnel_ping`` performs TWO reads — the 2-byte method-negotiation reply,
+    then the 4-byte CONNECT reply — so the single-payload ``_FakeSocket`` above
+    cannot express "negotiation succeeded, then the tunnel answered X". Each
+    entry in *replies* is either ``bytes`` to return or an exception class to
+    raise on that call.
+    """
+
+    def __init__(
+        self,
+        *,
+        replies: list,
+        connect_raises: type[Exception] | None = None,
+        sendall_raises: type[Exception] | None = None,
+    ) -> None:
+        self._replies = list(replies)
+        self._connect_raises = connect_raises
+        self._sendall_raises = sendall_raises
+        self.closed = False
+        self.connect_calls: list[tuple[str, int]] = []
+        self.sendall_calls: list[bytes] = []
+        self.timeout: float | None = None
+
+    def settimeout(self, t: float) -> None:
+        self.timeout = t
+
+    def connect(self, addr: tuple[str, int]) -> None:
+        if self._connect_raises is not None:
+            raise self._connect_raises(f"connect refused: {addr}")
+        self.connect_calls.append(addr)
+
+    def sendall(self, data: bytes) -> None:
+        if self._sendall_raises is not None:
+            raise self._sendall_raises("sendall failed")
+        self.sendall_calls.append(data)
+
+    def recv(self, n: int) -> bytes:
+        if not self._replies:
+            return b""
+        nxt = self._replies.pop(0)
+        if isinstance(nxt, type) and issubclass(nxt, BaseException):
+            raise nxt("scripted failure")
+        return nxt[:n]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _ok_script() -> list:
+    """Negotiation accepted (no-auth), then CONNECT succeeded (0x00)."""
+    return [b"\x05\x00", b"\x05\x00\x00\x03"]
+
+
+def test_tunnel_ping_success_returns_latency():
+    sock = _ScriptedSocket(replies=_ok_script())
+    result = tunnel_ping(11001, _sock_factory=lambda: sock)
+    assert result.ok is True
+    assert result.latency_ms is not None and result.latency_ms >= 0
+    assert sock.connect_calls == [("127.0.0.1", 11001)]
+    assert len(sock.sendall_calls) == 2  # negotiation + CONNECT
+
+
+def test_tunnel_ping_connect_failure_returns_ok_false():
+    sock = _ScriptedSocket(replies=[], connect_raises=OSError)
+    result = tunnel_ping(11001, _sock_factory=lambda: sock)
+    assert result.ok is False
+    assert "connect" in result.detail.lower()
+
+
+def test_tunnel_ping_negotiation_failure():
+    sock = _ScriptedSocket(replies=[b"\x05\xFF"])  # refused all methods
+    result = tunnel_ping(11001, _sock_factory=lambda: sock)
+    assert result.ok is False
+    assert "refused all offered" in result.detail
+
+
+def test_tunnel_ping_tunnel_refused_connect():
+    """SOCKS5 code 0x01 = 'general SOCKS server failure' means tunnel is not up yet."""
+    sock = _ScriptedSocket(replies=[b"\x05\x00", b"\x05\x01\x00\x00"])
+    result = tunnel_ping(11001, _sock_factory=lambda: sock)
+    assert result.ok is False
+    assert result.latency_ms is not None  # elapsed time still recorded
+    assert "tunnel refused CONNECT" in result.detail
+    assert "not established yet" in result.detail
+
+
+def test_tunnel_ping_invalid_port():
+    result = tunnel_ping(80, _sock_factory=lambda: _ScriptedSocket(replies=[]))
+    assert result.ok is False
+    assert "out of range" in result.detail
+
+
+def test_tunnel_ping_target_host_defaults():
+    """Verify the CONNECT request targets www.google.com:80 by default."""
+    sock = _ScriptedSocket(replies=_ok_script())
+    tunnel_ping(11001, _sock_factory=lambda: sock)
+    # The second sendall is the CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (domain),
+    # LEN, <domain bytes>, <port as 2-byte big-endian>.
+    connect_request = sock.sendall_calls[1]
+    assert connect_request[:5] == b"\x05\x01\x00\x03\x0e"  # ATYP=3, LEN=14
+    # Next 14 bytes should be "www.google.com", then 2-byte port 80 (0x0050).
+    assert connect_request[5:19] == b"www.google.com"
+    assert connect_request[19:21] == b"\x00\x50"
+
+
+def test_tunnel_ping_custom_target():
+    """Custom target_host and target_port are encoded in the CONNECT."""
+    sock = _ScriptedSocket(replies=_ok_script())
+    tunnel_ping(11001, target_host="example.com", target_port=443, _sock_factory=lambda: sock)
+    connect_request = sock.sendall_calls[1]
+    assert connect_request[:5] == b"\x05\x01\x00\x03\x0b"  # LEN=11
+    assert connect_request[5:16] == b"example.com"
+    assert connect_request[16:18] == b"\x01\xbb"  # 443 = 0x01bb
+
+
+def test_tunnel_ping_socket_closed_on_exception():
+    sock = _ScriptedSocket(replies=[], sendall_raises=OSError)
+    tunnel_ping(11001, _sock_factory=lambda: sock)
+    assert sock.closed is True
+
+
+def test_tunnel_ping_result_default_detail_empty():
+    r = TunnelPingResult(ok=False)
     assert r.detail == ""
