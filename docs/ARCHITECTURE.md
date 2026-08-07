@@ -70,6 +70,25 @@ root, no polkit escalation, no systemd unit, and never touches
 failure mode where 3x-ui regenerated `config.json` from its SQLite DB on
 restart and wiped the out-of-band edits.
 
+### Privilege boundary — the one exception (Phase 28)
+
+The panel runs as the unprivileged `psiphon3xui` service user and has no
+shell access to the box. The **one narrow privilege escalation** is for
+opening firewall ports: when the operator changes the panel port from
+Settings (`POST /api/settings/panel-port`), the panel must open the new
+port in ufw **before** it persists the change, or it comes back on a port
+ufw is still filtering while the old port is already gone.
+
+ufw is root-only. The polkit rule in `systemd/49-psiphon-3x-ui.rules`
+grants only `org.freedesktop.systemd1.manage-units` and cannot cover ufw
+(not a systemd unit). The installer drops in a sudoers file at
+`/etc/sudoers.d/49-psiphon-3x-ui` (source:
+[`systemd/49-psiphon-3x-ui.sudoers`](../systemd/49-psiphon-3x-ui.sudoers))
+that grants the service user NOPASSWD on exactly `ufw allow <port>/tcp` —
+no delete, no enable/disable, no reset, no default-policy change, and the
+argument must be a bare 1-to-5-digit TCP port (see the file header for the
+digit-class enumeration rationale). `install.sh --uninstall` removes it.
+
 Each enabled country contributes:
 
 * One outbound tagged `psiphon-out-<CODE>` (protocol `socks`, one server

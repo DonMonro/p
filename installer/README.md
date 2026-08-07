@@ -12,8 +12,8 @@ exposes exactly one ``run_<name>()`` function and is `shellcheck`-clean.
 | [`prepare_user.sh`](prepare_user.sh) | `run_prepare_user` | Create `psiphon3xui` system user/group + set prefix ownership (MUST run before psiphon_install / panel_install so their `install -g` works) |
 | [`prompt.sh`](prompt.sh) | `run_prompt` | Interactive port/username/password; Enter for random value; `read -s` password |
 | [`psiphon_install.sh`](psiphon_install.sh) | `run_psiphon_install` | Build `psiphon-tunnel-core` from a pinned upstream tag, install + SHA256 manifest |
-| [`panel_install.sh`](panel_install.sh) | `run_panel_install` | venv, build wheel, `panel.seed` the DB, write `panel.env`, register systemd unit (defensively guards that the user/group already exists) |
-| [`firewall.sh`](firewall.sh) | `run_firewall` | Open only the panel TCP port in `ufw` (the inbound range is opened later by the wizard) |
+| [`panel_install.sh`](panel_install.sh) | `run_panel_install` | venv, build wheel, `panel.seed` the DB, write `panel.env`, register systemd unit (defensively guards that the user/group already exists), install the polkit rule + the `ufw allow` sudoers drop-in |
+| [`firewall.sh`](firewall.sh) | `run_firewall` | Open only the panel TCP port in `ufw` (the inbound range is opened later by the wizard). Also invoked **standalone, unprivileged** by the panel on a port change — escalates via `sudo -n ufw allow` and fails non-zero if that isn't permitted |
 | [`bootstrap.sh`](bootstrap.sh) | (n/a) | Phase-0 stdin stub — use `bash <(curl …)` from README instead |
 
 ## Why psiphon is built from source

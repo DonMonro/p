@@ -491,6 +491,46 @@ EOF
         warn "Missing ${POLKIT_RULE_SRC} — the panel user will not be able to start tunnels (Bug #2 will persist)."
     fi
 
+    # (c) Phase 28 (item 1, part 3): sudoers drop-in granting the service user
+    #     NOPASSWD on `ufw allow <port>/tcp` — and nothing else. Without it the
+    #     "change panel port" action cannot open the new port (ufw is root-only
+    #     and is not a systemd unit, so the polkit rule above cannot cover it),
+    #     and firewall.sh correctly refuses rather than bricking the panel.
+    local SUDOERS_SRC="${SCRIPT_DIR}/systemd/49-psiphon-3x-ui.sudoers"
+    local SUDOERS_DST="/etc/sudoers.d/49-psiphon-3x-ui"
+    local SUDOERS_DIR="/etc/sudoers.d"
+    if [[ -f "${SUDOERS_SRC}" ]]; then
+        if [[ ! -d "${SUDOERS_DIR}" ]]; then
+            install -d -m 0755 "${SUDOERS_DIR}" \
+                || warn "mkdir ${SUDOERS_DIR} failed."
+        fi
+        # NEVER write an unvalidated file into /etc/sudoers.d — a syntax error
+        # there breaks sudo for every user on the box. Stage it outside the
+        # directory, patch it, validate with visudo, and only then install.
+        local SUDOERS_TMP
+        SUDOERS_TMP="$(mktemp)" || SUDOERS_TMP=""
+        if [[ -n "${SUDOERS_TMP}" ]] && cat "${SUDOERS_SRC}" >"${SUDOERS_TMP}"; then
+            if [[ "${PSIPHON3XUI_USER}" != "psiphon3xui" ]]; then
+                sed -i -e "s|psiphon3xui|${PSIPHON3XUI_USER}|g" \
+                    "${SUDOERS_TMP}" 2>/dev/null || true
+            fi
+            if visudo -c -f "${SUDOERS_TMP}" >/dev/null 2>&1; then
+                if install -m 0440 -o root -g root "${SUDOERS_TMP}" "${SUDOERS_DST}"; then
+                    ok "Installed sudoers drop-in: ${SUDOERS_DST} (ufw allow only)"
+                else
+                    warn "install of ${SUDOERS_DST} failed — changing the panel port from Settings will refuse until this is fixed."
+                fi
+            else
+                warn "visudo rejected ${SUDOERS_SRC}; NOT installing it (a bad drop-in would break sudo system-wide)."
+            fi
+        else
+            warn "Could not stage ${SUDOERS_SRC} for validation; skipping the sudoers drop-in."
+        fi
+        [[ -n "${SUDOERS_TMP}" ]] && rm -f "${SUDOERS_TMP}"
+    else
+        warn "Missing ${SUDOERS_SRC} — the panel will refuse in-panel port changes (it cannot open the new port in ufw)."
+    fi
+
     # ── 7c. Phase 26 — /opt/psiphon-3x-ui directory setup ──
     # The panel's panel.db lives at /opt/psiphon-3x-ui/panel.db and must be
     # writable by the psiphon3xui user (the panel service runs as that

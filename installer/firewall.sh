@@ -21,15 +21,58 @@ run_firewall() {
         return 0
     fi
 
+    # Phase 28 (item 1, part 3): PANEL_PORT lands in a privileged command line
+    # below, so refuse anything that is not a bare port number. This also keeps
+    # the sudoers wildcard (`allow [0-9]*/tcp`) from ever seeing a surprise.
+    if ! [[ "${PANEL_PORT:-}" =~ ^[0-9]+$ ]] \
+        || (( PANEL_PORT < 1 || PANEL_PORT > 65535 )); then
+        warn "PANEL_PORT='${PANEL_PORT:-}' is not a valid TCP port; refusing to touch ufw."
+        return 1
+    fi
+
+    # Phase 28 (item 1, part 2): ufw is root-only. During install we ARE root, so
+    # this is a no-op there. But `change_panel_port` re-runs this script from the
+    # panel process, which runs as the unprivileged `psiphon3xui` service user —
+    # bare `ufw allow` fails with "ERROR: You need to be root to run this
+    # script".
+    #
+    # Previously that failure was swallowed (`|| warn`, then an unconditional
+    # `ok` + implicit `return 0`), so the caller saw exit 0 and reported
+    # "firewall.sh OK" while the port was never opened. The panel then restarted
+    # onto a port ufw was still blocking — unreachable on the old port (closed)
+    # AND the new one (filtered).
+    #
+    # Part 3 gives the unprivileged path a real way to succeed: the installer
+    # drops systemd/49-psiphon-3x-ui.sudoers into /etc/sudoers.d, granting the
+    # service user NOPASSWD on `ufw allow <port>/tcp` and nothing else. If that
+    # drop-in is absent we still fail loudly (non-zero exit) so
+    # change_panel_port refuses the change *before* it rewrites panel.env.
+    # Resolve ufw to an absolute path: the sudoers drop-in enumerates absolute
+    # paths (sudo matches the resolved binary), so passing a bare `ufw` would
+    # depend on the service PATH happening to hit a listed location.
+    local UFW_BIN
+    UFW_BIN="$(command -v ufw 2>/dev/null)" || UFW_BIN="ufw"
+    local -a UFW=("${UFW_BIN}")
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        if ! command -v sudo >/dev/null 2>&1; then
+            warn "ufw requires root, this runs as UID ${EUID:-$(id -u)}, and sudo is not installed — cannot open ${PANEL_PORT}/tcp."
+            return 1
+        fi
+        UFW=(sudo -n "${UFW_BIN}")
+    fi
+
     info "Opening panel port ${PANEL_PORT}/tcp in ufw …"
-    ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || warn "ufw rule add failed (continuing)."
+    if ! "${UFW[@]}" allow "${PANEL_PORT}/tcp" >/dev/null 2>&1; then
+        warn "${UFW[*]} allow ${PANEL_PORT}/tcp failed (uid ${EUID:-$(id -u)}); is /etc/sudoers.d/49-psiphon-3x-ui installed?"
+        return 1
+    fi
 
     # ENABLE with care: enabling ufw when SSH isn't whitelisted can lock the
     # user out. Phase 2 will enable ufw only if port 22 is already allowed or
     # explicitly confirm with the user.
     # ufw --force enable || true
 
-    ok "Firewall updated (panel port)."
+    ok "Firewall updated (panel port ${PANEL_PORT}/tcp)."
 }
 
 # Phase 27 (Hotfix #13): when invoked standalone (e.g. by change_panel_port),

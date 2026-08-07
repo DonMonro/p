@@ -219,6 +219,10 @@ run_uninstall() {
     rm -f /etc/systemd/system/psiphon-tunnel@.service \
         "/etc/systemd/system/psiphon-tunnel@.service.d"/*.conf 2>/dev/null || true
     rm -f /etc/polkit-1/rules.d/49-psiphon-3x-ui.rules 2>/dev/null || true
+    # Phase 28 (item 1, part 3): drop the sudoers grant too. Leaving a NOPASSWD
+    # rule behind for a user that install.sh is about to delete would let a
+    # future account that reuses the name run `ufw allow`.
+    rm -f /etc/sudoers.d/49-psiphon-3x-ui 2>/dev/null || true
     # Best-effort reloads so polkit+systemd release the now-removed files.
     systemctl reload polkit.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
@@ -396,7 +400,16 @@ EOF
                           # sets PANEL_ENABLE_HTTPS=yes (re-enable manually by
                           # exporting PANEL_ENABLE_HTTPS=yes before install.sh)
     run_panel_install     # venv + wheel + seed + systemd enable (needs the user, may pick up TLS)
-    run_firewall          # opens panel port only (range opened later by wizard)
+
+    # Phase 28 (item 1): run_firewall now returns non-zero when it cannot open
+    # the port — change_panel_port depends on that to abort BEFORE it rewrites
+    # panel.env. The installer must NOT inherit that strictness: under
+    # `set -e` a bare call would abort here, on the last step, and skip
+    # print_summary — the only place the generated password is ever shown. A
+    # box with a broken ufw would then need a full re-install to recover it.
+    # Open-port failure at install time is recoverable by hand, so warn and
+    # continue.
+    run_firewall || warn "Could not open ${PANEL_PORT}/tcp in ufw. The panel is installed and running; open the port manually (\`sudo ufw allow ${PANEL_PORT}/tcp\`) or the web UI will be unreachable."
 
     print_summary
     echo
