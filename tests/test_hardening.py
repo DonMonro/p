@@ -6155,7 +6155,12 @@ class TestPhase29FirewallRemoval:
     thing that broke.
 
     What was removed, and what the tests below pin:
-    - ``installer/firewall.sh`` — deleted.
+    - ``installer/firewall.sh`` — replaced by a no-op shim (it cannot come
+      back as a real helper; see ``test_firewall_sh_is_a_noop_shim_only``).
+      The shim exists so already-published pinned-tag installs keep working:
+      their install.sh hardcodes ``firewall`` in the helper list and clones
+      the repo unpinned, so a missing file aborts the bootstrap before
+      anything runs.
     - ``systemd/49-psiphon-3x-ui.sudoers`` — deleted (the NOPASSWD grant).
     - ``panel/dashboard/router.py::_reload_firewall`` — deleted; the port
       change no longer touches ufw at all.
@@ -6182,6 +6187,11 @@ class TestPhase29FirewallRemoval:
     _INSTALL_SH = _REPO_ROOT / "install.sh"
     _DEPS_SH = _REPO_ROOT / "installer" / "deps.sh"
     _DASHBOARD_HTML = _REPO_ROOT / "panel" / "static" / "dashboard.html"
+
+    def _strip_comments(self, text: str) -> str:
+        """Drop shell comments for absence checks. Docstrings don't occur in
+        shell; a #-comment is ``#`` to end of line."""
+        return re.sub(r"#[^\n]*", "", text)
 
     def test_change_panel_port_card_has_no_helper_text(self):
         """Phase 29 (item 2) — nothing at all under the Change port button.
@@ -6239,11 +6249,97 @@ class TestPhase29FirewallRemoval:
 
     # ── the deleted artifacts stay deleted ──────────────────────────────
 
-    def test_firewall_sh_is_deleted(self):
-        """The firewall helper must not come back."""
-        assert not self._FIREWALL_SH.exists(), (
-            "Phase 29 (item 3) — installer/firewall.sh must stay deleted; the "
-            "installer no longer manages the host firewall."
+    def test_firewall_sh_is_a_noop_shim_only(self):
+        """installer/firewall.sh may exist ONLY as a no-op compatibility shim.
+
+        Phase 29 deleted this file outright. That broke every already-published
+        pinned-tag install: releases up to v1.0.0 hardcode ``firewall`` in
+        install.sh's helper list and clone the repo *unpinned*, so a v1.0.0
+        script pulled main's helper tree and aborted with "No such file or
+        directory". Restoring the file as a stub is what unbreaks that URL,
+        since a published tag's script cannot be edited retroactively.
+
+        What Phase 29 actually forbids is host-firewall *management*, not a
+        filename. So the file is allowed back, and this test pins it to a shim
+        that cannot manage anything: no ufw/iptables/nft invocation, no sudo,
+        and a ``run_firewall`` that returns success so an old strict-mode
+        caller does not abort mid-install.
+        """
+        if not self._FIREWALL_SH.exists():
+            return
+
+        text = self._FIREWALL_SH.read_text(encoding="utf-8")
+        code = self._strip_comments(text)
+
+        for tool in ("iptables", "nft", "firewall-cmd"):
+            assert tool not in code, (
+                f"Phase 29 (item 3) — installer/firewall.sh invokes {tool!r}. "
+                "The shim must not manage a host firewall; it exists only so "
+                "an old unpinned install.sh can source it without aborting."
+            )
+
+        assert "sudo" not in code, (
+            "Phase 29 (item 3) — the shim must not escalate privileges; the "
+            "sudoers grant it used to rely on is deleted."
+        )
+
+        # `ufw` may appear only inside the advisory string telling the operator
+        # to open the port themselves — never as a command being run.
+        for line in code.splitlines():
+            stripped = line.strip()
+            if "ufw" not in stripped:
+                continue
+            assert stripped.startswith("info "), (
+                "Phase 29 (item 3) — installer/firewall.sh may mention ufw "
+                f"only in advisory info() output, not run it. Offending: {stripped!r}"
+            )
+
+        assert "run_firewall()" in code, (
+            "the shim must still DEFINE run_firewall — old install.sh copies "
+            "call it bare under `set -euo pipefail`, where a command-not-found "
+            "aborts the run and skips every later stage."
+        )
+        assert "return 0" in code, (
+            "run_firewall must explicitly succeed; under `set -e` a failing "
+            "last command in a bare-called function takes the installer down."
+        )
+
+    def test_bootstrap_clone_is_pinned_to_a_ref(self):
+        """The curl|bash clone must pin the same ref install.sh came from.
+
+        Root cause of the "installation doesn't work at all" report. The
+        one-liner fetches install.sh from a pinned tag, but the clone that
+        supplies its installer/*.sh helpers was unpinned, so it took whatever
+        the default branch held. Script and helpers came from different
+        commits: invisible while the two agreed, fatal the moment Phase 29
+        deleted a helper the tagged script still sourced.
+
+        A tagged install.sh must clone its own tag. Anything else silently
+        mixes versions, and the failure surfaces as a missing file rather
+        than as the version skew it actually is.
+        """
+        code = self._strip_comments(self._INSTALL_SH.read_text(encoding="utf-8"))
+
+        match = re.search(r"git clone[^\n]*repo-tmp", code)
+        assert match is not None, "could not find the bootstrap git clone in install.sh"
+        clone = match.group(0)
+
+        assert "--branch" in clone, (
+            "install.sh's bootstrap clone must pin the ref via --branch so the "
+            "helpers come from the same commit as this script. Unpinned clone: "
+            f"{clone!r}"
+        )
+        assert "REPO_REF" in clone, (
+            "the bootstrap clone must pin REPO_REF rather than a hardcoded "
+            f"branch name, so a release bumps one place. Found: {clone!r}"
+        )
+        assert re.search(r"^REPO_REF=", code, re.M), (
+            "install.sh must define REPO_REF (baked-in default, overridable "
+            "via PSIPHON3XUI_REPO_REF for branch testing)."
+        )
+        assert "PSIPHON3XUI_REPO_REF" in code, (
+            "REPO_REF must stay overridable via PSIPHON3XUI_REPO_REF so a "
+            "branch can be tested without editing the script."
         )
 
     def test_sudoers_dropin_is_deleted(self):
