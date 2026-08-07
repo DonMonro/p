@@ -290,3 +290,145 @@ async def test_leaves_countries_with_no_outbound_unchanged(monkeypatch, tmp_path
     assert report["skipped"] is None
     assert report["countries"] == []
     assert FakeUninstallClient.xray_update_payload is None
+
+
+# ===========================================================================
+# Phase 29 (item 4) — "I uninstalled the script, but it didn't delete anything"
+# ---------------------------------------------------------------------------
+# XuiLink.password_enc is signed with PSIPHON3XUI_SESSION_SECRET, which lives
+# only in /opt/psiphon-3x-ui/panel.env (systemd hands it to the panel via
+# EnvironmentFile=). install.sh ran this module from a plain root shell, so the
+# secret was absent, panel.config fell back to its built-in default,
+# decrypt_creds() failed the signature check, and cleanup returned early having
+# deleted nothing — exit 0, one easily-missed line of output.
+# ===========================================================================
+class TestPhase29UninstallCredentialDecryption:
+    @pytest.mark.asyncio
+    async def test_wrong_session_secret_reports_a_decrypt_failure(
+        self, monkeypatch, tmp_path
+    ):
+        """A row that exists but won't decrypt must say WHY, not "no creds".
+
+        This is the exact production failure: the row was fine, the secret was
+        missing. Reporting it as "no cached credentials" sent operators looking
+        for a DB problem that did not exist.
+        """
+        _isolated_env(tmp_path, monkeypatch)
+        from panel import config
+        from panel import uninstall as uninstall_mod
+
+        monkeypatch.setenv("PSIPHON3XUI_SESSION_SECRET", "the-real-install-secret")
+        config.get_settings.cache_clear()
+
+        _seed_country(code="US")
+        _seed_clone(country_code="US", inbound_id=42)
+        _seed_xui_link()  # encrypted under the real secret
+
+        # Now simulate install.sh's bare invocation: the env var is gone, so
+        # panel.config falls back to its default.
+        monkeypatch.delenv("PSIPHON3XUI_SESSION_SECRET", raising=False)
+        config.get_settings.cache_clear()
+
+        report = await uninstall_mod._cleanup(str(tmp_path / "panel.db"), dry_run=False)
+
+        assert report["skipped"] is not None
+        assert "decrypt" in report["skipped"].lower(), (
+            "a signature failure must be reported as a decrypt failure, not as "
+            f"a missing row; got: {report['skipped']!r}"
+        )
+        assert "PSIPHON3XUI_SESSION_SECRET" in report["skipped"], (
+            "the skip message must name the env var an operator has to supply, "
+            f"got: {report['skipped']!r}"
+        )
+        assert FakeUninstallClient.deleted_inbounds == []
+
+    @pytest.mark.asyncio
+    async def test_correct_session_secret_deletes_everything(
+        self, monkeypatch, tmp_path
+    ):
+        """With the env var loaded, the same DB cleans up completely.
+
+        The positive control for the test above: identical fixtures, only the
+        secret differs, and now every inbound AND every outbound/rule goes.
+        """
+        _isolated_env(tmp_path, monkeypatch)
+        from panel import config
+        from panel import uninstall as uninstall_mod
+
+        monkeypatch.setenv("PSIPHON3XUI_SESSION_SECRET", "the-real-install-secret")
+        config.get_settings.cache_clear()
+
+        _seed_country(code="US")
+        _seed_clone(country_code="US", inbound_id=42)
+        _seed_xui_link()
+        FakeUninstallClient.xray_template = {
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "psiphon-out-US", "protocol": "socks"},
+            ],
+            "routing": {
+                "rules": [
+                    {"inboundTag": ["in-31001-tcp"], "outboundTag": "psiphon-out-US"}
+                ]
+            },
+        }
+
+        report = await uninstall_mod._cleanup(str(tmp_path / "panel.db"), dry_run=False)
+
+        assert report["skipped"] is None
+        assert report["inbounds"] == [42]
+        assert report["countries"] == ["US"]
+        final = json.loads(FakeUninstallClient.xray_update_payload)
+        assert {ob["tag"] for ob in final["outbounds"]} == {"direct"}
+        assert final["routing"]["rules"] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_password_column_is_reported_separately(
+        self, monkeypatch, tmp_path
+    ):
+        """An actually-empty password_enc keeps the "no cached credentials" text.
+
+        The two failures need distinguishable messages or the diagnostic value
+        of the one above is lost.
+        """
+        _isolated_env(tmp_path, monkeypatch)
+        from panel import uninstall as uninstall_mod
+
+        _seed_country(code="US")
+        init_db()
+        with Session(get_engine()) as s:
+            s.add(
+                XuiLink(
+                    id=1,
+                    base_url="http://127.0.0.1:2053",
+                    username="xui-admin",
+                    password_enc="",
+                )
+            )
+            s.commit()
+
+        report = await uninstall_mod._cleanup(str(tmp_path / "panel.db"), dry_run=False)
+
+        assert report["skipped"] == "no cached 3x-ui credentials in panel.db"
+
+    def test_skip_is_reported_on_stderr(self, monkeypatch, tmp_path, capsys):
+        """A skip means debris is being left behind — it must be a warning.
+
+        On stdout it was one quiet line lost among the rest of the uninstall
+        output, which is why nobody noticed nothing had been deleted.
+        """
+        _isolated_env(tmp_path, monkeypatch)
+        from panel import uninstall as uninstall_mod
+
+        _seed_country(code="US")
+        # No XuiLink at all → guaranteed skip.
+        rc = uninstall_mod.main(["--db", str(tmp_path / "panel.db")])
+
+        assert rc == 0, "a skip must never block the uninstall"
+        captured = capsys.readouterr()
+        assert "SKIPPED" in captured.err, (
+            "the skip must go to stderr so it survives the uninstall output; "
+            f"stdout={captured.out!r} stderr={captured.err!r}"
+        )
+        assert "3x-ui" in captured.err
+

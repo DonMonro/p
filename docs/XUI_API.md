@@ -661,11 +661,14 @@ the on-disk `panel.db` + matching config entries — zip-slip guarded, with
 against the stored bcrypt hash (a stale session cookie alone can't change
 the password) and writes a fresh hash. `POST /api/dashboard/change-panel-port`
 persists the new `Settings.panel_port` (rejecting collisions with existing
-`PortAssignment.socks_port` / `public_port` rows) and surfaces a banner
-reminding the operator to `systemctl restart psiphon-3x-ui.service` and
-re-run `installer/firewall.sh` — the panel listens on the persisted port but
-the actual `psiphon-3x-ui.service` unit needs a restart for that to take
-effect.
+`PortAssignment.socks_port` / `public_port` rows), rewrites
+`PSIPHON3XUI_PORT` in `panel.env` — the port the panel process actually
+reads — and then restarts `psiphon-3x-ui.service` in-band via the polkit
+rule. A port already bound by another process is refused up front with a
+409, since `Restart=on-abort` would not retry the resulting bind failure.
+Phase 29 removed the host-firewall step: opening the new port in a
+firewall or security group is the operator's job, and the browser is not
+redirected to the new port.
 
 ## Per-country routing via the Xray-settings API (Phase 26)
 

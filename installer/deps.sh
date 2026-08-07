@@ -8,7 +8,12 @@
 #   - python3-venv, python3-pip, python3-build, python3-setuptools :: panel wheel build
 #   - golang-go (>=1.21)  :: build psiphon-tunnel-core from source
 #   - git                 :: clone the pinned psiphon-tunnel-core tag
-#   - jq, ufw, curl, wget, ca-certificates, tar :: misc installer bookkeeping
+#   - jq, curl, wget, ca-certificates, tar :: misc installer bookkeeping
+#
+# Phase 29 (item 3) dropped `ufw` from this list: the installer no longer
+# manages the host firewall, so pulling it in would install a package the
+# operator never asked for. An already-installed ufw is left exactly as it is
+# — we do not enable, disable or configure it.
 #
 # We scope apt locking to this script and tolerate apt auto-installing
 # recommended extras (golang-go pulls gccgo/clang naturally); we don't pin
@@ -29,7 +34,7 @@ run_deps() {
     apt-get update -qq
 
     apt-get install -y -qq \
-        curl wget git jq ufw ca-certificates tar \
+        curl wget git jq ca-certificates tar \
         python3 python3-venv python3-pip \
         python3-build python3-setuptools python3-wheel \
         golang-go \

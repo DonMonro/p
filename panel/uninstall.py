@@ -3,7 +3,16 @@
 Invoked by ``install.sh --uninstall`` before it tears down the service and
 deletes the install prefix::
 
+    set -a; source "${ENV_FILE}"; set +a
     ${VENV_DIR}/bin/python -m panel.uninstall --db "${DB_PATH}"
+
+Sourcing the env file is **required**, not decorative (Phase 29, item 4). The
+3x-ui password is stored signature-encrypted in ``XuiLink.password_enc`` using
+``PSIPHON3XUI_SESSION_SECRET``, which systemd supplies to the panel via
+``EnvironmentFile=`` and which is therefore absent from a plain root shell.
+Run bare, :func:`panel.auth.decrypt_creds` falls back to the built-in default
+secret, fails the signature check, returns ``None``, and this module used to
+exit 0 having deleted nothing at all.
 
 Why this exists
 ---------------
@@ -141,10 +150,29 @@ async def _cleanup(db_path: str | None, *, dry_run: bool) -> dict[str, Any]:
 
         from .auth import decrypt_creds
 
-        creds = decrypt_creds(link.password_enc) if link.password_enc else None
-        password = creds.get("password") if creds else None
-        if not password:
+        if not link.password_enc:
             report["skipped"] = "no cached 3x-ui credentials in panel.db"
+            return report
+
+        # Phase 29 (item 4): a decrypt failure and an empty column are NOT the
+        # same problem, and conflating them is what made the silent-skip bug so
+        # hard to spot. password_enc is signed with PSIPHON3XUI_SESSION_SECRET,
+        # which lives only in panel.env; run this module without that env var
+        # loaded and decrypt_creds() returns None for a perfectly good row.
+        # Saying so out loud turns an invisible no-op into a fixable error.
+        creds = decrypt_creds(link.password_enc)
+        if creds is None:
+            report["skipped"] = (
+                "could not decrypt the cached 3x-ui password — "
+                "PSIPHON3XUI_SESSION_SECRET does not match the one that "
+                "encrypted it. Load the panel's env file before running this "
+                "module (set -a; source /opt/psiphon-3x-ui/panel.env; set +a)."
+            )
+            return report
+
+        password = creds.get("password")
+        if not password:
+            report["skipped"] = "cached 3x-ui credentials contain no password"
             return report
 
         base_url = link.base_url
@@ -227,7 +255,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1 if args.strict else 0
 
     if report["skipped"]:
-        print(f"3x-ui cleanup skipped: {report['skipped']}")
+        # Phase 29 (item 4): a skip means inbounds/outbounds are being LEFT in
+        # 3x-ui. That is a warning, not a status line — it goes to stderr so it
+        # survives the rest of the uninstall output.
+        print(f"3x-ui cleanup SKIPPED: {report['skipped']}", file=sys.stderr)
+        if report["skipped"] != "dry-run":
+            print(
+                "3x-ui cleanup SKIPPED: the inbounds and outbounds this panel "
+                "created are still in 3x-ui — delete them from the 3x-ui UI.",
+                file=sys.stderr,
+            )
     else:
         n_in = len(report["inbounds"])
         n_co = len(report["countries"])

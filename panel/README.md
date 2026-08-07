@@ -211,9 +211,11 @@ The dashboard surface:
   `current_password` against the stored bcrypt hash so a leaked session
   cookie alone can't change the password. `change-panel-port` persists the
   new `Settings.panel_port` (rejecting collisions with existing
-  `PortAssignment.socks_port` / `public_port` rows) and surfaces a banner
-  reminding the operator to run `systemctl restart psiphon-3x-ui.service`
-  + `installer/firewall.sh` for the new port to take effect.
+  `PortAssignment.socks_port` / `public_port` rows), rewrites
+  `PSIPHON3XUI_PORT` in `panel.env`, and restarts
+  `psiphon-3x-ui.service` in-band. The browser is not redirected — the
+  operator reopens the dashboard on the new port. Phase 29 removed the
+  host-firewall step; opening the port is the operator's job.
 
 The full request/response shape + error codes for every handler are
 documented in [`docs/XUI_API.md`](../docs/XUI_API.md) § *Phase 6 —

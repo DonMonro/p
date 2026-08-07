@@ -1700,31 +1700,23 @@ def _stub_listening_ports(monkeypatch, ports: set[int]):
 
 
 def _stub_port_change_host(
-    monkeypatch, *, firewall=(True, ""), env=(True, "rewritten"), restart=(True, "")
+    monkeypatch, *, env=(True, "rewritten"), restart=(True, "")
 ):
     """Model a host where the port-change side effects succeed.
 
-    Phase 28 (item 1, part 2): the firewall and env-rewrite steps are now
-    ABORT conditions rather than logged warnings, because a port change that
-    half-applies takes the panel off both the old and the new port. On a
-    Windows dev box neither step can succeed (no ufw, no panel.env), so a test
-    that wants the happy path has to say so explicitly.
+    Phase 28 (item 1, part 2) made the env-rewrite step an ABORT condition
+    rather than a logged warning, because a port change that half-applies takes
+    the panel off both the old and the new port. On a Windows dev box the step
+    cannot succeed (no panel.env), so a test that wants the happy path has to
+    say so explicitly.
 
-    Returns the list of ports the firewall step was asked to open, so a test can
-    assert the firewall ran BEFORE anything was persisted.
+    Phase 29 (item 3) removed the firewall step entirely, so the ``firewall``
+    keyword and the returned call-list are gone with it.
     """
     from panel.dashboard import router as dashboard_router
 
-    fw_calls: list[int] = []
-
-    def _fake_fw(port: int) -> tuple[bool, str]:
-        fw_calls.append(int(port))
-        return firewall
-
-    monkeypatch.setattr(dashboard_router, "_reload_firewall", _fake_fw)
     monkeypatch.setattr(dashboard_router, "_update_panel_env_port", lambda port: env)
     monkeypatch.setattr(dashboard_router, "_restart_panel_service", lambda: restart)
-    return fw_calls
 
 
 class TestChangePanelPort:
@@ -1742,7 +1734,13 @@ class TestChangePanelPort:
         assert body["changed"] is True
         assert body["old_port"] == 18001
         assert body["new_port"] == 19001
-        assert "firewall" in body["note"]
+        assert "19001" in body["note"], (
+            "the note must tell the operator where the panel is coming back"
+        )
+        assert "firewall" not in body["note"].lower(), (
+            "Phase 29 (item 3) — the note must not mention a firewall the "
+            "panel no longer touches."
+        )
 
         init_db()
         with Session(get_engine()) as s:
@@ -1821,53 +1819,37 @@ class TestChangePanelPort:
         assert r.json()["changed"] is True
 
     # ── The lockout itself: a half-applied change must not be reported as OK ──
-    def test_firewall_failure_aborts_and_keeps_old_port(self, monkeypatch, tmp_path):
-        """THE reported bug. ufw is root-only and the panel runs unprivileged,
-        so the firewall step routinely cannot run. It used to be logged and
-        ignored, returning 200 — the service was then restarted onto a port ufw
-        was still blocking, killing access on BOTH ports with no way back in.
+    def test_env_rewrite_failure_never_reaches_the_restart(self, monkeypatch, tmp_path):
+        """Ordering is what stops a half-applied change from stranding the panel.
+
+        Phase 28's reported bug was the FIREWALL step failing while the change
+        was logged-and-ignored, returning 200 — the panel then restarted onto a
+        port it could not reach. Phase 29 (item 3) removed that step, so the
+        env rewrite is the only remaining mid-change failure, and it must abort
+        the same way: once panel.env cannot be written there is no in-band way
+        back, so the service must NOT be restarted.
+
+        (The 502 + DB rollback halves are pinned by
+        ``test_env_rewrite_failure_rolls_back_the_db_row`` below.)
         """
         client = _client(monkeypatch, tmp_path)
         _login(client)
         _stub_listening_ports(monkeypatch, set())
-        _stub_port_change_host(
-            monkeypatch, firewall=(False, "ufw requires root but this runs as UID 997")
-        )
+        restart_calls: list[int] = []
 
-        r = client.post("/api/dashboard/change-panel-port", json={"new_port": 19001})
-        assert r.status_code == 502, r.text
-        detail = r.json()["detail"]
-        assert "19001" in detail
-        assert "18001" in detail, "must tell the operator where the panel still is"
-        assert "ufw allow" in detail, "must give the manual recovery command"
-
-        # Nothing persisted: the panel is still reachable on the old port.
-        init_db()
-        with Session(get_engine()) as s:
-            assert s.get(Settings, {"id": 1}).panel_port == 18001
-
-    def test_firewall_runs_before_anything_is_persisted(self, monkeypatch, tmp_path):
-        """Ordering is the whole fix: once panel.env is rewritten there is no
-        in-band way back, so the firewall must be proven first."""
-        client = _client(monkeypatch, tmp_path)
-        _login(client)
-        _stub_listening_ports(monkeypatch, set())
-        env_calls: list[int] = []
-
-        fw_calls = _stub_port_change_host(
-            monkeypatch, firewall=(False, "ufw requires root")
-        )
         from panel.dashboard import router as dashboard_router
 
-        def _tracking_env(port: int) -> tuple[bool, str]:
-            env_calls.append(int(port))
-            return True, "rewritten"
+        def _tracking_restart() -> tuple[bool, str]:
+            restart_calls.append(1)
+            return True, "restarted"
 
-        monkeypatch.setattr(dashboard_router, "_update_panel_env_port", _tracking_env)
+        _stub_port_change_host(monkeypatch, env=(False, "env file not found"))
+        monkeypatch.setattr(dashboard_router, "_restart_panel_service", _tracking_restart)
 
         client.post("/api/dashboard/change-panel-port", json={"new_port": 19001})
-        assert fw_calls == [19001], "firewall step must have been attempted"
-        assert env_calls == [], "env must NOT be rewritten after a firewall failure"
+        assert restart_calls == [], (
+            "a failed env rewrite must abort BEFORE the service is restarted"
+        )
 
     def test_env_rewrite_failure_rolls_back_the_db_row(self, monkeypatch, tmp_path):
         """If panel.env can't be rewritten, a restart rebinds to the OLD port.

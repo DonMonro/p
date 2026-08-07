@@ -70,24 +70,31 @@ root, no polkit escalation, no systemd unit, and never touches
 failure mode where 3x-ui regenerated `config.json` from its SQLite DB on
 restart and wiped the out-of-band edits.
 
-### Privilege boundary — the one exception (Phase 28)
+### Privilege boundary — no host-firewall management (Phase 29)
 
 The panel runs as the unprivileged `psiphon3xui` service user and has no
-shell access to the box. The **one narrow privilege escalation** is for
-opening firewall ports: when the operator changes the panel port from
-Settings (`POST /api/settings/panel-port`), the panel must open the new
-port in ufw **before** it persists the change, or it comes back on a port
-ufw is still filtering while the old port is already gone.
+shell access to the box. **This project does not manage the host
+firewall.** Phase 28 briefly added a narrow `sudo` grant so the panel
+could run `ufw allow <port>/tcp` on a port change; Phase 29 removed it
+along with `installer/firewall.sh` and
+`systemd/49-psiphon-3x-ui.sudoers`.
 
-ufw is root-only. The polkit rule in `systemd/49-psiphon-3x-ui.rules`
-grants only `org.freedesktop.systemd1.manage-units` and cannot cover ufw
-(not a systemd unit). The installer drops in a sudoers file at
-`/etc/sudoers.d/49-psiphon-3x-ui` (source:
-[`systemd/49-psiphon-3x-ui.sudoers`](../systemd/49-psiphon-3x-ui.sudoers))
-that grants the service user NOPASSWD on exactly `ufw allow <port>/tcp` —
-no delete, no enable/disable, no reset, no default-policy change, and the
-argument must be a bare 1-to-5-digit TCP port (see the file header for the
-digit-class enumeration rationale). `install.sh --uninstall` removes it.
+The reasoning: the installer never ran `ufw --force enable` (deliberately,
+to avoid locking an operator out of SSH), so on a stock install ufw is
+inactive and the `allow` rules filtered nothing. The step's only real
+effect was to make the in-panel port change fail — ufw is root-only, and
+the sudoers grant meant to bridge that gap became the failure itself.
+
+An already-installed ufw is left **exactly as-is**: the installer neither
+enables, disables, nor configures it, and `install.sh` sweeps away a stale
+`/etc/sudoers.d/49-psiphon-3x-ui` from Phase-28 checkouts on both install
+and uninstall. Opening ports in a host firewall or a cloud security group
+is the operator's job, the same as for any other service on the box.
+
+The remaining escalation is the polkit rule in
+`systemd/49-psiphon-3x-ui.rules`, which grants only
+`org.freedesktop.systemd1.manage-units` so the panel can restart its own
+unit and the `psiphon-tunnel@` fleet.
 
 Each enabled country contributes:
 
