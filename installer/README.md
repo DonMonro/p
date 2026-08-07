@@ -53,6 +53,8 @@ Every helper is safe to re-run:
 
 `../install.sh --uninstall` stops + disables the panel service, removes
 `${INSTALL_PREFIX}` (`/opt/psiphon-3x-ui`) and the `psiphon3xui` system
-user/group. The Sanaei 3x-ui panel itself and any inbounds created through
-it are **left untouched** — you must remove them from the 3x-ui UI/API
-manually.
+user/group. It also deletes the 3x-ui entries this panel created — the
+per-country cloned inbounds and their `psiphon-out-<CC>` outbounds, via
+`python -m panel.uninstall` (the routing rules go with the inbound). The
+Sanaei 3x-ui panel itself and anything created through it manually are
+**left untouched**.

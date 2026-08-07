@@ -437,8 +437,9 @@ Usage: install.sh [--uninstall]
              re-seeded with any newly-entered password, systemd service
              bounced.
   --uninstall  Stop the panel service and remove ${INSTALL_PREFIX}.
-             Psiphon tunnel instances are stopped. The 3x-ui panel and any
-             inbounds created through it are left untouched.
+             Psiphon tunnel instances are stopped. The 3x-ui inbounds and
+             outbounds this panel created are removed from 3x-ui; the 3x-ui
+             panel itself and everything else in it are left untouched.
 EOF
             exit 0
             ;;
