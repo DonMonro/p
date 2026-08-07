@@ -48,6 +48,13 @@ BIN_DIR="${INSTALL_PREFIX}/bin"
 # shellcheck disable=SC2034  # used by installer/panel_install.sh (per-country psiphon-tunnel-core datastore root)
 DATA_DIR="${INSTALL_PREFIX}/data"
 REPO_URL="https://github.com/DonMonro/p.git"
+# The git ref the curl|bash flow clones its helpers from. MUST match the ref
+# this copy of install.sh is served from, or the script and the installer/*.sh
+# helpers it sources come from different commits — the exact skew that broke
+# v1.0.0 installs when Phase 29 removed installer/firewall.sh. Bump this in
+# the same commit that moves a release tag. Override for branch testing:
+#   PSIPHON3XUI_REPO_REF=my-branch sudo bash install.sh
+REPO_REF="${PSIPHON3XUI_REPO_REF:-v1.0.0}"
 LOG_FILE="${INSTALL_PREFIX}/install.log"
 PSIPHON3XUI_USER="${PSIPHON3XUI_USER:-psiphon3xui}"
 PSIPHON3XUI_GROUP="${PSIPHON3XUI_GROUP:-psiphon3xui}"
@@ -146,7 +153,7 @@ ensure_helpers_present() {
     if [[ -d "${INSTALLER_DIR}" ]]; then
         return 0
     fi
-    info "Fetching installer modules from ${REPO_URL} ..."
+    info "Fetching installer modules from ${REPO_URL} at ref '${REPO_REF}' ..."
     if command -v git >/dev/null 2>&1; then
         # Install git first if missing (we'll need it anyway for the psiphon clone).
         if ! command -v apt-get >/dev/null 2>&1; then
@@ -167,8 +174,24 @@ ensure_helpers_present() {
             rm -rf "${INSTALL_PREFIX}/repo-tmp" \
                 || die "Could not remove stale ${INSTALL_PREFIX}/repo-tmp — delete it manually ('sudo rm -rf ${INSTALL_PREFIX}/repo-tmp') and re-run."
         fi
-        git clone --depth 1 "${REPO_URL}" "${INSTALL_PREFIX}/repo-tmp" \
-            || die "Failed to clone installer repository."
+        # Clone the SAME ref this script came from (Phase 29 hotfix).
+        #
+        # This clone used to be unpinned, which silently mixed versions: the
+        # curl|bash one-liner fetches install.sh from a pinned tag, but the
+        # helpers it then sources came from whatever the default branch
+        # happened to be. That worked only while the two agreed. Deleting
+        # installer/firewall.sh in Phase 29 made every `v1.0.0` install abort
+        # with "installer/firewall.sh: No such file or directory" — a tagged
+        # script looking for a file that tag still lists but main no longer
+        # ships. Any future helper rename/removal would break it again.
+        #
+        # REPO_REF is baked in and bumped at release time, so a tagged
+        # install.sh clones its own tag. PSIPHON3XUI_REPO_REF overrides it for
+        # testing a branch. A ref that does not exist on the remote is a hard
+        # error, never a silent fall back to the default branch — falling back
+        # is precisely the version skew this fixes.
+        git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${INSTALL_PREFIX}/repo-tmp" \
+            || die "Failed to clone installer repository at ref '${REPO_REF}'. Check the ref exists (git ls-remote --tags --heads ${REPO_URL}) or override with PSIPHON3XUI_REPO_REF=<branch-or-tag>."
         INSTALLER_DIR="${INSTALL_PREFIX}/repo-tmp/installer"
         SCRIPT_DIR="${INSTALL_PREFIX}/repo-tmp"
     else
