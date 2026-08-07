@@ -12,8 +12,8 @@ has ``wizard_completed == True``. It lets the operator:
 * idempotently re-apply the entire wizard state (rewrite every country
   config + restart every unit + re-clone every 3x-ui inbound);
 * export/restore ``panel.db`` and ``config/*.json`` (backup/restore);
-* rotate the admin password and change the panel port (with a firewall
-  sync note so the operator re-runs the firewall stage).
+* rotate the admin password and change the panel port (persisted to
+  panel.db + panel.env, then applied by restarting the service).
 
 All handlers require a valid session cookie (see
 :func:`panel.auth.get_current_user`) and return JSON unless they stream
@@ -27,7 +27,6 @@ import contextlib
 import io
 import json
 import logging
-import os
 import re
 import subprocess
 import tarfile
@@ -352,69 +351,6 @@ def _pick_free_public_port(db: Session, claimed: set[int] | None = None) -> int:
     while candidate in used or candidate < 1024:
         candidate += 1
     return candidate
-
-
-def _reload_firewall(panel_port: int | None = None) -> tuple[bool, str]:
-    """Hotfix #10 (Bug #5) + Hotfix #13 (Bug #1): re-run installer/firewall.sh in-band.
-
-    Returns (ok, detail). The installer directory lives adjacent to the
-    installed panel. We best-effort locate it via the install prefix (the
-    psiphon_install.sh places the repo at /opt/psiphon3xui). If firewall.sh
-    is missing or fails, returns (False, error message).
-
-    Hotfix #13 (Bug #1) — TWO compounding defects caused a total lockout when
-    the operator changed the panel port:
-
-    1. The search paths never matched reality. This looked under
-       ``/opt/psiphon3xui`` (no dashes), but ``INSTALL_PREFIX`` is
-       ``/opt/psiphon-3x-ui`` (with dashes) and install.sh clones the repo to
-       ``${INSTALL_PREFIX}/repo-tmp``. So firewall.sh was never found and the
-       step degraded to a logged warning.
-    2. Even when found, ``bash firewall.sh`` only *defined* ``run_firewall``
-       and exited 0 without calling it — so the step reported SUCCESS while
-       doing nothing. firewall.sh now self-invokes when run as a script.
-
-    Net effect: the new port never opened in ufw, yet the panel still
-    restarted onto it — the old port was closed and the new one firewalled,
-    which is exactly the reported "neither port works, panel completely gone".
-
-    The caller passes ``panel_port`` explicitly so the standalone self-invoke
-    path opens the correct port.
-    """
-    candidates = [
-        # install.sh clones to ${INSTALL_PREFIX}/repo-tmp and leaves it there.
-        Path("/opt/psiphon-3x-ui/repo-tmp/installer/firewall.sh"),
-        # Derived from the live db_path, so a relocated prefix still resolves.
-        _panel_db_path().parent / "repo-tmp" / "installer" / "firewall.sh",
-        _panel_db_path().parent / "installer" / "firewall.sh",
-        # Legacy paths kept so existing deployments don't regress.
-        Path("/opt/psiphon3xui/installer/firewall.sh"),
-        Path("/usr/local/share/psiphon-3x-ui/installer/firewall.sh"),
-    ]
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        try:
-            env = os.environ.copy()
-            if panel_port is not None:
-                env["PANEL_PORT"] = str(panel_port)
-            proc = subprocess.run(  # noqa: S603 — system binary
-                ["bash", str(candidate)],
-                capture_output=True,
-                text=True,
-                timeout=60.0,
-                check=False,
-                env=env,
-            )
-            ok = proc.returncode == 0
-            detail = proc.stdout.strip() if ok else proc.stderr.strip() or proc.stdout.strip()
-            return ok, detail or f"ran {candidate}"
-        except (OSError, subprocess.SubprocessError) as exc:
-            return False, f"firewall.sh invocation failed: {type(exc).__name__}: {exc}"
-    return False, (
-        "firewall.sh not found — searched "
-        + ", ".join(str(c) for c in candidates)
-    )
 
 
 def _panel_env_path() -> Path:
@@ -1934,16 +1870,22 @@ async def change_panel_port(
 ) -> dict[str, Any]:
     """Persist a new panel listen port AND apply it in-band.
 
-    Hotfix #10 (Bug #5): as well as flipping :attr:`Settings.panel_port`
-    in panel.db, this endpoint NOW (a) re-runs ``installer/firewall.sh`` so
-    the new port is reachable through the host firewall, and (b) calls
-    ``systemctl restart psiphon-3x-ui.service`` — authorised by the polkit
-    rule's newly-extended scope (see systemd/49-psiphon-3x-ui.rules). The
-    operator no longer needs to drop to a shell. The response surfaces
-    ``firewall_ok`` + ``service_restart_ok`` flags plus a joined note so the
-    SPA can tell the user the browser must reload at the new port once the
-    service comes back. Pre-Hotfix-#10 this endpoint only flipped the field
-    and the operator had to run the two shell commands manually.
+    Three steps, in an order chosen so a failure can never strand the panel:
+
+    1. Refuse up front if the port is already bound by another process. A
+       restart into ``EADDRINUSE`` is unrecoverable — ``Restart=on-abort``
+       does not retry a plain exit-1, so the panel would be gone from the old
+       port and never reach the new one.
+    2. Flip :attr:`Settings.panel_port` in panel.db, then rewrite
+       ``PSIPHON3XUI_PORT`` in ``panel.env``. The env file is what the panel
+       actually reads its port from; if that rewrite fails the DB row is
+       rolled back so the two cannot disagree.
+    3. Restart ``psiphon-3x-ui.service`` via the polkit rule.
+
+    Phase 29 (item 3) removed the host-firewall step that used to run first.
+    The panel no longer touches ufw at all — see the note at the call site.
+    The browser is NOT redirected to the new port; the operator reopens the
+    dashboard there once the service is back.
     """
     _require_wizard_completed(db)
     settings = db.get(Settings, {"id": 1})
@@ -1975,14 +1917,13 @@ async def change_panel_port(
 
     # Phase 28 (item 1 follow-up): reject a port already bound by ANOTHER process.
     #
-    # This is the remaining half of the reported lockout. Hotfix #13 fixed the
-    # firewall (the new port is now genuinely opened in ufw), but nothing checked
-    # whether the new port was free. If the operator picks a port something else
-    # already holds, the sequence is: DB row flipped → panel.env rewritten →
-    # service restarted → uvicorn dies with EADDRINUSE → `Restart=on-abort` does
-    # NOT retry a plain exit-1 → the panel is gone from BOTH ports, exactly as
-    # reported. Refusing up-front is the only safe order: once panel.env is
-    # rewritten there is no in-band way back.
+    # With the firewall step gone (Phase 29 item 3) this is the ONLY remaining
+    # way an in-panel port change can strand the panel, so it stays. If the
+    # operator picks a port something else already holds, the sequence is: DB
+    # row flipped → panel.env rewritten → service restarted → uvicorn dies with
+    # EADDRINUSE → `Restart=on-abort` does NOT retry a plain exit-1 → the panel
+    # is gone from BOTH ports. Refusing up-front is the only safe order: once
+    # panel.env is rewritten there is no in-band way back.
     #
     # The probe itself is best-effort (it must never block a legitimate change on
     # a host where /proc and `ss` are both unavailable), so a probe FAILURE is
@@ -2007,43 +1948,18 @@ async def change_panel_port(
                 f"become unreachable on both {old_port} and {new_port})"
             ),
         )
-    # Phase 28 (item 1, part 2): open the firewall FIRST, and abort if it fails.
+    # Phase 29 (item 3): the firewall step is GONE.
     #
-    # This ordering is the fix for the reported "panel is gone from both ports".
-    # The old sequence was: commit DB → rewrite panel.env → open firewall →
-    # restart. Steps 3 and 4 only *logged* their failures, so a firewall step
-    # that could not run still produced HTTP 200 + `changed: true` — and the
-    # service had already been pointed at a port ufw was blocking. Both ports
-    # then appear dead (old one closed, new one filtered) and there is no
-    # in-band way back, because the panel that would let you fix it is the
-    # thing that just went unreachable.
+    # This used to open the new port in ufw first and abort with a 502 if that
+    # failed. In practice the abort was the only thing it ever did: ufw is
+    # root-only, the panel runs unprivileged, and even with the sudoers grant
+    # in place the step is pointless on a stock install because the installer
+    # never enables ufw — the allow rules were filtering nothing. The operator
+    # asked for host-firewall management to be removed entirely, so the panel
+    # no longer touches ufw and no longer refuses a port change on its behalf.
     #
-    # `ufw` is root-only and the panel runs as the unprivileged `psiphon3xui`
-    # user, so this step depends on the sudoers drop-in that panel_install.sh
-    # writes (systemd/49-psiphon-3x-ui.sudoers — NOPASSWD on `ufw allow
-    # <port>/tcp` and nothing else). firewall.sh now returns non-zero rather
-    # than swallowing the error, so a missing drop-in surfaces here as a clean
-    # refusal instead of a silent lockout.
-    #
-    # Opening the new port before committing is safe and idempotent — an extra
-    # `ufw allow` for a port we end up not using is harmless, whereas the
-    # reverse order is unrecoverable.
-    fw_ok, fw_detail = _reload_firewall(new_port)
-    if not fw_ok:
-        _log.warning("change_panel_port firewall reload failed: %s", fw_detail)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=(
-                f"refusing to change the panel port: the firewall could not be "
-                f"updated for {new_port}/tcp, so the panel would become "
-                f"unreachable on both {old_port} and {new_port}. Nothing was "
-                f"changed — the panel is still on {old_port}. This usually "
-                f"means /etc/sudoers.d/49-psiphon-3x-ui is missing (re-run the "
-                f"installer); as a workaround, run `sudo ufw allow "
-                f"{new_port}/tcp` from a shell and retry. ({fw_detail})"
-            ),
-        )
-
+    # If a host DOES run an active firewall, opening the new port is now the
+    # operator's job, same as any other service on the box.
     settings.panel_port = new_port
     db.add(settings)
     db.commit()
@@ -2087,12 +2003,12 @@ async def change_panel_port(
     # 19f5) must authorise the psiphon3xui user to restart
     # `psiphon-3x-ui.service`. If the service restart succeeds the panel process
     # is killed while this very request is still streaming — the response body
-    # may be cut short in-flight. We deliberately return the success payload
-    # with a browser-self-refresh hint so the operator's tab reloads on the new
-    # port once the service comes back.
+    # may be cut short in-flight.
     #
-    # The firewall step already ran (and hard-failed) above, before anything was
-    # persisted — see the Phase 28 note there for why that ordering matters.
+    # Phase 29 (item 3): the operator explicitly does NOT need the browser to
+    # follow the panel to the new port. Changing the port correctly is the
+    # whole requirement, so a cut-short response here is an expected outcome,
+    # not a failure — the note below just tells the operator where to look.
     svc_ok, svc_detail = _restart_panel_service()
     if not svc_ok:
         _log.warning("change_panel_port systemctl restart failed: %s", svc_detail)
@@ -2103,22 +2019,18 @@ async def change_panel_port(
         + (f" — {env_detail}" if env_detail else "")
     )
     note_bits.append(
-        f"firewall.sh {'OK' if fw_ok else 'FAILED'}" + (f" — {fw_detail}" if fw_detail else "")
-    )
-    note_bits.append(
         f"systemctl restart psiphon-3x-ui.service {'OK' if svc_ok else 'FAILED'}"
         + (f" — {svc_detail}" if svc_detail else "")
     )
     note_bits.append(
-        "the panel is restarting on the new port — please reload the browser "
-        f"at http://<host>:{new_port}/dashboard once the service comes back"
+        f"the panel is restarting on port {new_port} — open "
+        f"http://<host>:{new_port}/dashboard when it comes back"
     )
     return {
         "changed": True,
         "old_port": old_port,
         "new_port": new_port,
         "env_rewrite_ok": env_ok,
-        "firewall_ok": fw_ok,
         "service_restart_ok": svc_ok,
         "note": " | ".join(note_bits),
     }

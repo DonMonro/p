@@ -17,7 +17,6 @@
 #   - apt deps (incl. golang-go for building psiphon-tunnel-core from source)
 #   - build psiphon-tunnel-core from the pinned upstream tag
 #   - build the panel wheel, seed panel.db, register the systemd service
-#   - ufw: open the chosen panel port only (inbound range opened later by wizard)
 #   - final summary: server IP + browser login URL + credentials (shown once)
 #
 # Idempotent: re-running install.sh upgrades in place; session secret + DB row
@@ -178,6 +177,28 @@ ensure_helpers_present() {
 }
 
 # ---------------------------------------------------------------------------
+# Phase 29 (item 3): remove the Phase-28 sudoers grant.
+#
+# Phase 28 installed /etc/sudoers.d/49-psiphon-3x-ui to let the unprivileged
+# panel run `ufw allow <port>/tcp`. Phase 29 removes host-firewall management
+# entirely, so that grant is now dead weight — and dead weight in
+# /etc/sudoers.d is a standing privilege the operator did not ask to keep.
+#
+# This runs on INSTALL as well as uninstall: an operator upgrading from the
+# previous release already has the file on disk, and nothing else would ever
+# clear it. Both call sites are idempotent.
+# ---------------------------------------------------------------------------
+_remove_stale_sudoers_dropin() {
+    local dropin="/etc/sudoers.d/49-psiphon-3x-ui"
+    if [[ -e "${dropin}" ]]; then
+        rm -f "${dropin}" 2>/dev/null \
+            && info "Removed the obsolete sudoers grant ${dropin} (the panel no longer manages the firewall)." \
+            || warn "Could not remove ${dropin}; delete it manually."
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
 run_uninstall() {
@@ -194,11 +215,39 @@ run_uninstall() {
 
     # ── Phase 27 (item 3): clean the 3x-ui entries this panel created ──────
     # Run BEFORE stopping the service so the venv + DB are still intact.
+    #
+    # Phase 29 (item 4) — THIS IS THE FIX for "uninstall didn't delete anything".
+    #
+    # The 3x-ui password is stored encrypted in panel.db (XuiLink.password_enc),
+    # signed with PSIPHON3XUI_SESSION_SECRET. That secret lives ONLY in
+    # ${ENV_FILE}, which systemd feeds to the panel via EnvironmentFile= — it is
+    # never in a login shell's environment. Invoking the cleanup module bare, as
+    # this did, meant panel.config.Settings fell back to its built-in default
+    # ("dev-only-change-me"), decrypt_creds() failed the signature check and
+    # returned None, and the module bailed out early with
+    #
+    #     3x-ui cleanup skipped: no cached 3x-ui credentials in panel.db
+    #
+    # printed among the other uninstall output — exit code 0, nothing deleted.
+    # Every inbound and outbound the panel ever created stayed in 3x-ui.
+    #
+    # Sourcing ${ENV_FILE} in a SUBSHELL (so the secret never leaks into the
+    # rest of this script's environment) with `set -a` gives the module the real
+    # secret, so decryption succeeds and the cleanup actually runs.
     if [[ -x "${VENV_DIR}/bin/python" && -f "${DB_PATH}" ]]; then
         info "Cleaning 3x-ui entries created by this panel …"
-        "${VENV_DIR}/bin/python" -m panel.uninstall --db "${DB_PATH}" || {
-            warn "3x-ui cleanup reported warnings (see above); continuing uninstall."
-        }
+        (
+            set -a
+            if [[ -f "${ENV_FILE}" ]]; then
+                # shellcheck source=/dev/null
+                source "${ENV_FILE}" 2>/dev/null || true
+            fi
+            set +a
+            "${VENV_DIR}/bin/python" -m panel.uninstall --db "${DB_PATH}"
+        ) || warn "3x-ui cleanup reported warnings (see above); continuing uninstall."
+        if [[ ! -f "${ENV_FILE}" ]]; then
+            warn "${ENV_FILE} not found — the 3x-ui password could not be decrypted, so inbounds/outbounds may remain. Remove them from the 3x-ui UI."
+        fi
     else
         warn "Skipping 3x-ui cleanup: venv or panel.db not found."
     fi
@@ -219,10 +268,10 @@ run_uninstall() {
     rm -f /etc/systemd/system/psiphon-tunnel@.service \
         "/etc/systemd/system/psiphon-tunnel@.service.d"/*.conf 2>/dev/null || true
     rm -f /etc/polkit-1/rules.d/49-psiphon-3x-ui.rules 2>/dev/null || true
-    # Phase 28 (item 1, part 3): drop the sudoers grant too. Leaving a NOPASSWD
-    # rule behind for a user that install.sh is about to delete would let a
-    # future account that reuses the name run `ufw allow`.
-    rm -f /etc/sudoers.d/49-psiphon-3x-ui 2>/dev/null || true
+    # Phase 29 (item 3): clear the obsolete Phase-28 sudoers grant if an older
+    # install left one behind. Leaving a NOPASSWD rule for a user that is about
+    # to be deleted would hand `ufw allow` to any future account reusing the name.
+    _remove_stale_sudoers_dropin
     # Best-effort reloads so polkit+systemd release the now-removed files.
     systemctl reload polkit.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
@@ -386,7 +435,7 @@ EOF
     # runs first because shellcheck checks can't see across files. https_install
     # runs ahead of panel_install so the latter can pick up ${PANEL_TLS_CERT}
     # / ${PANEL_TLS_KEY} into panel.env + the systemd ExecStart.
-    for helper in deps prepare_user prompt psiphon_install https_install panel_install firewall; do
+    for helper in deps prepare_user prompt psiphon_install https_install panel_install; do
         # shellcheck disable=SC1090,SC1091
         source "${INSTALLER_DIR}/${helper}.sh" || die "Failed to load ${helper}.sh"
     done
@@ -401,15 +450,14 @@ EOF
                           # exporting PANEL_ENABLE_HTTPS=yes before install.sh)
     run_panel_install     # venv + wheel + seed + systemd enable (needs the user, may pick up TLS)
 
-    # Phase 28 (item 1): run_firewall now returns non-zero when it cannot open
-    # the port — change_panel_port depends on that to abort BEFORE it rewrites
-    # panel.env. The installer must NOT inherit that strictness: under
-    # `set -e` a bare call would abort here, on the last step, and skip
-    # print_summary — the only place the generated password is ever shown. A
-    # box with a broken ufw would then need a full re-install to recover it.
-    # Open-port failure at install time is recoverable by hand, so warn and
-    # continue.
-    run_firewall || warn "Could not open ${PANEL_PORT}/tcp in ufw. The panel is installed and running; open the port manually (\`sudo ufw allow ${PANEL_PORT}/tcp\`) or the web UI will be unreachable."
+    # Phase 29 (item 3): the firewall stage is gone. installer/firewall.sh has
+    # been deleted and this installer no longer touches ufw. On a stock install
+    # ufw was never enabled anyway (the `ufw --force enable` call was always
+    # commented out to avoid locking the operator out of SSH), so the allow
+    # rules filtered nothing and only ever caused the in-panel port change to
+    # fail. Hosts that DO run an active firewall now open the panel port the
+    # same way they would for any other service.
+    _remove_stale_sudoers_dropin
 
     print_summary
     echo

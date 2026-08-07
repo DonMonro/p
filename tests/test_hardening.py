@@ -647,6 +647,47 @@ class TestUninstallFlag:
             "clean up the 3x-ui entries this panel created"
         )
 
+    def test_uninstall_loads_panel_env_before_the_cleanup_module(self):
+        """Phase 29 (item 4): the cleanup subprocess must run with the panel's
+        env file loaded.
+
+        The 3x-ui password is stored signature-encrypted in panel.db using
+        PSIPHON3XUI_SESSION_SECRET. That secret lives only in panel.env
+        (systemd hands it to the panel via EnvironmentFile=) — a plain root
+        shell never has it. Run the cleanup bare and decrypt_creds() fails the
+        signature check, the module exits 0 having deleted NOTHING, exactly the
+        'it didn't delete anything' bug. Sourcing the env file in a subshell
+        restores the real secret for the subprocess only."""
+        text = self._install_path.read_text(encoding="utf-8")
+        assert 'source "${ENV_FILE}"' in text, (
+            "install.sh must source the panel env file before invoking "
+            "panel.uninstall, or the 3x-ui password cannot be decrypted and "
+            "the cleanup silently does nothing"
+        )
+        uninstall_at = text.index("-m panel.uninstall")
+        source_at = text.index('source "${ENV_FILE}"')
+        assert source_at < uninstall_at, (
+            "the env file must be sourced BEFORE the cleanup module runs"
+        )
+        # `set -a` exports what the env file defines; `set +a` closes it again,
+        # and both must sit between the subshell open and the python call so
+        # the secret never leaks into the rest of install.sh's environment.
+        set_a_at = text.rindex("set -a", 0, source_at)
+        set_plus_a_at = text.index("set +a", source_at)
+        assert set_a_at < source_at < set_plus_a_at < uninstall_at, (
+            "the env sourcing must be wrapped in `set -a` / `set +a` and stay "
+            "scoped to the cleanup subshell"
+        )
+        subshell_at = text.rindex("(", 0, set_a_at)
+        assert text[subshell_at + 1 : set_a_at].strip() == "", (
+            "`set -a` must be the first statement inside a subshell so "
+            "PSIPHON3XUI_SESSION_SECRET is not exported into the rest of the "
+            "uninstall; found "
+            f"{text[subshell_at : set_a_at]!r} between the paren and `set -a`"
+        )
+        # A missing env file must warn loudly, not silently skip.
+        assert text.index("${ENV_FILE} not found") > uninstall_at
+
     def test_uninstall_cleanup_runs_before_the_service_is_stopped(self):
         """The cleanup shells out to the venv interpreter and reads panel.db,
         so it has to happen while both still exist — i.e. before
@@ -2370,6 +2411,10 @@ class TestHotfix10PostReleaseRegressions:
       commands manually. Fix: handler now runs ``installer/firewall.sh`` and
       ``systemctl restart psiphon-3x-ui.service`` in-band; the polkit rule
       is extended to authorise the restart verb for the panel's own unit.
+      **Phase 29 (item 3) dropped the firewall half**: ufw is root-only, the
+      panel is unprivileged, and the installer never enabled ufw anyway, so
+      the step only ever blocked the port change. The restart half — the part
+      that actually saved the operator a shell trip — stands.
     """
 
     # ─── Bug #1: Logout anchor lives inside <main x-data> ────────────────
@@ -2550,21 +2595,23 @@ class TestHotfix10PostReleaseRegressions:
             "belt-and-braces fallback for non-systemd-journal distros."
         )
 
-    # ─── Bug #5 backend: change_panel_port invokes firewall + restart ───
-    def test_change_panel_port_invokes_firewall_and_restart_in_band(self):
+    # ─── Bug #5 backend: change_panel_port restarts the service in-band ───
+    def test_change_panel_port_restarts_the_service_in_band(self):
+        """The operator must not have to drop to a shell to finish the change.
+
+        Phase 29 (item 3) removed the firewall half of this test along with the
+        code it pinned; ``_reload_firewall`` and the ``firewall_ok`` flag are
+        gone and their absence is pinned by TestPhase29FirewallRemoval. The
+        restart is what Bug #5 was actually about, and it stays.
+        """
         import re  # noqa: PLC0415
 
         path = Path(__file__).resolve().parent.parent / "panel" / "dashboard" / "router.py"
         text = path.read_text(encoding="utf-8")
         text_no_comments = re.sub(r"#[^\n]*", "", text)
-        # 1) the helper functions exist near the top helpers block.
-        assert "def _reload_firewall(" in text_no_comments, (
-            "Bug #5 — _reload_firewall() helper must exist on the dashboard router."
-        )
         assert "def _restart_panel_service(" in text_no_comments, (
             "Bug #5 — _restart_panel_service() helper must exist on the dashboard router."
         )
-        # 2) change_panel_port invokes both helpers.
         m = re.search(
             r"def\s+change_panel_port\b.*?(?=\n@router\.|\nasync\s+def\s|\ndef\s|\nclass\s|\Z)",
             text_no_comments,
@@ -2572,18 +2619,13 @@ class TestHotfix10PostReleaseRegressions:
         )
         assert m is not None, "change_panel_port handler not found"
         body = m.group(0)
-        assert "_reload_firewall(" in body, (
-            "Bug #5 — change_panel_port must invoke _reload_firewall() after "
-            "persisting the new panel_port."
-        )
         assert "_restart_panel_service()" in body, (
             "Bug #5 — change_panel_port must invoke _restart_panel_service() "
             "so the operator doesn't have to drop to a shell."
         )
-        assert "firewall_ok" in body and "service_restart_ok" in body, (
-            "Bug #5 — change_panel_port response must surface firewall_ok + "
-            "service_restart_ok flags so the SPA can show the operator what "
-            "happened."
+        assert "service_restart_ok" in body, (
+            "Bug #5 — change_panel_port response must surface "
+            "service_restart_ok so the SPA can show the operator what happened."
         )
 
     # ─── Bug #5: polkit rule authorises restart of psiphon-3x-ui.service
@@ -2783,29 +2825,17 @@ class TestHotfix11PostReleaseRegressions:
         assert m is not None, "Bug #3 — change_panel_port def not found."
         body = m.group(0)
         env_call = body.find("_update_panel_env_port(")
-        fw_call = body.find("_reload_firewall(")
         svc_call = body.find("_restart_panel_service()")
-        assert env_call != -1 and fw_call != -1 and svc_call != -1, (
-            "Bug #3 — change_panel_port must call _update_panel_env_port, "
-            "_reload_firewall, AND _restart_panel_service."
+        assert env_call != -1 and svc_call != -1, (
+            "Bug #3 — change_panel_port must call _update_panel_env_port AND "
+            "_restart_panel_service."
         )
-        # Phase 28 (item 1, part 2) INVERTED the env-vs-firewall order on
-        # purpose. Bug #3's requirement was env-rewrite before the *restart* —
-        # that still holds and is asserted below. Requiring env before the
-        # FIREWALL was incidental to how the fix happened to be written, and it
-        # is actively harmful: the firewall step is the one most likely to fail
-        # (ufw is root-only, the panel runs as unprivileged `psiphon3xui`), and
-        # once panel.env has been rewritten there is no in-band way back. Doing
-        # the fallible, idempotent step first lets the handler abort with the
-        # panel still reachable on the old port.
-        assert fw_call < env_call, (
-            "Phase 28 — _reload_firewall MUST run BEFORE _update_panel_env_port. "
-            "The firewall step can fail (ufw needs root; the panel does not have "
-            "it), and it is idempotent, so it must be proven before anything is "
-            "persisted. Rewriting panel.env first and only then discovering the "
-            "port is firewalled is what left the panel unreachable on BOTH the "
-            "old and the new port."
-        )
+        # Phase 28 also pinned _reload_firewall BEFORE the env rewrite, on the
+        # reasoning that the fallible step should be proven before anything is
+        # persisted. Phase 29 (item 3) deleted the firewall step outright, so
+        # that ordering constraint has no operands left. What remains is Bug #3's
+        # actual requirement: panel.env must carry the new port before the
+        # service restarts, or the panel comes back up on the OLD port.
         assert env_call < svc_call, (
             "Bug #3 — _update_panel_env_port MUST run BEFORE "
             "_restart_panel_service so the panel boots on the new port."
@@ -2814,7 +2844,7 @@ class TestHotfix11PostReleaseRegressions:
         assert '"env_rewrite_ok": env_ok' in body, (
             "Bug #3 — change_panel_port must return `env_rewrite_ok` in its "
             "JSON payload so the SPA + tests can detect an env-file-write "
-            "failure distinctly from firewall/restart failures."
+            "failure distinctly from a restart failure."
         )
 
     # ---- Bug #4: dashboard SPA has no Delete button + no deleteCountry() --
@@ -6112,29 +6142,36 @@ class TestHotfix23PostReleaseRegressions:
         assert "psiphon-xray-applier.service" not in text
 
 
-class TestPhase28PanelPortLockout:
-    """The operator changed the panel port and lost the panel on BOTH ports.
+class TestPhase29FirewallRemoval:
+    """Phase 29 (item 3) — the host firewall is no longer part of this project.
 
-    Two compounding defects, each pinned below:
+    The operator's directive was explicit: "Remove the firewall, it really
+    isn't needed." And it wasn't — the installer never ran ``ufw --force
+    enable`` (that line was always commented out to avoid SSH lockouts), so on
+    a stock install ufw is INACTIVE and the ``ufw allow`` rules filtered
+    nothing. The only effect of the firewall step was to make the in-panel
+    port change fail: ufw is root-only, the panel runs unprivileged, and the
+    sudoers grant that was meant to bridge the gap (Phase 28) was itself the
+    thing that broke.
 
-    1. ``installer/firewall.sh`` swallowed every ufw failure (``|| warn`` then an
-       unconditional ``ok``), so it exited 0 even when the port was never
-       opened. ``ufw`` is root-only and the panel runs as the unprivileged
-       ``psiphon3xui`` service user, so this was the NORMAL case for an in-band
-       port change, not an edge case.
+    What was removed, and what the tests below pin:
+    - ``installer/firewall.sh`` — deleted.
+    - ``systemd/49-psiphon-3x-ui.sudoers`` — deleted (the NOPASSWD grant).
+    - ``panel/dashboard/router.py::_reload_firewall`` — deleted; the port
+      change no longer touches ufw at all.
+    - ``installer/deps.sh`` — no longer installs ufw.
+    - ``installer/panel_install.sh`` — no longer installs the drop-in.
+    - ``install.sh`` — no longer sources the firewall helper; instead it
+      REMOVES the stale drop-in if one exists, on both install and uninstall.
+      An already-installed ufw on the operator's box is left exactly as-is —
+      removing *our management* of the firewall is not disabling *their*
+      firewall, and we never run ``ufw disable``.
 
-    2. ``change_panel_port`` treated the firewall and env-rewrite steps as
-       best-effort — logging failures and still returning HTTP 200 with
-       ``changed: true``. It had already rewritten ``panel.env`` and restarted
-       the service by then, so the panel came back on a port ufw was blocking:
-       old port closed, new port filtered, no way back in.
-
-    3. Fixing (1) and (2) stops the lockout but leaves the feature permanently
-       refusing, because nothing ever authorised the unprivileged panel to run
-       ufw: the polkit rule covers only ``org.freedesktop.systemd1.
-       manage-units`` and ufw is not a systemd unit. A narrowly-scoped sudoers
-       drop-in closes that gap — pinned below so the grant cannot silently
-       widen.
+    What survives (deliberately): the OS-listener 409 pre-check in
+    ``change_panel_port``. With the firewall step gone it is the ONLY
+    remaining way an in-panel port change can strand the panel — a bind
+    failure would kill uvicorn, ``Restart=on-abort`` does not retry a plain
+    exit, and the panel would be unreachable on both ports. That guard stays.
     """
 
     _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -6143,46 +6180,50 @@ class TestPhase28PanelPortLockout:
     _SUDOERS = _REPO_ROOT / "systemd" / "49-psiphon-3x-ui.sudoers"
     _PANEL_INSTALL = _REPO_ROOT / "installer" / "panel_install.sh"
     _INSTALL_SH = _REPO_ROOT / "install.sh"
+    _DEPS_SH = _REPO_ROOT / "installer" / "deps.sh"
+    _DASHBOARD_HTML = _REPO_ROOT / "panel" / "static" / "dashboard.html"
 
-    def test_firewall_sh_fails_when_not_root(self):
-        """A non-root run must return non-zero, not pretend success."""
-        text = self._FIREWALL_SH.read_text(encoding="utf-8")
-        no_comments = re.sub(r"#[^\n]*", "", text)
-        assert "EUID" in no_comments, (
-            "Phase 28 — firewall.sh must check for root before calling ufw; "
-            "ufw is root-only and the panel runs unprivileged."
-        )
-        assert "return 1" in no_comments, (
-            "Phase 28 — firewall.sh must return non-zero when it cannot open "
-            "the port, so change_panel_port can abort before persisting."
-        )
+    def test_change_panel_port_card_has_no_helper_text(self):
+        """Phase 29 (item 2) — nothing at all under the Change port button.
 
-    def test_firewall_sh_does_not_swallow_ufw_failure(self):
-        """The `|| warn ... (continuing)` pattern is what hid the bug."""
-        text = self._FIREWALL_SH.read_text(encoding="utf-8")
-        no_comments = re.sub(r"#[^\n]*", "", text)
-        assert "(continuing)" not in no_comments, (
-            "Phase 28 — a failed `ufw allow` must NOT be downgraded to a "
-            "warning that still exits 0. That reported firewall_ok=true while "
-            "the port stayed closed."
-        )
-        m = re.search(r"run_firewall\(\)\s*\{(.*?)\n\}", no_comments, re.DOTALL)
-        assert m is not None, "run_firewall() not found in firewall.sh"
-        body = m.group(1)
-        # The rule is added through the UFW array so the non-root path can
-        # prefix `sudo -n`; assert the invocation exists in either form rather
-        # than pinning the literal `ufw allow`.
-        assert re.search(r'(?:"\$\{UFW\[@\]\}"|\bufw)\s+allow\b', body), (
-            "Phase 28 — run_firewall() must actually invoke `ufw allow`; "
-            "previously the script only *defined* the function and exited 0."
-        )
-        assert "UFW=(ufw)" in body or 'UFW=("${UFW_BIN}")' in body, (
-            "Phase 28 — the UFW array must default to an unprivileged-prefix-"
-            "free invocation so the root install path does not need sudo."
-        )
+        The card used to carry a ``<small>`` block explaining the firewall and
+        the manual restart. Item 2 asked for it gone: "delete it completely,
+        there is no need for any text under it at all, nothing." Item 3 then
+        removed the firewall the text described, so re-adding any of it would
+        also be describing behaviour that no longer exists.
 
-    def test_change_panel_port_aborts_on_firewall_failure(self):
-        """The handler must raise, not log-and-continue."""
+        Scoped to the card, not the file: the panel-port *response* note is
+        generated server-side and is a different surface.
+        """
+        html = self._DASHBOARD_HTML.read_text(encoding="utf-8")
+        start = html.index("<strong>Change panel port</strong>")
+        card = html[start : html.index("</article>", start)]
+
+        assert "changePanelPort()" in card, (
+            "located the wrong block — the Change panel port card must contain "
+            "the changePanelPort() button"
+        )
+        assert "<small" not in card, (
+            "Phase 29 (item 2) — the Change panel port card must carry NO "
+            f"helper text under the button. Found a <small> block in:\n{card}"
+        )
+        for word in ("firewall", "ufw", "systemctl", "restart"):
+            assert word not in card.lower(), (
+                f"Phase 29 (item 2) — {word!r} must not appear in the Change "
+                "panel port card; the operator asked for no explanatory text "
+                f"there at all. Card:\n{card}"
+            )
+
+    def _change_panel_port_body(self, *, code_only: bool = False) -> str:
+        """The whole ``change_panel_port`` function, ``#`` comments stripped.
+
+        With ``code_only=True`` the docstring goes too. Both have to be removed
+        before asserting that a word is absent from the *code*: this function is
+        heavily documented, and the documentation necessarily says "ufw" and
+        "firewall" while explaining that neither is called any more. Matching
+        those would make the absence assertions unsatisfiable without deleting
+        the explanation of why the code is the way it is.
+        """
         text = self._DASHBOARD_ROUTER.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
         m = re.search(
@@ -6192,191 +6233,149 @@ class TestPhase28PanelPortLockout:
         )
         assert m is not None, "change_panel_port def not found"
         body = m.group(0)
-        fw_idx = body.find("_reload_firewall(")
-        assert fw_idx != -1
-        # An HTTPException must be raised between the firewall call and the commit.
-        commit_idx = body.find("db.commit()", fw_idx)
-        assert commit_idx != -1, "change_panel_port must still commit on success"
-        between = body[fw_idx:commit_idx]
-        assert "raise HTTPException" in between, (
-            "Phase 28 — change_panel_port must ABORT when _reload_firewall "
-            "fails, before committing the new port. Logging the failure and "
-            "continuing is what took the panel off both ports."
+        if code_only:
+            body = re.sub(r'"""(?:.|\n)*?"""', "", body, count=1)
+        return body
+
+    # ── the deleted artifacts stay deleted ──────────────────────────────
+
+    def test_firewall_sh_is_deleted(self):
+        """The firewall helper must not come back."""
+        assert not self._FIREWALL_SH.exists(), (
+            "Phase 29 (item 3) — installer/firewall.sh must stay deleted; the "
+            "installer no longer manages the host firewall."
+        )
+
+    def test_sudoers_dropin_is_deleted(self):
+        """The NOPASSWD grant must not come back."""
+        assert not self._SUDOERS.exists(), (
+            "Phase 29 (item 3) — systemd/49-psiphon-3x-ui.sudoers must stay "
+            "deleted; the panel no longer runs ufw, so the grant has nothing "
+            "to authorise and only widens the blast radius."
+        )
+
+    # ── router.py: the port change is firewall-free ─────────────────────
+
+    def test_change_panel_port_has_no_firewall_code(self):
+        """No ufw call, no firewall status key, no reload helper.
+
+        Code-only: the docstring and comments explain that the firewall is gone,
+        so they legitimately contain the word — the CODE must not.
+        """
+        body = self._change_panel_port_body(code_only=True)
+        assert "_reload_firewall" not in body, (
+            "Phase 29 (item 3) — _reload_firewall must stay deleted from "
+            "change_panel_port; the panel no longer touches the host firewall."
+        )
+        assert "ufw" not in body, (
+            "Phase 29 (item 3) — change_panel_port must not invoke ufw; the "
+            "step was root-only, the panel is unprivileged, and the allow rule "
+            "filtered nothing on a stock install (ufw was never enabled)."
+        )
+        assert "firewall_ok" not in body, (
+            "Phase 29 (item 3) — the firewall_ok result key must stay gone."
         )
 
     def test_change_panel_port_checks_os_listeners(self):
-        """Picking an occupied port must be refused, not discovered at bind time."""
-        text = self._DASHBOARD_ROUTER.read_text(encoding="utf-8")
-        no_comments = re.sub(r"#[^\n]*", "", text)
-        m = re.search(
-            r"async\s+def\s+change_panel_port\b.*?(?=\n@router\.|\nasync\s+def\s|\ndef\s|\nclass\s|\Z)",
-            no_comments,
-            re.DOTALL,
-        )
-        assert m is not None
-        body = m.group(0)
+        """Picking an occupied port must be refused, not discovered at bind time.
+
+        This is the ONE guard that survives the firewall removal: a bind
+        failure kills uvicorn, `Restart=on-abort` does not retry a plain
+        exit-1, and the panel would be unreachable on both ports.
+        """
+        body = self._change_panel_port_body()
         assert "listening_ports()" in body, (
-            "Phase 28 — change_panel_port must probe OS listeners so an "
-            "already-bound port is refused up-front; uvicorn would otherwise "
-            "die with EADDRINUSE and systemd would not bring the panel back."
+            "Phase 29 (item 3) — change_panel_port must still probe OS "
+            "listeners; with the firewall step gone this is the only thing "
+            "that stops an in-panel port change from stranding the panel."
         )
 
-    # ── part 3: the privilege path that lets the fix actually succeed ──
+    def test_change_panel_port_still_persists_and_restarts(self):
+        """The port change itself must still work end-to-end."""
+        body = self._change_panel_port_body()
+        assert "settings.panel_port" in body, (
+            "the new port must be persisted to the settings"
+        )
+        assert "db.commit()" in body, "the new port must be committed"
+        assert "restart" in body.lower(), (
+            "the service must restart so the panel actually binds the new port"
+        )
 
-    def test_firewall_sh_escalates_via_sudo_when_not_root(self):
-        """Non-root must retry through `sudo -n`, not just give up."""
-        text = self._FIREWALL_SH.read_text(encoding="utf-8")
+    # ── install.sh: the stale grant is removed, not re-created ──────────
+
+    def test_installer_does_not_source_a_firewall_helper(self):
+        """The helper-source loop must not grow a `firewall` entry back."""
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-        assert re.search(r"sudo -n (ufw|\"?\$\{UFW_BIN\}\"?)", no_comments), (
-            "Phase 28 — the panel runs unprivileged, so firewall.sh must open "
-            "the port via `sudo -n` (authorised by the sudoers drop-in). "
-            "Without this the port-change feature can never succeed."
-        )
-        assert "-n" in no_comments, "sudo must be non-interactive (-n): there is no TTY."
-        # The sudoers drop-in enumerates absolute paths, so a bare `ufw` would
-        # only match if the service PATH happens to resolve to a listed one.
-        # NOTE: assert on the *assignment*, not on the substring `command -v ufw`
-        # — the "is ufw installed at all" guard at the top of the file contains
-        # that substring already, which would make the assertion vacuous.
-        assert re.search(
-            r'UFW_BIN="\$\(command -v ufw[^"]*\)"', no_comments
-        ), (
-            "Phase 28 — resolve ufw to an absolute path before handing it to "
-            "sudo; the drop-in matches the resolved binary, not the PATH lookup."
+        m = re.search(r"for\s+helper\s+in\s+([^\n;]+)", no_comments)
+        assert m is not None, "the helper-source loop must exist"
+        assert "firewall" not in m.group(1), (
+            "Phase 29 (item 3) — the helper loop must not source a firewall "
+            f"helper; got: {m.group(1).strip()!r}"
         )
 
-    def test_firewall_sh_validates_panel_port_before_privileged_call(self):
-        """PANEL_PORT reaches a root command line; it must be a bare integer."""
-        text = self._FIREWALL_SH.read_text(encoding="utf-8")
+    def test_installer_removes_stale_sudoers_dropin(self):
+        """Install must sweep the Phase-28 grant off boxes that have it."""
+        text = self._INSTALL_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-        m = re.search(r"run_firewall\(\)\s*\{(.*?)\n\}", no_comments, re.DOTALL)
-        assert m is not None, "run_firewall() not found in firewall.sh"
-        body = m.group(1)
-        assert re.search(r"\^\[0-9\]\+\$", body), (
-            "Phase 28 — validate PANEL_PORT against ^[0-9]+$ before it reaches "
-            "the privileged `ufw allow` command line."
+        occurrences = [
+            m.start()
+            for m in re.finditer(r"_remove_stale_sudoers_dropin\b", no_comments)
+        ]
+        assert len(occurrences) >= 2, (
+            "Phase 29 (item 3) — install.sh must define "
+            "_remove_stale_sudoers_dropin AND call it; got only a definition."
         )
-        assert "65535" in body, "Phase 28 — PANEL_PORT must be range-checked too."
-        # The validation has to come BEFORE the ufw invocation, or it is decoration.
-        assert body.index("65535") < body.index("allow"), (
-            "Phase 28 — the port validation must precede the `ufw allow` call."
+        def_idx = no_comments.index("_remove_stale_sudoers_dropin() {")
+        call_sites = [i for i in occurrences if i > def_idx]
+        assert call_sites, (
+            "Phase 29 (item 3) — the function must actually be invoked, not "
+            "just defined."
         )
-
-    def test_sudoers_dropin_grants_only_ufw_allow(self):
-        """The grant must stay minimal: one user, one verb, port-shaped arg."""
-        assert self._SUDOERS.is_file(), (
-            "Phase 28 — systemd/49-psiphon-3x-ui.sudoers must exist; without it "
-            "the unprivileged panel cannot open the new panel port."
+        # One call on the INSTALL path, before the summary.
+        assert any(i < no_comments.index("print_summary") for i in call_sites), (
+            "Phase 29 (item 3) — the install flow must remove the stale "
+            "sudoers drop-in before finishing."
         )
-        text = self._SUDOERS.read_text(encoding="utf-8")
-        body = "\n".join(
-            ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
-        )
-        assert "NOPASSWD" in body, "the panel has no TTY, so the grant must be NOPASSWD"
-        assert "psiphon3xui ALL=(root)" in body, (
-            "the grant must name the service user and target root explicitly"
-        )
-        # Only `ufw allow` — never a bare ufw, never ALL.
-        assert "ufw allow " in body
-        for forbidden in (
-            "NOPASSWD: ALL",
-            "ufw delete",
-            "ufw disable",
-            "ufw enable",
-            "ufw reset",
-            "ufw default",
-            "firewall.sh",
-        ):
-            assert forbidden not in body, (
-                f"Phase 28 — the sudoers drop-in must NOT grant {forbidden!r}. "
-                "Keep the blast radius to adding a single accept rule."
-            )
-        # Every granted command must be an absolute path (sudo requires it) and
-        # must constrain the argument to a port-shaped token.
-        cmnds = re.findall(r"(/\S*/ufw)\s+allow\s+(\S+)", body)
-        assert cmnds, "no absolute-path `ufw allow` commands found"
-        for path, arg in cmnds:
-            assert path.startswith("/"), f"{path} must be absolute"
-            # sudo concatenates arguments into ONE string before matching, so a
-            # `*` here also matches spaces — `[0-9]*/tcp` would allow multi-word
-            # rule specs such as `1 to any port 3306/tcp`. Require digit classes
-            # only, so the argument can be nothing but a numeric port.
-            assert re.fullmatch(r"(?:\[0-9\])+/tcp,?", arg), (
-                f"Phase 28 — argument pattern {arg!r} is too loose. Enumerate "
-                "'[0-9]' classes (no bare '*') so only a numeric TCP port can "
-                "be passed to a NOPASSWD root command."
-            )
-        lengths = {arg.rstrip(",").count("[0-9]") for _, arg in cmnds}
-        assert lengths >= {4, 5}, (
-            "Phase 28 — the panel port floor is 4 digits and ports run to "
-            f"65535, so 4- and 5-digit patterns are required; got {sorted(lengths)}."
+        # One call in the UNINSTALL branch.
+        uninstall_idx = no_comments.index("run_uninstall()")
+        assert any(i > uninstall_idx for i in call_sites), (
+            "Phase 29 (item 3) — uninstall must also remove the stale drop-in."
         )
 
-    def test_panel_install_validates_sudoers_before_installing(self):
-        """An invalid /etc/sudoers.d file breaks sudo for the whole machine."""
-        text = self._PANEL_INSTALL.read_text(encoding="utf-8")
-        no_comments = re.sub(r"#[^\n]*", "", text)
-        assert "49-psiphon-3x-ui.sudoers" in no_comments, (
-            "Phase 28 — panel_install.sh must install the sudoers drop-in."
-        )
-        assert "visudo -c" in no_comments, (
-            "Phase 28 — validate with `visudo -c` BEFORE writing into "
-            "/etc/sudoers.d; a syntax error there locks sudo out system-wide."
-        )
-        assert "install -m 0440" in no_comments, (
-            "Phase 28 — sudoers drop-ins must be mode 0440; sudo refuses to "
-            "read anything more permissive."
-        )
-        # visudo must run against the staged copy, not the live destination.
-        visudo_idx = no_comments.index("visudo -c")
-        install_idx = no_comments.index("install -m 0440")
-        assert visudo_idx < install_idx, (
-            "Phase 28 — validation must happen before installation, not after."
-        )
-
-    def test_uninstall_removes_sudoers_dropin(self):
+    def test_uninstall_removes_stale_sudoers_dropin(self):
         """A NOPASSWD grant must not outlive the user it was written for."""
         text = self._INSTALL_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-        assert "/etc/sudoers.d/49-psiphon-3x-ui" in no_comments, (
-            "Phase 28 — uninstall must remove the sudoers drop-in. Leaving it "
-            "behind grants `ufw allow` to any future account that reuses the "
-            "service user's name."
+        uninstall_idx = no_comments.index("run_uninstall()")
+        assert no_comments.index("_remove_stale_sudoers_dropin", uninstall_idx) > -1, (
+            "Phase 29 (item 3) — uninstall must remove the stale sudoers "
+            "drop-in. Leaving it behind grants `ufw allow` to any future "
+            "account that reuses the service user's name."
         )
 
-    def test_installer_tolerates_run_firewall_failure(self):
-        """`run_firewall` got strict; the INSTALLER must not inherit that.
+    # ── installer modules: nothing left to install ──────────────────────
 
-        install.sh runs under ``set -euo pipefail`` and calls run_firewall as
-        its last step, immediately before ``print_summary`` — the only place
-        the generated panel password is ever shown. A bare call would now abort
-        the whole install on a box with a broken ufw and take the password with
-        it, which is unrecoverable without a re-install. The port can be opened
-        by hand afterwards, so this failure must warn and continue.
-
-        change_panel_port needs the opposite: there, a firewall failure MUST
-        abort (pinned by test_change_panel_port_aborts_on_firewall_failure).
-        The strictness lives in the function; the tolerance lives at this one
-        call site.
-        """
-        text = self._INSTALL_SH.read_text(encoding="utf-8")
+    def test_deps_sh_does_not_install_ufw(self):
+        """Pulling ufw in would install a package the operator never asked for."""
+        text = self._DEPS_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
-
-        calls = re.findall(r"^\s*run_firewall\b[^\n]*", no_comments, re.MULTILINE)
-        assert calls, "install.sh must still call run_firewall"
-        for call in calls:
-            assert "||" in call, (
-                "Phase 28 — install.sh must call `run_firewall || warn ...`. A "
-                "bare call aborts under `set -e` and skips print_summary, "
-                f"losing the generated password. Found: {call.strip()!r}"
-            )
-
-        # And it must still be the summary that follows, not an early exit.
-        fw_idx = no_comments.index("run_firewall")
-        summary_idx = no_comments.index("print_summary")
-        assert fw_idx < summary_idx, (
-            "Phase 28 — print_summary must still run after the firewall step."
+        m = re.search(r"apt-get\s+install[^\n]*", no_comments)
+        assert m is not None, "the apt-get install line must exist"
+        assert "ufw" not in m.group(0), (
+            "Phase 29 (item 3) — deps.sh must not install ufw; an "
+            "already-installed ufw is left exactly as-is."
         )
+
+    def test_panel_install_does_not_install_sudoers(self):
+        """The (c) sudoers-install block must stay gone from panel_install.sh."""
+        text = self._PANEL_INSTALL.read_text(encoding="utf-8")
+        no_comments = re.sub(r"#[^\n]*", "", text)
+        for needle in ("visudo", "49-psiphon-3x-ui.sudoers", "install -m 0440"):
+            assert needle not in no_comments, (
+                f"Phase 29 (item 3) — panel_install.sh must not install the "
+                f"sudoers drop-in; found {needle!r}."
+            )
 
 
 class TestPhase28DashboardActions:
@@ -6508,15 +6507,38 @@ class TestPhase28DashboardActions:
                 "the reported problem."
             )
 
-    def test_logs_button_stays_clickable_for_disabled_countries(self):
-        """Deliberate exception: the log is how you diagnose a dead country."""
+    def test_logs_button_is_frozen_for_disabled_countries(self):
+        """Phase 29 (item 1) — Logs is frozen too; no exceptions left.
+
+        Phase 28 deliberately exempted Logs, reasoning that reading a disabled
+        country's log is how you diagnose it. The operator asked for the
+        opposite: every button in the actions cell must be inert while the
+        country is disabled. This test replaces the Phase-28 one that pinned
+        the exemption, so the two cannot both pass.
+        """
         cell = self._actions_cell()
-        m = re.search(r'@click="viewLogs\(c\)"([^>]*)>', cell)
+        m = re.search(r'@click="viewLogs\(c\)"([^>]*)>', cell, re.DOTALL)
         assert m is not None, "the Logs button must exist"
-        assert "!c.enabled" not in m.group(1), (
-            "Phase 28 (item 4) — Logs must NOT be frozen. Reading a disabled "
-            "country's log is exactly how the operator finds out why it is down."
+        assert "!c.enabled" in m.group(1), (
+            "Phase 29 (item 1) — the Logs button must carry "
+            ':disabled="!c.enabled" like the other three actions.'
         )
+
+    def test_every_action_button_is_frozen_for_disabled_countries(self):
+        """No action may be added to this cell without a freeze binding."""
+        cell = self._actions_cell()
+        buttons = re.findall(r"<button\b([^>]*)>", cell, re.DOTALL)
+        assert len(buttons) >= 4, (
+            f"expected at least the 4 known action buttons, found {len(buttons)}"
+        )
+        for attrs in buttons:
+            handler = re.search(r'@click="([^"(]+)', attrs)
+            name = handler.group(1) if handler else attrs.strip()[:40]
+            assert "!c.enabled" in attrs, (
+                f"Phase 29 (item 1) — the {name!r} button in the actions cell "
+                'has no :disabled="!c.enabled". Every action must freeze while '
+                "the country is disabled."
+            )
 
     def test_ping_handler_refuses_disabled_countries_client_side(self):
         html = self._strip_comments(self._DASHBOARD_HTML.read_text(encoding="utf-8"))

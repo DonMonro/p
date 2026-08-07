@@ -88,11 +88,15 @@
                       :class="c.healthy ? 'healthy-badge' : (c.inbound_id ? 'unhealthy-badge' : 'inactive-badge')"></span>
               </td>
               <td data-col="actions">
-                <button class="outline secondary" @click="viewLogs(c)">Logs</button>
-                <!-- Phase 28 (item 4): every mutating/testing action is frozen
-                     while the country is disabled, so a stray click cannot hit
-                     a country that has no tunnel. Logs stay reachable — reading
-                     a disabled country's log is exactly how you find out why. -->
+                <!-- Phase 29 (item 1): the Logs button is frozen for disabled
+                     countries too. Phase 28 deliberately left it clickable
+                     (reading a disabled country's log is how you find out why
+                     it is disabled), but the operator wants every action in
+                     this cell inert so a stray click cannot land on a country
+                     that has no tunnel. All four buttons now gate on
+                     c.enabled. -->
+                <button class="outline secondary" @click="viewLogs(c)"
+                        :disabled="!c.enabled">Logs</button>
                 <button class="outline" @click="openPorts(c)"
                         :disabled="!c.enabled">Edit ports</button>
                 <!-- Phase 25 (Feature D): swap the 3x-ui template inbound for
@@ -307,9 +311,6 @@
           <label>New panel listen port
             <input type="number" min="1024" max="65535" x-model.number="port.new">
           </label>
-          <small>The firewall is updated and the panel restarts automatically.
-            Your browser will reload at the new port — no manual steps
-            needed.</small>
         </fieldset>
         <footer><button @click="changePanelPort()">Change port</button></footer>
       </article>

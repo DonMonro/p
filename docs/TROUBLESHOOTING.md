@@ -10,7 +10,7 @@ Phase 0 / 2 entries — flesh out as Phase 3+ surfaces real failure modes.
 | `must be run as root` | ran without sudo | `sudo bash install.sh` |
 | `install: invalid group 'psiphon3xui'` (during `run_psiphon_install`) | stale install of an old checkout where `installer/prepare_user.sh` is missing | re-clone / pull latest, then re-run; the helper creates the user+group *before* `run_psiphon_install` |
 | `Group 'psiphon3xui' not found. Run installer/prepare_user.sh first` | helper was invoked standalone out-of-order | invoke via `bash install.sh` (which sources `prepare_user.sh` first), or source it yourself before invoking |
-| ufw rule add failed | ufw disabled; tolerated | installer continues; check `ufw status` |
+| Installer never opened the panel port in the firewall | Phase 29 removed host-firewall management entirely — the installer does not touch ufw | open the port yourself if you run an active firewall: `sudo ufw allow <panel_port>/tcp` (plus the cloud security group) |
 | `golang-go did not install` / `Detected go 1.18` | Ubuntu 22.04 ships Go 1.18 from the base archive — too old for `psiphon-tunnel-core` v2.x | `sudo add-apt-repository ppa:longsleep/golang-backports && sudo apt-get update && sudo apt-get install golang-go`; requires Go ≥ 1.21 |
 | `go build of ConsoleClient failed` | missing module cache, network blocked, or wrong Go version | Check `${LOG_FILE}`; run `cd /opt/psiphon-3x-ui/build-psiphon/ConsoleClient && GOOS=linux GOARCH=amd64 go build -v .` manually to see the real error; `go env GOPATH GOCACHE` |
 | `Failed to clone psiphon-tunnel-core @ vX.Y.Z` | upstream tag missing or network blocked | browse https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases and bump `PSIPHON_TAG` at the top of `installer/psiphon_install.sh`; or `git ls-remote --tags https://github.com/Psiphon-Labs/psiphon-tunnel-core` |
@@ -43,39 +43,39 @@ Then re-run `sudo bash /path/to/install.sh` (idempotent — it will rebuild).
 ## Panel
 
 - **Can't reach the web UI:** check `systemctl status psiphon-3x-ui` and
-  `journalctl -u psiphon-3x-ui -n 200`. Confirm the panel port is allowed in
-  ufw and any cloud security group.
+  `journalctl -u psiphon-3x-ui -n 200`. If you run a host firewall or a cloud
+  security group, confirm the panel port is allowed in it — the installer does
+  not manage either (Phase 29).
 - **Login fails after install:** the password was shown **once** at the end
   of the installer. If lost, re-run the installer (it's an upsert against the
   `Settings` row — a fresh `--password` will replace the bcrypt hash) or
   `${VENV_DIR}/bin/python -m panel.seed --port ... --user ... --password ...` directly.
 
-### Changing the panel port from Settings (Phase 28)
+### Changing the panel port from Settings (Phase 29)
 
-`POST /api/settings/panel-port` opens the new port in ufw **before** it
-persists anything. If the firewall step can't succeed the request returns
-**502 and changes nothing** — the panel stays reachable on the old port.
-That ordering is the fix for the Phase-28 lockout, where the port was
-persisted first and the panel came back on a port ufw was still filtering
-while the old port was already gone: unreachable on both.
+`POST /api/settings/panel-port` does three things, in this order: refuse
+up front if another process already holds the port, persist the new port
+to `panel.db` **and** rewrite `PSIPHON3XUI_PORT` in `panel.env`, then
+restart `psiphon-3x-ui.service`.
 
-ufw is root-only and the panel runs as the unprivileged `psiphon3xui`
-user, so the installer drops in a **narrow sudoers grant** at
-`/etc/sudoers.d/49-psiphon-3x-ui` (source:
-[`systemd/49-psiphon-3x-ui.sudoers`](../systemd/49-psiphon-3x-ui.sudoers)).
-It grants the service user NOPASSWD on exactly `ufw allow <port>/tcp` —
-no delete, no enable/disable, no reset, no default-policy change, and the
-argument must be a bare 1-to-5-digit TCP port. The polkit rule in
-`49-psiphon-3x-ui.rules` cannot cover this: it authorises
-`org.freedesktop.systemd1.manage-units`, and ufw is not a systemd unit.
-`install.sh --uninstall` removes the drop-in.
+**The panel does not touch the host firewall.** Phase 28 tried to run
+`ufw allow <port>/tcp` first, via a `sudo` grant at
+`/etc/sudoers.d/49-psiphon-3x-ui`; Phase 29 removed all of it. The
+installer never enabled ufw in the first place, so those rules filtered
+nothing — the step's only effect was to abort port changes with a 502. If
+your box does run an active firewall, open the new port yourself before
+changing it here.
+
+The browser is **not** redirected. After the request the service restarts
+(the response may be cut short in flight — expected), and you reopen the
+dashboard at `http://<host>:<new_port>/dashboard`.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Port change returns 502 `the firewall could not be updated … Nothing was changed` | `/etc/sudoers.d/49-psiphon-3x-ui` is missing (installed from an older checkout), or `sudo` isn't present | re-run `sudo bash install.sh` to install the drop-in; as a one-off workaround run `sudo ufw allow <new_port>/tcp` from a shell and retry the change |
 | Port change returns 409 `already in use` | something else on the box is listening on the requested port | `sudo ss -ltnp \| grep :<new_port>`; pick a free port or stop the other listener. Refused up front on purpose — `Restart=on-abort` does not retry a plain bind failure, so a restart onto a busy port would leave the panel down |
-| Port change succeeded but the browser still can't reach the panel | the browser is still pointed at the old port; or a cloud security group / external firewall also filters the new port | reload at `http://<host>:<new_port>`; open the port in the provider's security group too — ufw is only the host firewall |
-| `sudo: a terminal is required` in the journal during a port change | a distro shipping `requiretty` didn't pick up the drop-in's `Defaults!…!requiretty` line | confirm the file installed cleanly: `sudo visudo -c -f /etc/sudoers.d/49-psiphon-3x-ui` |
+| Port change returns 502 `panel.env could not be rewritten` | `${INSTALL_PREFIX}/panel.env` is missing or not writable by the service user | `ls -la /opt/psiphon-3x-ui/panel.env`; re-run `sudo bash install.sh`. Nothing was persisted — the panel is still on the old port |
+| Port change returned 200 but the panel never comes back | the restart failed, or a firewall/security group filters the new port | `sudo systemctl status psiphon-3x-ui`, `journalctl -u psiphon-3x-ui -n 200 --no-pager`; open the new port in your host firewall and cloud security group |
+| Port change returns 502 `the firewall could not be updated …` | you are running a **pre-Phase-29 checkout** | pull latest and re-run `sudo bash install.sh`; the firewall step no longer exists |
 
 ## Wizard
 

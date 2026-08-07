@@ -112,11 +112,9 @@ psiphon-3x-ui/
 │       └── release.yml             # Build + attach release assets on tag
 ├── installer/
 │   ├── bootstrap.sh                 # curl/wget-aware top-level script
-│   ├── deps.sh                     # apt installs (python3-venv, curl, jq, ufw, ...)
+│   ├── deps.sh                     # apt installs (python3-venv, curl, jq, ...)
 │   ├── psiphon_install.sh          # Download + verify checksum of psiphon-tunnel-core
 │   ├── panel_install.sh            # Create venv, install panel wheel, write systemd unit
-│   ├── firewall.sh                 # Open chosen public inbound range
-│   └── prompt.sh                   # Port/username/password interactive prompts
 ├── panel/
 │   ├── pyproject.toml              # Poetry / pip build config
 │   ├── requirements.txt
@@ -259,7 +257,7 @@ Bonus: post-wizard management dashboard → `panel/dashboard/router.py`, `static
 ### Phase 2 — Installer (`install.sh`)
 - [ ] `bootstrap.sh`: detect `curl` else use `wget`; ensure root; check Ubuntu 20.04+/22.04+.
 - [ ] `deps.sh`: `python3-venv`, `python3-pip`, `python3-build`, `setuptools`,
-      `jq`, `ufw`, `curl`, `wget`, `git`, `tar`, `golang-go` (≥1.21 for upstream module support).
+      `jq`, `curl`, `wget`, `git`, `tar`, `golang-go` (≥1.21 for upstream module support).
 - [ ] `psiphon_install.sh` — **build from source** (resolved during Phase 2 spike:
       the upstream `psiphon-tunnel-core` GitHub release ships only the Android/iOS/
       Client-Library Go-source zips — **no prebuilt linux_amd64 binary and no
@@ -286,8 +284,14 @@ Bonus: post-wizard management dashboard → `panel/dashboard/router.py`, `static
   - Render the `systemd/psiphon-3x-ui.service` template into `/etc/systemd/system/`
     with `EnvironmentFile=${ENV_FILE}` + `ExecStart=${VENV_DIR}/bin/python -m panel`.
   - `systemctl daemon-reload && systemctl enable --now psiphon-3x-ui`.
-- [ ] `firewall.sh`: open chosen panel port only (public inbound range opened later by wizard).
-- [ ] `install.sh` flags: `--uninstall` (stop+disable service, leave 3x-ui inbounds intact with a warning); re-run = idempotent upgrade.
+- [x] ~~`firewall.sh`: open chosen panel port only (public inbound range opened later by wizard).~~
+      **Dropped in Phase 29.** The installer never ran `ufw --force enable` (deliberately —
+      it would lock an operator out of SSH), so the allow rules filtered nothing on a stock
+      install; the only thing the stage ever did was fail. `installer/firewall.sh` is deleted
+      and the project does not manage the host firewall. An already-installed ufw is left as-is.
+- [ ] `install.sh` flags: `--uninstall` (stop+disable service, delete the per-country
+      inbounds+outbounds the panel created in 3x-ui — the routes go with the inbound);
+      re-run = idempotent upgrade.
 - [ ] Final echo block:
   ```
   ── Psiphon-3X-UI installed ───────────────
@@ -360,7 +364,8 @@ Bonus: post-wizard management dashboard → `panel/dashboard/router.py`, `static
   - **Inbounds**: link to 3x-ui panel, re-clone template button, health badge
   - **Logs**: tail of systemd journal for selected tunnel
   - **Backup**: export/restore `panel.db` + `config/*.json`
-  - **Settings**: rotate admin password, change panel port (with firewall sync)
+  - **Settings**: rotate admin password, change panel port (rewrites `panel.env` +
+    restarts the unit in-band; no firewall step — Phase 29)
 - [x] `panel/dashboard/router.py`:
   - `GET /api/dashboard/countries`
   - `PATCH /api/dashboard/countries/{code}` (enable/disable)
@@ -420,7 +425,11 @@ I've packaged these in good faith — a few items in the prompt warrant refineme
 
 7. **3x-ui not installed.** If 3x-ui isn't detected, the wizard can still complete — tunnels and local SOCKS proxies will be usable manually. Offer a "skip integration" path rather than blocking.
 
-8. **Firewall.** Remember to open the **public inbound range** in `ufw` during wizard apply, not at install time (we don't know the range yet at install time).
+8. **~~Firewall~~ (dropped, Phase 29).** The project does not manage the host firewall.
+   ufw was never enabled by the installer (SSH-lockout risk), so allow rules filtered
+   nothing; the old plan — opening the **public inbound range** in `ufw` during wizard
+   apply — was removed along with `installer/firewall.sh`. Operators with an active
+   firewall or cloud security group open the public inbound range themselves.
 
 9. **Subscription links / clients.** The prompt's last line ("user only needs to create a client or import link") is handled inside 3x-ui itself; our panel should deep-link to the 3x-ui inbound view for convenience.
 
