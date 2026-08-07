@@ -1927,7 +1927,7 @@ def rotate_password(
 
 
 @router.post("/change-panel-port", status_code=status.HTTP_200_OK)
-def change_panel_port(
+async def change_panel_port(
     body: ChangePanelPortBody,
     user: Annotated[dict, Depends(get_current_user)],
     db: Session = Depends(get_db),  # noqa: B008  FastAPI idiom
@@ -1972,6 +1972,78 @@ def change_panel_port(
                 f"public={clashes.public_port})"
             ),
         )
+
+    # Phase 28 (item 1 follow-up): reject a port already bound by ANOTHER process.
+    #
+    # This is the remaining half of the reported lockout. Hotfix #13 fixed the
+    # firewall (the new port is now genuinely opened in ufw), but nothing checked
+    # whether the new port was free. If the operator picks a port something else
+    # already holds, the sequence is: DB row flipped → panel.env rewritten →
+    # service restarted → uvicorn dies with EADDRINUSE → `Restart=on-abort` does
+    # NOT retry a plain exit-1 → the panel is gone from BOTH ports, exactly as
+    # reported. Refusing up-front is the only safe order: once panel.env is
+    # rewritten there is no in-band way back.
+    #
+    # The probe itself is best-effort (it must never block a legitimate change on
+    # a host where /proc and `ss` are both unavailable), so a probe FAILURE is
+    # logged and ignored — but a probe that succeeds and finds the port taken is
+    # a hard 409. Keeping the raise outside the try is what preserves that
+    # distinction; inside, `except Exception` would swallow the 409 itself.
+    busy: set[int] = set()
+    probe_ok = True
+    try:
+        busy = await listening_ports()
+    except Exception as exc:  # noqa: BLE001  defensive; never block the operator
+        probe_ok = False
+        _log.warning("change_panel_port: listening-port probe failed: %s", exc)
+
+    # The old panel port is held by THIS process; it frees up on restart.
+    if probe_ok and new_port in (busy - {old_port}):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"port {new_port} is already in use by another process on this "
+                f"host — pick a free port (the panel would fail to bind and "
+                f"become unreachable on both {old_port} and {new_port})"
+            ),
+        )
+    # Phase 28 (item 1, part 2): open the firewall FIRST, and abort if it fails.
+    #
+    # This ordering is the fix for the reported "panel is gone from both ports".
+    # The old sequence was: commit DB → rewrite panel.env → open firewall →
+    # restart. Steps 3 and 4 only *logged* their failures, so a firewall step
+    # that could not run still produced HTTP 200 + `changed: true` — and the
+    # service had already been pointed at a port ufw was blocking. Both ports
+    # then appear dead (old one closed, new one filtered) and there is no
+    # in-band way back, because the panel that would let you fix it is the
+    # thing that just went unreachable.
+    #
+    # `ufw` is root-only and the panel runs as the unprivileged `psiphon3xui`
+    # user, so this step depends on the sudoers drop-in that panel_install.sh
+    # writes (systemd/49-psiphon-3x-ui.sudoers — NOPASSWD on `ufw allow
+    # <port>/tcp` and nothing else). firewall.sh now returns non-zero rather
+    # than swallowing the error, so a missing drop-in surfaces here as a clean
+    # refusal instead of a silent lockout.
+    #
+    # Opening the new port before committing is safe and idempotent — an extra
+    # `ufw allow` for a port we end up not using is harmless, whereas the
+    # reverse order is unrecoverable.
+    fw_ok, fw_detail = _reload_firewall(new_port)
+    if not fw_ok:
+        _log.warning("change_panel_port firewall reload failed: %s", fw_detail)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"refusing to change the panel port: the firewall could not be "
+                f"updated for {new_port}/tcp, so the panel would become "
+                f"unreachable on both {old_port} and {new_port}. Nothing was "
+                f"changed — the panel is still on {old_port}. This usually "
+                f"means /etc/sudoers.d/49-psiphon-3x-ui is missing (re-run the "
+                f"installer); as a workaround, run `sudo ufw allow "
+                f"{new_port}/tcp` from a shell and retry. ({fw_detail})"
+            ),
+        )
+
     settings.panel_port = new_port
     db.add(settings)
     db.commit()
@@ -1987,21 +2059,40 @@ def change_panel_port(
     # missing (defensive — operator can drop the panel back up manually).
     env_ok, env_detail = _update_panel_env_port(new_port)
     if not env_ok:
+        # Phase 28 (item 1, part 2): this used to be a logged warning that still
+        # returned 200. But the env file is what the panel actually reads its
+        # port from — if the rewrite failed, the restart below rebinds to the
+        # OLD port while panel.db claims the new one. The dashboard then shows a
+        # port the panel is not listening on, and the operator is told to reload
+        # at a port that will never answer. Roll the DB row back and refuse, so
+        # the panel stays consistently on the old port.
         _log.warning("change_panel_port env-file rewrite failed: %s", env_detail)
+        settings.panel_port = old_port
+        db.add(settings)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"refusing to change the panel port: could not rewrite "
+                f"PSIPHON3XUI_PORT in the panel env file, so a restart would "
+                f"rebind to {old_port} while the panel claimed {new_port}. "
+                f"Nothing was changed — the panel is still on {old_port}. "
+                f"({env_detail})"
+            ),
+        )
 
     # Hotfix #10 (Bug #5) + Hotfix #11 (Bug #3, part 2) + Hotfix #13 (Bug #1):
-    # re-run installer/firewall.sh + restart the panel service in-band so the
-    # operator doesn't have to drop to a shell. The polkit rule
-    # (systemd/49-psiphon-3x-ui.rules — extended in 19f5) must authorise the
-    # psiphon3xui user to restart `psiphon-3x-ui.service`. If the service
-    # restart succeeds the panel process is killed while this very request
-    # is still streaming — the response body may be cut short in-flight.
-    # We deliberately return the success payload with a browser-self-refresh
-    # hint so the operator's tab reloads on the new port once the service
-    # comes back.
-    fw_ok, fw_detail = _reload_firewall(new_port)
-    if not fw_ok:
-        _log.warning("change_panel_port firewall reload failed: %s", fw_detail)
+    # restart the panel service in-band so the operator doesn't have to drop to
+    # a shell. The polkit rule (systemd/49-psiphon-3x-ui.rules — extended in
+    # 19f5) must authorise the psiphon3xui user to restart
+    # `psiphon-3x-ui.service`. If the service restart succeeds the panel process
+    # is killed while this very request is still streaming — the response body
+    # may be cut short in-flight. We deliberately return the success payload
+    # with a browser-self-refresh hint so the operator's tab reloads on the new
+    # port once the service comes back.
+    #
+    # The firewall step already ran (and hard-failed) above, before anything was
+    # persisted — see the Phase 28 note there for why that ordering matters.
     svc_ok, svc_detail = _restart_panel_service()
     if not svc_ok:
         _log.warning("change_panel_port systemctl restart failed: %s", svc_detail)

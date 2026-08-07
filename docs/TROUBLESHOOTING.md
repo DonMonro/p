@@ -50,6 +50,33 @@ Then re-run `sudo bash /path/to/install.sh` (idempotent — it will rebuild).
   `Settings` row — a fresh `--password` will replace the bcrypt hash) or
   `${VENV_DIR}/bin/python -m panel.seed --port ... --user ... --password ...` directly.
 
+### Changing the panel port from Settings (Phase 28)
+
+`POST /api/settings/panel-port` opens the new port in ufw **before** it
+persists anything. If the firewall step can't succeed the request returns
+**502 and changes nothing** — the panel stays reachable on the old port.
+That ordering is the fix for the Phase-28 lockout, where the port was
+persisted first and the panel came back on a port ufw was still filtering
+while the old port was already gone: unreachable on both.
+
+ufw is root-only and the panel runs as the unprivileged `psiphon3xui`
+user, so the installer drops in a **narrow sudoers grant** at
+`/etc/sudoers.d/49-psiphon-3x-ui` (source:
+[`systemd/49-psiphon-3x-ui.sudoers`](../systemd/49-psiphon-3x-ui.sudoers)).
+It grants the service user NOPASSWD on exactly `ufw allow <port>/tcp` —
+no delete, no enable/disable, no reset, no default-policy change, and the
+argument must be a bare 1-to-5-digit TCP port. The polkit rule in
+`49-psiphon-3x-ui.rules` cannot cover this: it authorises
+`org.freedesktop.systemd1.manage-units`, and ufw is not a systemd unit.
+`install.sh --uninstall` removes the drop-in.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Port change returns 502 `the firewall could not be updated … Nothing was changed` | `/etc/sudoers.d/49-psiphon-3x-ui` is missing (installed from an older checkout), or `sudo` isn't present | re-run `sudo bash install.sh` to install the drop-in; as a one-off workaround run `sudo ufw allow <new_port>/tcp` from a shell and retry the change |
+| Port change returns 409 `already in use` | something else on the box is listening on the requested port | `sudo ss -ltnp \| grep :<new_port>`; pick a free port or stop the other listener. Refused up front on purpose — `Restart=on-abort` does not retry a plain bind failure, so a restart onto a busy port would leave the panel down |
+| Port change succeeded but the browser still can't reach the panel | the browser is still pointed at the old port; or a cloud security group / external firewall also filters the new port | reload at `http://<host>:<new_port>`; open the port in the provider's security group too — ufw is only the host firewall |
+| `sudo: a terminal is required` in the journal during a port change | a distro shipping `requiretty` didn't pick up the drop-in's `Defaults!…!requiretty` line | confirm the file installed cleanly: `sudo visudo -c -f /etc/sudoers.d/49-psiphon-3x-ui` |
+
 ## Wizard
 
 - **"Country never connects"** — Psiphon tunnels may be blocked from the
