@@ -105,7 +105,7 @@
                 <button class="outline" @click="openEditInbound(c)"
                         :disabled="!c.enabled">Edit inbound</button>
                 <!-- Phase 28 (item 3): ping THIS country's tunnel. After the
-                     country is enabled a 5 s cooldown runs so the operator
+                     country is enabled a 10 s cooldown runs so the operator
                      cannot ping before Psiphon has finished establishing the
                      tunnel (which would report a false failure). -->
                 <button class="outline" @click="pingCountry(c)"
@@ -460,7 +460,7 @@
               this.countries = this.countries.map(x => x.code === c.code ? updated : x);
               this.notify(`${c.code} ${newValue ? "enabled" : "disabled"}`);
               // Phase 28 (item 3): starting a tunnel is not instant, so hold
-              // Ping test for 5 s after an enable. Disabling clears the timer
+              // Ping test for 10 s after an enable. Disabling clears the timer
               // and the stale result instead of leaving them on screen.
               if (newValue) this.startCooldown(c.code);
               else this.clearCooldown(c.code);
@@ -478,7 +478,11 @@
         // Hold the button for `secs` seconds after an enable. Any in-flight
         // timer for this country is cleared first, so a rapid disable/enable
         // cannot leave two intervals decrementing the same counter.
-        startCooldown(code, secs = 5) {
+        // Hold the button for `secs` seconds after an enable (default 10). Any
+        // in-flight timer for this country is cleared first, so a rapid
+        // disable/enable cannot leave two intervals decrementing the same
+        // counter.
+        startCooldown(code, secs = 10) {
           this.clearCooldown(code);
           this.cooldown[code] = secs;
           this._timers[code] = setInterval(() => {
@@ -583,7 +587,7 @@
             }
             this.countries = this.countries.map(x => x.code === code ? body : x);
             // Phase 28 (item 3): this is the second enable path (enable-with-
-            // ports), so it needs the same 5 s Ping test hold as toggleEnabled.
+            // ports), so it needs the same 10 s Ping test hold as toggleEnabled.
             this.startCooldown(code);
             // Phase 25 (Feature C): surface apply_result + clone_result in
             // the toast so the operator sees the full outcome inline.
