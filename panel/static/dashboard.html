@@ -326,7 +326,7 @@
                 rotate: false, port: false, reclone: false, ping: "" },
         // Phase 28 (item 3): per-country ping state.
         //   cooldown[code] — seconds remaining before Ping test unlocks. Set to
-        //     5 when a country is enabled, so the operator has to wait for the
+        //     10 when a country is enabled, so the operator has to wait for the
         //     tunnel to come up instead of pinging a half-started Psiphon.
         //   pingResult[code] — last {ok, latency_ms, detail} for that country.
         //   _timers[code] — the live setInterval handle, cleared on 0 / reload
