@@ -12,6 +12,7 @@
 #   8.  Dev-host command-output scratch files & test logs
 #   9.  Local upstream-research scaffolding (sample/capture dumps)
 #   10. Trash filenames from past `python -c "..." | tee` misadventures
+#   11. Local AI-assistant scaffolding (Claude Code)
 #
 # To re-normalise the working tree after editing .gitattributes:
 #   git add --renormalize .
@@ -133,3 +134,10 @@ panel.db-shm
 # content as the filename — exclude them and any future sibling.
 import io;*
 lines =*
+
+
+# ── 11.  Local AI-assistant scaffolding (Claude Code) ─────────────────────
+# Dev-host only: session memory, settings, and project guidance. Not part of
+# the install/runtime surface — never commit.
+.claude/
+CLAUDE.md
