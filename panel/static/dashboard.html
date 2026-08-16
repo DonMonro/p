@@ -70,19 +70,47 @@
                              transition: color .15s ease; }
     main.container > nav a:hover { color: var(--no-accent-hi); }
 
-    /* ── Section cards (details/summary) ─────────────────────── */
-    details {
+    /* ── Sidebar layout ──────────────────────────────────────── */
+    [x-cloak] { display: none !important; }
+    .layout { display: flex; gap: 1.5rem; align-items: flex-start; }
+    .sidebar {
+      flex: 0 0 13.5rem; position: sticky; top: 1rem;
+      background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
+      border: 1px solid var(--no-hairline); border-radius: var(--no-radius-card);
+      padding: .8rem; box-shadow: 0 12px 32px rgba(0,0,0,.25);
+    }
+    .sidebar-nav { display: flex; flex-direction: column; gap: .25rem; }
+    .sidebar-nav button {
+      width: 100%; text-align: left; background: transparent;
+      border: 1px solid transparent; border-radius: var(--no-radius-ctl);
+      color: var(--no-text-2); font-size: .9rem; font-weight: 600;
+      padding: .6rem .8rem; margin: 0; letter-spacing: .01em;
+    }
+    .sidebar-nav button:hover:not([disabled]) {
+      background: rgba(37,99,235,.08); color: var(--no-text); box-shadow: none;
+    }
+    .sidebar-nav button.active {
+      background: rgba(37,99,235,.12); border-color: rgba(59,130,246,.35);
+      color: var(--no-accent-hi);
+    }
+    .content { flex: 1; min-width: 0; }
+
+    /* ── Section cards ───────────────────────────────────────── */
+    .card {
       background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
       border: 1px solid var(--no-hairline);
       border-radius: var(--no-radius-card);
       padding: 1.25rem 1.5rem; margin-bottom: 1.25rem;
       box-shadow: 0 12px 32px rgba(0,0,0,.25);
+      /* The 9-column countries table is nowrap and can exceed the (now
+         sidebar-narrowed) content column — scroll it inside the card at
+         every width instead of pushing the page wider. */
+      overflow-x: auto;
     }
-    details summary { color: var(--no-text); cursor: pointer; }
-    details summary::marker { color: var(--no-accent-hi); }
-    summary h3 { display: inline; margin: 0; font-weight: 700; color: var(--no-text); font-size: 1.15rem; }
-    details small { color: var(--no-text-2); }
-    details p { color: var(--no-text-2); line-height: 1.55; }
+    .card-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: 1rem; }
+    .card-head h3 { margin: 0; font-weight: 700; color: var(--no-text); font-size: 1.15rem; }
+    .card small { color: var(--no-text-2); }
+    .card p { color: var(--no-text-2); line-height: 1.55; }
 
     /* ── Countries table ─────────────────────────────────────── */
     .country-flag { margin-right: .35rem; }
@@ -182,30 +210,30 @@
     button[disabled] { opacity: .5; pointer-events: none; }
 
     /* ── Inline modal cards (ports / enable / reclone / logs) ── */
-    main.container > article {
+    .content > article {
       background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
       border: 1px solid rgba(59,130,246,.35);
       border-radius: var(--no-radius-card);
       padding: 1.5rem 1.75rem; margin-bottom: 1.25rem;
       box-shadow: 0 0 40px rgba(37,99,235,.12), 0 16px 40px rgba(0,0,0,.4);
     }
-    main.container > article > header strong { color: var(--no-text); font-size: 1.1rem; font-weight: 700; }
-    main.container > article > footer { display: flex; gap: .6rem; justify-content: flex-end; }
+    .content > article > header strong { color: var(--no-text); font-size: 1.1rem; font-weight: 700; }
+    .content > article > footer { display: flex; gap: .6rem; justify-content: flex-end; }
     /* Nested settings cards (rotate password / change panel port) */
-    details > article {
+    .card > article {
       background: var(--no-surface); border: 1px solid var(--no-hairline);
       border-radius: 12px; padding: 1.1rem 1.3rem; margin-bottom: 1rem;
       box-shadow: none;
     }
-    details > article > header strong { color: var(--no-text); }
+    .card > article > header strong { color: var(--no-text); }
 
     /* ── Log consoles ────────────────────────────────────────── */
     pre.log { max-height: 22rem; overflow: auto; background: var(--no-console); color: #D7DEE8;
               padding: .85rem 1rem; border: 1px solid var(--no-hairline);
               border-radius: var(--no-radius-ctl); font-size: .8rem; }
-    details > pre { background: var(--no-console); border: 1px solid var(--no-hairline);
-                    border-radius: var(--no-radius-ctl); color: #D7DEE8;
-                    font-size: .78rem; padding: .75rem .9rem; }
+    .card > pre { background: var(--no-console); border: 1px solid var(--no-hairline);
+                  border-radius: var(--no-radius-ctl); color: #D7DEE8;
+                  font-size: .78rem; padding: .75rem .9rem; }
 
     /* ── Toast ───────────────────────────────────────────────── */
     .toast { position: fixed; bottom: 1rem; right: 1rem; padding: .7rem 1rem;
@@ -216,12 +244,20 @@
     .toast.err { background: var(--no-err); border-color: transparent; color: #fff; }
     .toast.ok { background: var(--no-ok); border-color: transparent; color: #06180c; }
 
+    @media (max-width: 900px) {
+      /* Sidebar collapses into a horizontal pill row above the content.
+         align-items must flip back to stretch: flex-start (set above so the
+         desktop sidebar hugs its content) would let the content column size
+         to the table's min-content width and overflow the page. */
+      .layout { flex-direction: column; align-items: stretch; gap: 1rem; }
+      .sidebar { position: static; width: 100%; flex: none; }
+      .sidebar-nav { flex-direction: row; flex-wrap: wrap; }
+      .sidebar-nav button { width: auto; }
+    }
     @media (max-width: 640px) {
-      details { padding: 1rem 1.1rem; }
-      main.container > article { padding: 1.1rem 1.1rem; }
-      details > article { padding: .9rem 1rem; }
-      /* The 9-column countries table scrolls horizontally instead of squeezing */
-      details { overflow-x: auto; }
+      .card { padding: 1rem 1.1rem; }
+      .content > article { padding: 1.1rem 1.1rem; }
+      .card > article { padding: .9rem 1rem; }
     }
   </style>
 </head>
@@ -247,11 +283,26 @@
       <div class="toast" :class="toast.kind" x-text="toast.text"></div>
     </template>
 
+    <div class="layout">
+      <!-- -----------------------------------------------------------------
+           Side menu — replaces the old <details> drop-down sections. Each
+           item switches the content column to the matching section card.
+      ------------------------------------------------------------------ -->
+      <aside class="sidebar">
+        <nav class="sidebar-nav">
+          <button :class="{ active: section === 'countries' }"
+                  @click="section = 'countries'">Countries</button>
+          <button :class="{ active: section === 'settings' }"
+                  @click="section = 'settings'">Settings</button>
+        </nav>
+      </aside>
+
+      <div class="content">
     <!-- -------------------------------------------------------------------
          Countries panel — list + enable/disable + delete
     -------------------------------------------------------------------- -->
-    <details open>
-      <summary><h3>Countries</h3> <small x-text="`(${countries.length})`"></small></summary>
+    <section class="card" x-show="section === 'countries'">
+      <div class="card-head"><h3>Countries</h3> <small x-text="`(${countries.length})`"></small></div>
       <table id="countries">
         <thead>
           <tr>
@@ -330,7 +381,7 @@
           </template>
         </tbody>
       </table>
-    </details>
+    </section>
 
     <!-- -------------------------------------------------------------------
          Ports edit dialog (per-country)
@@ -457,38 +508,30 @@
     </article>
 
     <!-- -------------------------------------------------------------------
-         Idempotent re-apply of the whole panel state
+         Settings — re-apply, backup/restore, rotate password, panel port
     -------------------------------------------------------------------- -->
-    <details>
-      <summary><h3>Re-apply everything</h3></summary>
-      <p>Iterate every <code>PortAssignment</code> row and re-write its per-country Psiphon
-         config + restart the templated unit. Unhealthy 3x-ui clones are re-cloned from the
-         wizard's template inbound.</p>
-      <button @click="reapplyAll()" :disabled="busy.reapply"
-              :class="{ busy: busy.reapply }">Re-apply whole panel</button>
-      <pre x-show="reapply.result" class="log"><code x-text="JSON.stringify(reapply.result, null, 2)"></code></pre>
-    </details>
-
-    <!-- -------------------------------------------------------------------
-         Backup / restore
-    -------------------------------------------------------------------- -->
-    <details>
-      <summary><h3>Backup / Restore</h3></summary>
-      <p>Export a tar archive of <code>panel.db</code> + <code>config/*.json</code> or restore from a
-         previously-exported archive.</p>
-      <button @click="downloadBackup()" :disabled="busy.backup">Download backup</button>
-      <hr>
-      <label>Restore from tar archive
-        <input type="file" accept=".tar,application/x-tar" @change="uploadRestore($event)">
-      </label>
-      <pre x-show="restore.result" class="log"><code x-text="JSON.stringify(restore.result, null, 2)"></code></pre>
-    </details>
-
-    <!-- -------------------------------------------------------------------
-         Settings — rotate password + change panel port
-    -------------------------------------------------------------------- -->
-    <details>
-      <summary><h3>Settings</h3></summary>
+    <section class="card" x-show="section === 'settings'" x-cloak>
+      <div class="card-head"><h3>Settings</h3></div>
+      <article>
+        <header><strong>Re-apply everything</strong></header>
+        <p>Iterate every <code>PortAssignment</code> row and re-write its per-country Psiphon
+           config + restart the templated unit. Unhealthy 3x-ui clones are re-cloned from the
+           wizard's template inbound.</p>
+        <button @click="reapplyAll()" :disabled="busy.reapply"
+                :class="{ busy: busy.reapply }">Re-apply whole panel</button>
+        <pre x-show="reapply.result" class="log"><code x-text="JSON.stringify(reapply.result, null, 2)"></code></pre>
+      </article>
+      <article>
+        <header><strong>Backup / Restore</strong></header>
+        <p>Export a tar archive of <code>panel.db</code> + <code>config/*.json</code> or restore from a
+           previously-exported archive.</p>
+        <button @click="downloadBackup()" :disabled="busy.backup">Download backup</button>
+        <hr>
+        <label>Restore from tar archive
+          <input type="file" accept=".tar,application/x-tar" @change="uploadRestore($event)">
+        </label>
+        <pre x-show="restore.result" class="log"><code x-text="JSON.stringify(restore.result, null, 2)"></code></pre>
+      </article>
       <article>
         <header><strong>Rotate admin password</strong></header>
         <fieldset :disabled="busy.rotate">
@@ -506,13 +549,17 @@
         </fieldset>
         <footer><button @click="changePanelPort()">Change port</button></footer>
       </article>
-    </details>
+    </section>
+      </div><!-- /.content -->
+    </div><!-- /.layout -->
   </main>
 
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script>
     function appDashboard() {
       return {
+        // Side-menu selection: which section card the content column shows.
+        section: "countries",
         countries: [],
         busy: { countries: false, ports: false, reapply: false, backup: false,
                 rotate: false, port: false, reclone: false, ping: "" },
