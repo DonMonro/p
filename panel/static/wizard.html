@@ -424,12 +424,6 @@
          rotate the admin password and change the panel's port.</p>
       <button @click.prevent="goToDashboard()">Open the Management Dashboard →</button>
     </article>
-
-    <!-- ─────────────────────────  Footer state dump  ────────────── -->
-    <details style="margin-top:2rem">
-      <summary>Wizard state snapshot (debug)</summary>
-      <pre x-text="JSON.stringify(state, null, 2)"></pre>
-    </details>
   </main>
 
   <!-- Alpine.js pulls the same minimal build used by the dashboard/login SPAs -->
