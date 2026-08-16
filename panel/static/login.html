@@ -1,28 +1,117 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Psiphon-3X-UI — Sign in</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <!-- Inter (variable) — same jsDelivr CDN family as Pico/Alpine for cache locality -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5/index.css">
   <style>
-    body { display: flex; min-height: 100vh; align-items: center; justify-content: center;
-           background: #f6f7f9; }
-    .login-card { width: 100%; max-width: 26rem; padding: 2rem 2.25rem; background: #fff;
-                  border-radius: 8px; box-shadow: 0 10px 28px rgba(0,0,0,.10); }
-    .login-card h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
-    .login-card .sub { color: #777; margin-bottom: 1.5rem; font-size: .9rem; }
-    .login-card button { width: 100%; margin-top: .25rem; }
+    /* ── Night-Ops theme — design tokens ───────────────────────── */
+    :root {
+      --no-bg: #0B0E14;
+      --no-bg-2: #10141C;
+      --no-surface: #151A22;
+      --no-surface-2: #1A1F29;
+      --no-input: #20242B;
+      --no-hairline: rgba(255,255,255,.08);
+      --no-hairline-2: rgba(255,255,255,.16);
+      --no-accent: #2563EB;
+      --no-accent-hi: #3B82F6;
+      --no-accent-soft: rgba(37,99,235,.22);
+      --no-glow: rgba(37,99,235,.35);
+      --no-text: #F2F5F9;
+      --no-text-2: #9AA3B2;
+      --no-ok: #22C55E;
+      --no-err: #EF4444;
+      --no-warn: #F59E0B;
+      --no-console: #0A0D12;
+      --no-radius-card: 16px;
+      --no-radius-ctl: 8px;
+      --no-radius-pill: 999px;
+      /* Rebrand Pico's default cyan accent to the Night-Ops blue so native
+         checkbox/radio fills, focus rings and links match the theme. */
+      --pico-primary: var(--no-accent-hi);
+      --pico-primary-background: var(--no-accent);
+      --pico-primary-border: var(--no-accent);
+      --pico-primary-focus: var(--no-accent-soft);
+      --pico-primary-hover: var(--no-accent-hi);
+      --pico-primary-hover-background: var(--no-accent-hi);
+      --pico-primary-hover-border: var(--no-accent-hi);
+    }
+
+    body {
+      display: flex; min-height: 100vh; align-items: center; justify-content: center;
+      background:
+        radial-gradient(600px 420px at 12% 8%,  rgba(37,99,235,.16), transparent 70%),
+        radial-gradient(520px 380px at 88% 38%, rgba(37,99,235,.12), transparent 70%),
+        radial-gradient(700px 480px at 78% 96%, rgba(37,99,235,.10), transparent 70%),
+        linear-gradient(180deg, var(--no-bg) 0%, var(--no-bg-2) 100%);
+      background-attachment: fixed;
+      color: var(--no-text);
+      font-family: "Inter Variable", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      letter-spacing: .01em;
+    }
+    /* Barely-visible square grid overlay */
+    body::before {
+      content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+    }
+    main.container { position: relative; z-index: 1; width: 100%; }
+
+    .login-card {
+      width: 100%; max-width: 26rem; margin: 1rem auto;
+      padding: 2.5rem 2.25rem 2.25rem;
+      background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
+      border: 1px solid var(--no-hairline);
+      border-radius: var(--no-radius-card);
+      box-shadow: 0 0 60px rgba(37,99,235,.15), 0 24px 48px rgba(0,0,0,.45);
+    }
+    .login-card h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 .35rem; color: var(--no-text); }
+    .login-card .sub { color: var(--no-text-2); margin-bottom: 1.75rem; font-size: .9rem; line-height: 1.5; }
+
+    .login-card label { color: var(--no-text); font-size: .85rem; font-weight: 600; margin-bottom: .4rem; }
+    .login-card input {
+      background: var(--no-input); border: 1px solid var(--no-hairline);
+      border-radius: var(--no-radius-ctl); color: var(--no-text);
+      height: 2.75rem; padding: 0 .9rem; transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .login-card input::placeholder { color: rgba(154,163,178,.6); }
+    .login-card input:focus { border-color: var(--no-accent-hi); box-shadow: 0 0 0 3px var(--no-accent-soft); outline: none; }
+
+    .login-card button {
+      width: 100%; margin-top: .5rem; height: 2.75rem;
+      background: var(--no-accent); border: 1px solid transparent;
+      border-radius: var(--no-radius-ctl); color: #fff; font-weight: 600;
+      letter-spacing: .02em; transition: background .15s ease, box-shadow .15s ease;
+    }
+    .login-card button:hover:not([disabled]) { background: var(--no-accent-hi); box-shadow: 0 6px 20px var(--no-glow); }
+    .login-card button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--no-accent-soft); }
     .login-card button[disabled] { opacity: .55; pointer-events: none; }
-    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: .65rem 1rem;
-             background: #b2182b; color: #fff; border-radius: 4px; font-size: .9rem;
-             z-index: 9; box-shadow: 0 6px 16px rgba(0,0,0,.35); max-width: 22rem; }
-    .toast.warn { background: #c77d1a; }
-    .toast.ok { background: #2a7d2f; }
-    .branding { text-align: center; margin-bottom: 1rem; }
-    .branding .badge { display: inline-block; background: #2a7d2f; color: #fff;
-                       padding: .15rem .55rem; border-radius: 3px; font-size: .7rem;
-                       font-weight: 700; letter-spacing: .04em; }
+
+    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: .7rem 1rem;
+             background: var(--no-err); color: #fff; border-radius: var(--no-radius-ctl);
+             font-size: .875rem; z-index: 9; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+             max-width: 22rem; border: 1px solid rgba(255,255,255,.12); }
+    .toast.warn { background: var(--no-warn); color: #1a1206; }
+    .toast.ok { background: var(--no-ok); color: #06180c; }
+
+    /* Brand: blue uppercase title + short centered underline bar */
+    .branding { text-align: center; margin-bottom: 1.25rem; }
+    .branding .badge {
+      display: inline-block; background: transparent; color: var(--no-accent-hi);
+      padding: 0 0 .6rem; border-radius: 0; font-size: 1.05rem;
+      font-weight: 700; letter-spacing: .18em; text-transform: uppercase;
+      position: relative;
+    }
+    .branding .badge::after {
+      content: ""; position: absolute; left: 50%; bottom: 0; transform: translateX(-50%);
+      width: 40px; height: 3px; border-radius: 999px; background: var(--no-accent);
+    }
   </style>
 </head>
 <body>
