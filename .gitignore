@@ -13,6 +13,7 @@
 #   9.  Local upstream-research scaffolding (sample/capture dumps)
 #   10. Trash filenames from past `python -c "..." | tee` misadventures
 #   11. Local AI-assistant scaffolding (Claude Code)
+#   12. Local UI-preview scratch (throwaway panel launcher + scratch DB)
 #
 # To re-normalise the working tree after editing .gitattributes:
 #   git add --renormalize .
@@ -141,3 +142,10 @@ lines =*
 # the install/runtime surface — never commit.
 .claude/
 CLAUDE.md
+
+
+# ── 12.  Local UI-preview scratch ─────────────────────────────────────────
+# Throwaway preview launcher + scratch panel.db used to boot the dev
+# checkout against a disposable database for visual verification. Not
+# part of the product — never commit.
+.ui-preview/
