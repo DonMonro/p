@@ -306,7 +306,7 @@
         <small x-text="`${form.countries.codes.length} of ${countryCatalog.length} selected`"></small>
       </p>
 
-      <button @click.prevent="confirmCountries()" :disabled="busy">Continue → ports</button>
+      <button @click.prevent="submitCountries()" :disabled="busy">Continue → ports</button>
     </article>
 
     <!-- ─────────────────────────  Step: ports  ───────────────────── -->
@@ -518,9 +518,9 @@
         busy: false,
         toast: { text: "", kind: "ok" },
 
-        // Resource-warning confirmation gate for the countries step. The
-        // Continue button opens the modal; only "I understand — continue"
-        // (acceptWarning) runs the real submitCountries() POST.
+        // Resource-warning confirmation gate: the modal auto-opens on page
+        // load (init) and must be dismissed with "I understand — continue"
+        // (acceptWarning) before the operator can use the wizard.
         warnModal: { open: false },
 
         // Per-step form models. Initialized to empty defaults; repopulated
