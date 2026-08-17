@@ -43,6 +43,14 @@ sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.s
 > release needed. For a reproducible install pinned to a specific release,
 > fetch that tag's script **and** pin the clone to the same tag:
 > `PSIPHON3XUI_REPO_REF=v1.1.0 sudo bash <(curl -sL …/p/v1.1.0/install.sh)`
+>
+> If `raw.githubusercontent.com` rate-limits you (bash errors like
+> `429:: command not found`), clone instead — same code, no raw-file CDN:
+>
+> ```bash
+> rm -rf /tmp/p3x && git clone --depth 1 https://github.com/DonMonro/p.git /tmp/p3x \
+>   && sudo bash /tmp/p3x/install.sh
+> ```
 
 The installer will:
 - Install system dependencies (Python venv, `git`, `golang-go`, `jq`, `curl`, …). The installer does **not** manage a host firewall.
