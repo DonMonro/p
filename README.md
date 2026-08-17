@@ -40,7 +40,7 @@ sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/latest/install
 
 > The `latest` tag always points at the newest release, so this one-liner needs
 > no version number. (It is a *moving* tag, re-pointed at each release — see the
-> release procedure below. Pin a specific version with `…/p/v1.0.1/install.sh`
+> release procedure below. Pin a specific version with `…/p/v1.1.0/install.sh`
 > if you need a reproducible install.)
 
 The installer will:

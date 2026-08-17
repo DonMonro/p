@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Psiphon-3X-UI",
     description="Psiphon companion panel for Sanaei 3x-ui.",
-    version="1.0.1",
+    version="1.1.0",
     lifespan=lifespan,
 )
 

@@ -54,7 +54,7 @@ REPO_URL="https://github.com/DonMonro/p.git"
 # v1.0.0 installs when Phase 29 removed installer/firewall.sh. Bump this in
 # the same commit that moves a release tag. Override for branch testing:
 #   PSIPHON3XUI_REPO_REF=my-branch sudo bash install.sh
-REPO_REF="${PSIPHON3XUI_REPO_REF:-v1.0.1}"
+REPO_REF="${PSIPHON3XUI_REPO_REF:-v1.1.0}"
 LOG_FILE="${INSTALL_PREFIX}/install.log"
 PSIPHON3XUI_USER="${PSIPHON3XUI_USER:-psiphon3xui}"
 PSIPHON3XUI_GROUP="${PSIPHON3XUI_GROUP:-psiphon3xui}"
