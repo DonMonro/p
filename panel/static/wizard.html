@@ -77,6 +77,16 @@
     main.container > nav a { color: var(--no-text-2); text-decoration: none; font-size: .9rem;
                              transition: color .15s ease; }
     main.container > nav a:hover { color: var(--no-accent-hi); }
+    /* Logout — a real red button with a border, matching the dashboard. */
+    .logout-btn {
+      background: rgba(239,68,68,.12); border: 1px solid var(--no-err);
+      color: #f87171; font-size: .8rem; font-weight: 600;
+      padding: .35rem .9rem; margin: 0; letter-spacing: .02em;
+    }
+    .logout-btn:hover:not([disabled]) {
+      background: var(--no-err); border-color: var(--no-err); color: #fff;
+      box-shadow: 0 4px 16px rgba(239,68,68,.35);
+    }
 
     /* Step cards */
     main.container > article {
@@ -259,7 +269,7 @@
     <nav class="container-fluid">
       <ul><li><strong>Psiphon-3X-UI</strong> — First-run Setup Wizard</li></ul>
       <ul>
-        <li><a href="#" @click.prevent="logout()">Logout</a></li>
+        <li><button class="logout-btn" @click.prevent="logout()">Logout</button></li>
       </ul>
     </nav>
     <!-- ─────────────────────────  Toast  ───────────────────────── -->
