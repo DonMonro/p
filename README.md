@@ -34,8 +34,8 @@
 > (exposing only local SOCKS proxies) if `3x-ui` is absent.
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) \
-  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh)
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh) \
+  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh)
 ```
 
 The installer will:
@@ -81,7 +81,7 @@ to stop and remove the install:
 # operator never downloaded install.sh to disk (the canonical Psiphon-3X-UI
 # install route is `bash <(curl -sL …install.sh)`). Pass `--uninstall` as
 # the first arg to the resulting shell:
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) --uninstall
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh) --uninstall
 # → Type "yes" to confirm: the panel service + /opt/psiphon-3x-ui are removed.
 #   3x-ui's own inbounds installed through it are NOT touched — you must
 #   delete them from 3x-ui manually.

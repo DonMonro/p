@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psiphon-3x-ui-panel"
-version = "1.0.0"
+version = "1.0.1"
 description = "Psiphon-3X-UI management panel — install Psiphon and clone 3x-ui inbounds per country."
 readme = "panel/README.md"
 requires-python = ">=3.10"
