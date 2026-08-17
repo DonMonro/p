@@ -34,14 +34,15 @@
 > (exposing only local SOCKS proxies) if `3x-ui` is absent.
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/latest/install.sh) \
-  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/latest/install.sh)
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.sh) \
+  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/main/install.sh)
 ```
 
-> The `latest` tag always points at the newest release, so this one-liner needs
-> no version number. (It is a *moving* tag, re-pointed at each release — see the
-> release procedure below. Pin a specific version with `…/p/v1.1.0/install.sh`
-> if you need a reproducible install.)
+> The one-liner tracks `main`, so a plain `git push` is all it takes to ship a
+> change — re-run the installer and the new code is installed. No tag or
+> release needed. For a reproducible install pinned to a specific release,
+> fetch that tag's script **and** pin the clone to the same tag:
+> `PSIPHON3XUI_REPO_REF=v1.1.0 sudo bash <(curl -sL …/p/v1.1.0/install.sh)`
 
 The installer will:
 - Install system dependencies (Python venv, `git`, `golang-go`, `jq`, `curl`, …). The installer does **not** manage a host firewall.
@@ -86,7 +87,7 @@ to stop and remove the install:
 # operator never downloaded install.sh to disk (the canonical Psiphon-3X-UI
 # install route is `bash <(curl -sL …install.sh)`). Pass `--uninstall` as
 # the first arg to the resulting shell:
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/latest/install.sh) --uninstall
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.sh) --uninstall
 # → Type "yes" to confirm: the panel service + /opt/psiphon-3x-ui are removed.
 #   3x-ui's own inbounds installed through it are NOT touched — you must
 #   delete them from 3x-ui manually.
