@@ -43,7 +43,7 @@
 
     /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
        root font-size scales every component proportionally. */
-    html { font-size: 14.5px; }
+    html { font-size: 15.5px; }
 
     /* Full-bleed layout: override Pico's centered .container max-width so the
        wizard uses the entire viewport with only a hair of breathing room. */
@@ -110,6 +110,9 @@
       background: var(--no-input); border: 1px solid var(--no-hairline);
       border-radius: var(--no-radius-ctl); color: var(--no-text);
       height: 2.75rem;
+      /* Standard sign-in-card width — the full-bleed layout would otherwise
+         stretch every text box edge-to-edge across the page. */
+      max-width: 22rem;
       transition: border-color .15s ease, box-shadow .15s ease;
     }
     input::placeholder { color: rgba(154,163,178,.55); }
@@ -272,7 +275,8 @@
       <h3 x-text="titleFor('countries')"></h3>
       <div class="warn-banner">
         <span class="warn-icon">⚠️</span>
-        <span><strong>Warning:</strong> <span x-text="resourceWarningText()"></span></span>
+        <span><strong>Warning:</strong> Enabling every 7 countries requires 1 CPU core and
+          150 MB of RAM, so only enable the required countries to prevent server instability.</span>
       </div>
       <p>Choose which countries the panel should expose egress for. You can enable all or hand-pick a subset.</p>
       <fieldset :disabled="busy">
@@ -463,14 +467,15 @@
       <button @click.prevent="goToDashboard()">Open the Management Dashboard →</button>
     </article>
 
-    <!-- ───────────  Resource warning modal (countries step)  ──────── -->
-    <div class="modal-backdrop" x-show="warnModal.open" x-cloak
-         @keydown.escape.window="warnModal.open = false">
-      <article class="modal-card" @click.outside="warnModal.open = false">
+    <!-- ───────────  Resource warning modal (page-load gate)  ────────
+         Opens the instant the wizard page loads (init) and blocks every
+         control underneath. Deliberately NO Escape / outside-click / Cancel
+         dismiss — the confirm button is the only way through. -->
+    <div class="modal-backdrop" x-show="warnModal.open" x-cloak>
+      <article class="modal-card">
         <h4>⚠️ Resource warning</h4>
-        <p x-text="resourceWarningText()"></p>
+        <p><strong>Warning:</strong> <span x-text="resourceWarningText()"></span></p>
         <div class="modal-actions">
-          <button class="secondary" @click.prevent="warnModal.open = false">Cancel</button>
           <button @click.prevent="acceptWarning()">I understand — continue</button>
         </div>
       </article>
@@ -563,6 +568,10 @@
           // strictly user-driven (the API is the source of truth).
           await this.refreshState();
           if (this.state.is_completed) return;
+          // Resource-warning gate: the popup must be the first thing the
+          // operator sees on the wizard page — it opens immediately and
+          // blocks every control until confirmed (acceptWarning).
+          this.warnModal.open = true;
           if (this.state.current_step === "countries" && !this.countryCatalog.length) {
             await this.loadCountries();
           }
@@ -631,50 +640,39 @@
             if (r.status === 401) { this.redirectLogin(); return; }
             if (!r.ok) throw new Error(`GET /api/countries → ${r.status}`);
             const body = await r.json();
+            // Strict alphabetical order by country name (locale-aware, so
+            // accented names like Côte d'Ivoire sort sensibly).
             this.countryCatalog = (body.countries || []).slice().sort(
-              (a, b) => a.code.localeCompare(b.code));
+              (a, b) => a.name.localeCompare(b.name));
           } catch (e) {
             this.notify(`failed to load country catalog: ${e.message}`, "err");
           }
         },
 
-        // ── Resource-warning gate (countries step) ─────────────────
-        // One Psiphon tunnel per country ≈ 1 CPU core + 150 MB RAM, so the
-        // operator must acknowledge the footprint of their selection before
-        // the wizard proceeds. Counts are derived from the live selection:
-        // "all" mode uses the catalog length, "specific" the checked codes.
-        selectedCountryCount() {
-          return this.form.countries.mode === "specific"
-            ? this.form.countries.codes.length
-            : this.countryCatalog.length;
-        },
-
+        // ── Resource-warning gate (page-load) ────────────────────
+        // One Psiphon tunnel per country consumes real CPU + RAM, so the
+        // operator must acknowledge the footprint the instant the wizard page
+        // opens — before they can touch any control. init() flips
+        // warnModal.open; the ONLY way to dismiss it is the confirm button
+        // (no outside-click / Escape / Cancel bypass). The same sentence is
+        // repeated as a static banner at the top of step 1.
         resourceWarningText() {
-          const n = this.selectedCountryCount();
-          const cores = n === 1 ? "1 CPU core" : `${n} CPU cores`;
-          return `Activating ${n} ${n === 1 ? "country" : "countries"} requires ` +
-                 `${cores} and ${n * 150} MB of RAM, so only activate the ` +
-                 `required countries to prevent server instability.`;
+          return "Enabling every 7 countries requires 1 CPU core and 150 MB " +
+                 "of RAM, so only enable the required countries to prevent " +
+                 "server instability.";
         },
 
-        // Continue button → open the confirmation modal instead of posting.
-        confirmCountries() {
-          if (this.busy) return;
-          if (this.form.countries.mode === "specific" && !this.form.countries.codes.length) {
-            this.notify("select at least one country first", "err");
-            return;
-          }
-          this.warnModal.open = true;
-        },
-
-        // Modal "I understand" → close the popup and run the real submit.
+        // Modal confirm → close the popup so the operator can start step 1.
         acceptWarning() {
           this.warnModal.open = false;
-          this.submitCountries();
         },
 
         // POST /api/wizard/countries
         async submitCountries() {
+          if (this.form.countries.mode === "specific" && !this.form.countries.codes.length) {
+            this.notify("select at least one country first", "err");
+            return;
+          }
           this.busy = true;
           try {
             const body = { mode: this.form.countries.mode,

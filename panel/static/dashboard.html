@@ -43,7 +43,7 @@
 
     /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
        root font-size scales every component proportionally. */
-    html { font-size: 14.5px; }
+    html { font-size: 15.5px; }
 
     /* Full-bleed layout: override Pico's centered .container max-width so the
        dashboard uses the entire viewport with only a hair of breathing room. */
@@ -77,6 +77,16 @@
     main.container > nav a { color: var(--no-text-2); text-decoration: none; font-size: .9rem;
                              transition: color .15s ease; }
     main.container > nav a:hover { color: var(--no-accent-hi); }
+    /* Logout — a real red button with a border (was a plain text anchor). */
+    .logout-btn {
+      background: rgba(239,68,68,.12); border: 1px solid var(--no-err);
+      color: #f87171; font-size: .8rem; font-weight: 600;
+      padding: .35rem .9rem; margin: 0; letter-spacing: .02em;
+    }
+    .logout-btn:hover:not([disabled]) {
+      background: var(--no-err); border-color: var(--no-err); color: #fff;
+      box-shadow: 0 4px 16px rgba(239,68,68,.35);
+    }
 
     /* ── Sidebar layout ──────────────────────────────────────── */
     [x-cloak] { display: none !important; }
@@ -179,6 +189,9 @@
     input[type="text"], input[type="password"], input[type="number"], select {
       background: var(--no-input); border: 1px solid var(--no-hairline);
       border-radius: var(--no-radius-ctl); color: var(--no-text);
+      /* Standard sign-in-card width — keeps text boxes from stretching to
+         the full width of the (now full-bleed) panel. */
+      max-width: 22rem;
       transition: border-color .15s ease, box-shadow .15s ease;
     }
     input::placeholder { color: rgba(154,163,178,.55); }
@@ -221,16 +234,27 @@
     }
     button[disabled] { opacity: .5; pointer-events: none; }
 
-    /* ── Inline modal cards (ports / enable / reclone / logs) ── */
-    .content > article {
+    /* ── Inline per-country editor row ─────────────────────────
+       The ports / enable / reclone / logs editors no longer stack as cards
+       at the bottom of the list: each country's <tbody> carries a hidden
+       editor row that expands directly beneath the clicked country. The
+       card is deliberately slightly smaller than the full panel width. */
+    table#countries tr.row-editor > td {
+      padding: .15rem .55rem .9rem; white-space: normal;
+      border-bottom: 1px solid var(--no-hairline);
+    }
+    .row-editor article {
+      max-width: 46rem; margin: 0;
       background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
       border: 1px solid rgba(59,130,246,.35);
-      border-radius: var(--no-radius-card);
-      padding: 1.5rem 1.75rem; margin-bottom: 1.25rem;
-      box-shadow: 0 0 40px rgba(37,99,235,.12), 0 16px 40px rgba(0,0,0,.4);
+      border-left: 3px solid var(--no-accent-hi);
+      border-radius: 12px;
+      padding: 1.1rem 1.3rem;
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
     }
-    .content > article > header strong { color: var(--no-text); font-size: 1.1rem; font-weight: 700; }
-    .content > article > footer { display: flex; gap: .6rem; justify-content: flex-end; }
+    .row-editor article > header strong { color: var(--no-text); font-size: 1rem; font-weight: 700; }
+    .row-editor article > footer { display: flex; gap: .6rem; justify-content: flex-end; margin-top: .75rem; }
+    .row-editor fieldset { margin-bottom: .4rem; }
     /* Nested settings cards (rotate password / change panel port) */
     .card > article {
       background: var(--no-surface); border: 1px solid var(--no-hairline);
@@ -286,7 +310,7 @@
     <nav class="container-fluid">
       <ul><li><strong>Psiphon-3X-UI</strong> — Management Dashboard</li></ul>
       <ul>
-        <li><a href="#" @click.prevent="logout()">Logout</a></li>
+        <li><button class="logout-btn" @click.prevent="logout()">Logout</button></li>
       </ul>
     </nav>
 
@@ -322,8 +346,15 @@
             <th>Unit</th><th>Inbound</th><th>Healthy</th><th>Actions</th>
           </tr>
         </thead>
-        <tbody :class="{ busy: busy.countries }">
-          <template x-for="c in countries" :key="c.code">
+        <tbody x-show="!countries.length">
+          <tr><td colspan="9"><em>No countries yet — run the wizard's add-country step first.</em></td></tr>
+        </tbody>
+        <!-- One <tbody> per country so the editor panels can expand in a row
+             DIRECTLY BENEATH the clicked country instead of stacking at the
+             bottom of the list. Alpine's x-for supports <tbody> as its
+             single root element. -->
+        <template x-for="c in countries" :key="c.code">
+          <tbody :class="{ busy: busy.countries }">
             <tr>
               <td><code x-text="c.code"></code></td>
               <td data-col="name"><span class="country-flag" x-text="c.flag"></span><span x-text="c.name"></span></td>
@@ -387,137 +418,117 @@
                      SPA. -->
               </td>
             </tr>
-          </template>
-          <template x-if="!countries.length">
-            <tr><td colspan="9"><em>No countries yet — run the wizard's add-country step first.</em></td></tr>
-          </template>
-        </tbody>
+            <!-- Inline editor row — expands directly beneath THIS country.
+                 Each article is gated on its own state object's code so only
+                 the clicked country's row ever shows content. -->
+            <tr class="row-editor" x-show="editorOpenFor(c.code)" x-cloak>
+              <td colspan="9">
+                <!-- Edit ports -->
+                <article x-show="ports.open && ports.code === c.code" x-cloak>
+                  <header><strong x-text="`Edit ports — ${ports.code}`"></strong></header>
+                  <fieldset :disabled="busy.ports">
+                    <label>SOCKS port (internal)
+                      <input type="number" min="1024" max="65535" x-model.number="ports.socks">
+                    </label>
+                    <label>Public port (3x-ui listener)
+                      <input type="number" min="1" max="65535" x-model.number="ports.public">
+                    </label>
+                    <small>Re-apply rewrites the per-country Psiphon config, restarts the tunnel, and re-clones the
+                      matching 3x-ui inbound so the remark + listener match the new public port.</small>
+                  </fieldset>
+                  <footer>
+                    <button class="secondary" @click="closePorts()">Cancel</button>
+                    <button @click="submitPorts()">Re-apply</button>
+                  </footer>
+                </article>
+
+                <!-- Enable with ports (Hotfix #10 Bug #3 + Phase 25 Feature A):
+                     shown when the operator toggles Enabled on a country that
+                     has no PortAssignment yet. Collects socks+public ports and
+                     an optional clone-from inbound, then PATCHes everything in
+                     one shot. -->
+                <article x-show="ports.enable_open && ports.enable_code === c.code" x-cloak>
+                  <header><strong x-text="`Enable ${ports.enable_code} — assign ports + inbound`"></strong></header>
+                  <fieldset :disabled="busy.ports">
+                    <label>SOCKS port (internal)
+                      <input type="number" min="1024" max="65535" x-model.number="ports.enable_socks">
+                    </label>
+                    <label>Public port (3x-ui listener)
+                      <input type="number" min="1" max="65535" x-model.number="ports.enable_public">
+                    </label>
+                    <small>Leave blank/zero to use the smart-recommendation defaults.</small>
+                    <label>Clone from inbound (3x-ui template) — <em>optional</em>
+                      <select x-model.number="ports.enable_inbound_id">
+                        <option :value="0" selected>— no clone on enable —</option>
+                        <template x-for="i in ports.enable_inbounds" :key="i.id">
+                          <option :value="i.id"
+                                  x-text="`#${i.id} — ${i.remark || '(no remark)'} (${i.protocol} :${i.port})`"></option>
+                        </template>
+                      </select>
+                    </label>
+                    <small x-show="!ports.enable_inbounds.length">
+                      Fetching inbounds… — if the list stays empty your 3x-ui credentials
+                      have not been cached yet; run the wizard's creds step.
+                    </small>
+                  </fieldset>
+                  <footer>
+                    <button class="secondary" @click="cancelEnableWithPorts()">Cancel</button>
+                    <button @click="confirmEnableWithPorts()">Enable & apply</button>
+                  </footer>
+                </article>
+
+                <!-- Edit inbound (Phase 25 Feature D) -->
+                <article x-show="reclone.open && reclone.code === c.code" x-cloak>
+                  <header><strong x-text="`Edit inbound — ${reclone.code}`"></strong></header>
+                  <fieldset :disabled="busy.reclone">
+                    <label>Pick a new 3x-ui template inbound to clone for this country
+                      <select x-model.number="reclone.inbound_id">
+                        <option :value="0" disabled selected>— select inbound —</option>
+                        <template x-for="i in reclone.inbounds" :key="i.id">
+                          <option :value="i.id"
+                                  x-text="`#${i.id} — ${i.remark || '(no remark)'} (${i.protocol} :${i.port})`"></option>
+                        </template>
+                      </select>
+                    </label>
+                    <small x-show="!reclone.inbounds.length">
+                      Fetching inbounds… — if the list stays empty your 3x-ui credentials
+                      have not been cached yet; run the wizard's creds step.
+                    </small>
+                    <small>The existing clone is deleted and replaced. The tunnel unit
+                      re-applies after the swap.</small>
+                  </fieldset>
+                  <footer>
+                    <button class="secondary" @click="closeEditInbound()">Cancel</button>
+                    <button @click="submitEditInbound()"
+                            :disabled="!reclone.inbound_id || reclone.inbound_id === 0">
+                      Apply new inbound
+                    </button>
+                  </footer>
+                </article>
+
+                <!-- Logs -->
+                <article x-show="logs.open && logs.code === c.code" x-cloak>
+                  <header><strong x-text="`Logs — ${logs.code}`"></strong></header>
+                  <fieldset>
+                    <label>Lines to tail
+                      <input type="number" min="1" max="5000" x-model.number="logs.linesInput">
+                    </label>
+                    <!-- Hotfix #9 (Bug #5v6): Alpine's x-for requires a SINGLE
+                         root child per iteration — keep the span+br wrapped in
+                         one <div> root per line. -->
+                    <pre class="log"><template x-for="ln in logs.lines"><div><span x-text="ln"></span><br></div></template></pre>
+                  </fieldset>
+                  <footer>
+                    <button class="secondary" @click="closeLogs()">Close</button>
+                    <button @click="loadLogs(logs.code, logs.linesInput)">Reload</button>
+                  </footer>
+                </article>
+              </td>
+            </tr>
+          </tbody>
+        </template>
       </table>
     </section>
-
-    <!-- -------------------------------------------------------------------
-         Ports edit dialog (per-country)
-    -------------------------------------------------------------------- -->
-    <article x-show="ports.open" x-cloak>
-      <header><strong x-text="`Edit ports — ${ports.code}`"></strong></header>
-      <fieldset :disabled="busy.ports">
-        <label>SOCKS port (internal)
-          <input type="number" min="1024" max="65535" x-model.number="ports.socks">
-        </label>
-        <label>Public port (3x-ui listener)
-          <input type="number" min="1" max="65535" x-model.number="ports.public">
-        </label>
-        <small>Re-apply rewrites the per-country Psiphon config, restarts the tunnel, and re-clones the
-          matching 3x-ui inbound so the remark + listener match the new public port.</small>
-      </fieldset>
-      <footer>
-        <button class="secondary" @click="closePorts()">Cancel</button>
-        <button @click="submitPorts()">Re-apply</button>
-      </footer>
-    </article>
-
-    <!-- -------------------------------------------------------------------
-         Hotfix #10 (Bug #3): inline port-prompt modal — when the operator
-         toggles "Enabled" on a country that has no PortAssignment yet (i.e.
-         c.socks_port === null), the dashboard cannot just PATCH /countries
-         because the wizard's apply step never persisted a port pair. This
-         modal collects socks_port + public_port and submits them alongside
-         the enabled=true flag so the backend can run apply_country inline.
-
-         Phase 25 (Feature A): the SAME modal now also offers a "clone from
-         inbound" picker — the operator can select which 3x-ui template
-         inbound to clone while enabling. The list is lazy-fetched from
-         GET /api/wizard/inbounds when the modal opens. The backend's PATCH
-         handler then runs apply_country + clone_for_country in one shot.
-    ----------------------------------------------------------------------->
-    <article x-show="ports.enable_open" x-cloak>
-      <header><strong x-text="`Enable ${ports.enable_code} — assign ports + inbound`"></strong></header>
-      <fieldset :disabled="busy.ports">
-        <label>SOCKS port (internal)
-          <input type="number" min="1024" max="65535" x-model.number="ports.enable_socks">
-        </label>
-        <label>Public port (3x-ui listener)
-          <input type="number" min="1" max="65535" x-model.number="ports.enable_public">
-        </label>
-        <small>Leave blank/zero to use the smart-recommendation defaults.</small>
-        <label>Clone from inbound (3x-ui template) — <em>optional</em>
-          <select x-model.number="ports.enable_inbound_id">
-            <option :value="0" selected>— no clone on enable —</option>
-            <template x-for="i in ports.enable_inbounds" :key="i.id">
-              <option :value="i.id"
-                      x-text="`#${i.id} — ${i.remark || '(no remark)'} (${i.protocol} :${i.port})`"></option>
-            </template>
-          </select>
-        </label>
-        <small x-show="!ports.enable_inbounds.length">
-          Fetching inbounds… — if the list stays empty your 3x-ui credentials
-          have not been cached yet; run the wizard's creds step.
-        </small>
-      </fieldset>
-      <footer>
-        <button class="secondary" @click="cancelEnableWithPorts()">Cancel</button>
-        <button @click="confirmEnableWithPorts()">Enable & apply</button>
-      </footer>
-    </article>
-
-    <!-- -------------------------------------------------------------------
-         Phase 25 (Feature D) — "Edit inbound" per country. Lists every 3x-ui
-         inbound visible to the panel's cached credentials; submitting POSTs
-         /api/dashboard/countries/{code}/_reclone which deletes the existing
-         cloned inbound, re-clones the new template, and re-applies the
-         per-country tunnel config.
-    ----------------------------------------------------------------------->
-    <article x-show="reclone.open" x-cloak>
-      <header><strong x-text="`Edit inbound — ${reclone.code}`"></strong></header>
-      <fieldset :disabled="busy.reclone">
-        <label>Pick a new 3x-ui template inbound to clone for this country
-          <select x-model.number="reclone.inbound_id">
-            <option :value="0" disabled selected>— select inbound —</option>
-            <template x-for="i in reclone.inbounds" :key="i.id">
-              <option :value="i.id"
-                      x-text="`#${i.id} — ${i.remark || '(no remark)'} (${i.protocol} :${i.port})`"></option>
-            </template>
-          </select>
-        </label>
-        <small x-show="!reclone.inbounds.length">
-          Fetching inbounds… — if the list stays empty your 3x-ui credentials
-          have not been cached yet; run the wizard's creds step.
-        </small>
-        <small>The existing clone is deleted and replaced. The tunnel unit
-          re-applies after the swap.</small>
-      </fieldset>
-      <footer>
-        <button class="secondary" @click="closeEditInbound()">Cancel</button>
-        <button @click="submitEditInbound()"
-                :disabled="!reclone.inbound_id || reclone.inbound_id === 0">
-          Apply new inbound
-        </button>
-      </footer>
-    </article>
-
-    <!-- -------------------------------------------------------------------
-         Logs modal (per-country)
-    -------------------------------------------------------------------- -->
-    <article x-show="logs.open" x-cloak>
-      <header><strong x-text="`Logs — ${logs.code}`"></strong></header>
-      <fieldset>
-        <label>Lines to tail
-          <input type="number" min="1" max="5000" x-model.number="logs.lines">
-        </label>
-        <!-- Hotfix #9 (Bug #5v6): Alpine's x-for requires a SINGLE root
-             child per iteration. The previous "<span x-text='ln'></span><br>"
-             had TWO children — Alpine logged "x-for templates require a
-             single root element" at component init and silently failed to
-             bind downstream @click.prevent handlers (notably the nav's
-             Logout anchor). Symptom: clicking Logout was a literal no-op.
-             Wrap the span+br in a single <div> root per iteration line. -->
-        <pre class="log"><template x-for="ln in logs.lines"><div><span x-text="ln"></span><br></div></template></pre>
-      </fieldset>
-      <footer>
-        <button class="secondary" @click="closeLogs()">Close</button>
-        <button @click="loadLogs(logs.code, logs.lines)">Reload</button>
-      </footer>
-    </article>
 
     <!-- -------------------------------------------------------------------
          Settings — re-apply, backup/restore, rotate password, panel port
@@ -648,7 +659,10 @@
             if (r.status === 409) { window.location.href = "/wizard"; return; }
             if (!r.ok) throw new Error(`GET /api/dashboard/countries → ${r.status}`);
             const body = await r.json();
-            this.countries = body.countries || [];
+            // Strict alphabetical order by country name (locale-aware, so
+            // accented names like Côte d'Ivoire sort sensibly).
+            this.countries = (body.countries || []).slice().sort(
+              (a, b) => a.name.localeCompare(b.name));
           } catch (e) {
             this.notify(`failed to list countries: ${e.message}`, "err");
           } finally {
@@ -785,8 +799,15 @@
         },
 
         openPorts(c) {
+          // Replace the WHOLE ports object but keep the enable_* keys present
+          // (and enable_inbounds a real array) — the inline enable editor's
+          // x-show="!ports.enable_inbounds.length" evaluates in every country
+          // row and throws on an undefined key.
           this.ports = { open: true, code: c.code,
-                         socks: c.socks_port || 11000, public: c.public_port || 11050 };
+                         socks: c.socks_port || 11000, public: c.public_port || 11050,
+                         enable_open: false, enable_code: "", enable_socks: 0,
+                         enable_public: 0, enable_country: null,
+                         enable_inbound_id: 0, enable_inbounds: [] };
         },
         closePorts() { this.ports.open = false; },
 
@@ -941,6 +962,16 @@
           } finally {
             this.busy.ports = false;
           }
+        },
+
+        /** True when any of the four per-country editor panels is open for
+          * this country's code — gates the inline row-editor <tr> so it only
+          * renders directly beneath the clicked country. */
+        editorOpenFor(code) {
+          return (this.ports.open && this.ports.code === code) ||
+                 (this.ports.enable_open && this.ports.enable_code === code) ||
+                 (this.reclone.open && this.reclone.code === code) ||
+                 (this.logs.open && this.logs.code === code);
         },
 
         viewLogs(c) {
