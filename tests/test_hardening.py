@@ -683,7 +683,7 @@ class TestUninstallFlag:
             "`set -a` must be the first statement inside a subshell so "
             "PSIPHON3XUI_SESSION_SECRET is not exported into the rest of the "
             "uninstall; found "
-            f"{text[subshell_at : set_a_at]!r} between the paren and `set -a`"
+            f"{text[subshell_at:set_a_at]!r} between the paren and `set -a`"
         )
         # A missing env file must warn loudly, not silently skip.
         assert text.index("${ENV_FILE} not found") > uninstall_at
@@ -738,13 +738,13 @@ class TestPackagingRegressions:
         """``pyproject.toml``'s ``[project]`` ``version`` controls the wheel
         filename. After bumping ``app.version`` we MUST bump it here too or
         the installer advertises the old project version even though the
-        FastAPI app reports the new one. Lock in 1.0.0 — bump this when
+        FastAPI app reports the new one. Lock in 1.0.1 — bump this when
         cutting a new release.
         """
         pyproject = _load_pyproject()
-        assert pyproject["project"]["version"] == "1.0.0", (
+        assert pyproject["project"]["version"] == "1.0.1", (
             "pyproject.toml [project].version must be bumped to match panel.main's "
-            f"app.version. Got {pyproject['project']['version']!r}, expected '1.0.0'."
+            f"app.version. Got {pyproject['project']['version']!r}, expected '1.0.1'."
         )
 
     def test_python_multipart_declared_as_runtime_dependency(self):
@@ -3066,7 +3066,7 @@ class TestHotfix12PostReleaseRegressions:
             no_comments,
         ), (
             "Bug #1 / Phase 24 — render_config must NOT render the broken "
-            "plain-string-tuple shape (`\"RemoteServerListURLs\": "
+            'plain-string-tuple shape (`"RemoteServerListURLs": '
             "list(PSIPHON_REMOTE_SERVER_LIST_URLS)`) — that's the rejected "
             "form. Phase 24 substitutes a list of TransferURL dicts via "
             "creds['RemoteServerListURLs']."
@@ -3097,9 +3097,7 @@ class TestHotfix12PostReleaseRegressions:
         assert isinstance(urls, list) and len(urls) == 1
         entry = urls[0]
         assert isinstance(entry, dict)
-        assert entry["URL"] == base64.b64encode(
-            _HF14_FAKE_REMOTE_SERVER_LIST_URL.encode()
-        ).decode()
+        assert entry["URL"] == base64.b64encode(_HF14_FAKE_REMOTE_SERVER_LIST_URL.encode()).decode()
         assert base64.b64decode(entry["URL"]).decode() == _HF14_FAKE_REMOTE_SERVER_LIST_URL
         assert entry["OnlyAfterAttempts"] == 0
         assert entry["SkipVerify"] is False
@@ -3725,6 +3723,7 @@ class TestHotfix14PostReleaseRegressions:
                 "panel.env customisation can override the baked-in default)."
             )
 
+
 # ---------------------------------------------------------------------------
 # Hotfix #15 — Phase 24 Hotfix #2: orphan panel process survives uninstall
 # AND survives panel_install.sh's pre-flight → panel keeps serving the OLD
@@ -3857,35 +3856,35 @@ class TestHotfix15PostReleaseRegressions:
 
         text = self._INSTALL_SH.read_text(encoding="utf-8")
         # Strip comments so docblock prose ordering doesn't match.
-        no_comments_lines = [
-            ln for ln in re.sub(r"#[^\n]*", "", text).splitlines() if ln.strip()
-        ]
+        no_comments_lines = [ln for ln in re.sub(r"#[^\n]*", "", text).splitlines() if ln.strip()]
         # Walk and find: systemctl stop ... + _purge_orphan_panel_listeners
         # + _purge_orphan_panel_user_processes + userdel + rm -rf — in order.
 
         idx_stop = next(
-            (i for i, ln in enumerate(no_comments_lines)
-             if "systemctl stop psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in enumerate(no_comments_lines)
+                if "systemctl stop psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_purge_listen = next(
-            (i for i, ln in enumerate(no_comments_lines)
-             if "_purge_orphan_panel_listeners" in ln),
+            (i for i, ln in enumerate(no_comments_lines) if "_purge_orphan_panel_listeners" in ln),
             None,
         )
         idx_purge_user = next(
-            (i for i, ln in enumerate(no_comments_lines)
-             if "_purge_orphan_panel_user_processes" in ln and "()" not in ln),
+            (
+                i
+                for i, ln in enumerate(no_comments_lines)
+                if "_purge_orphan_panel_user_processes" in ln and "()" not in ln
+            ),
             None,
         )
         idx_rmrf = next(
-            (i for i, ln in enumerate(no_comments_lines)
-             if 'rm -rf "${INSTALL_PREFIX}"' in ln),
+            (i for i, ln in enumerate(no_comments_lines) if 'rm -rf "${INSTALL_PREFIX}"' in ln),
             None,
         )
-        assert all(
-            v is not None for v in (idx_stop, idx_purge_listen, idx_purge_user, idx_rmrf)
-        ), (
+        assert all(v is not None for v in (idx_stop, idx_purge_listen, idx_purge_user, idx_rmrf)), (
             "Phase 24 Hotfix #2 — install.sh --uninstall ordering broken: "
             "expected systemctl stop → _purge_orphan_panel_listeners → "
             "_purge_orphan_panel_user_processes → rm -rf, in that order."
@@ -3907,13 +3906,11 @@ class TestHotfix15PostReleaseRegressions:
         no_comments = re.sub(r"#[^\n]*", "", text)
         nonblank = [ln for ln in no_comments.splitlines() if ln.strip()]
         idx_stop = next(
-            (i for i, ln in enumerate(nonblank)
-             if "systemctl stop psiphon-3x-ui.service" in ln),
+            (i for i, ln in enumerate(nonblank) if "systemctl stop psiphon-3x-ui.service" in ln),
             None,
         )
         idx_prelight = next(
-            (i for i, ln in enumerate(nonblank)
-             if 'Pre-flight: checking TCP/${PANEL_PORT}' in ln),
+            (i for i, ln in enumerate(nonblank) if "Pre-flight: checking TCP/${PANEL_PORT}" in ln),
             None,
         )
         assert idx_stop is not None, (
@@ -3922,9 +3919,7 @@ class TestHotfix15PostReleaseRegressions:
             "any prior unit (Bug: prior pre-flight consulted is-active + "
             "MainPID exclusion which let the orphan survive)."
         )
-        assert idx_prelight is not None, (
-            "Pre-flight listener check missing from panel_install.sh."
-        )
+        assert idx_prelight is not None, "Pre-flight listener check missing from panel_install.sh."
         assert idx_stop < idx_prelight, (
             "Phase 24 Hotfix #2 — `systemctl stop psiphon-3x-ui.service` "
             "must run BEFORE the port_listeners check (so the live unit is "
@@ -3979,7 +3974,7 @@ class TestHotfix15PostReleaseRegressions:
         text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
         assert not re.search(
-            r'Restarting psiphon-3x-ui\.service \(was already running\)',
+            r"Restarting psiphon-3x-ui\.service \(was already running\)",
             no_comments,
         ), (
             "Phase 24 Hotfix #2 — panel_install.sh must NOT print the "
@@ -4146,10 +4141,7 @@ class TestHotfix16PostReleaseRegressions:
             "first-run mkdir fails under the unit's hardening sandbox."
         )
         # Verify the ownership flags target the service identity.
-        assert (
-            "${PSIPHON3XUI_USER}" in no_comments
-            and "${PSIPHON3XUI_GROUP}" in no_comments
-        ), (
+        assert "${PSIPHON3XUI_USER}" in no_comments and "${PSIPHON3XUI_GROUP}" in no_comments, (
             "Phase 24 Hotfix #3 — the install command for DATA_DIR must pass "
             "`-o ${PSIPHON3XUI_USER} -g ${PSIPHON3XUI_GROUP}` so the per-"
             "country psiphon-tunnel-core process (running as "
@@ -4450,10 +4442,14 @@ class TestHotfix17PostReleaseRegressions:
         text = self._TUNNEL_UNIT_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
         execstartpre_match = re.search(
-            r"^ExecStartPre\s*=", no_comments, re.M,
+            r"^ExecStartPre\s*=",
+            no_comments,
+            re.M,
         )
         execstart_match = re.search(
-            r"^ExecStart\s*=", no_comments, re.M,
+            r"^ExecStart\s*=",
+            no_comments,
+            re.M,
         )
         assert execstartpre_match is not None and execstart_match is not None
         assert execstartpre_match.start() < execstart_match.start(), (
@@ -4495,12 +4491,9 @@ class TestHotfix17PostReleaseRegressions:
             execstartpre_line_match.group(1),
         )
         assert pre_path_match is not None, (
-            "Phase 24 Hotfix #4 — ExecStartPre path must contain "
-            "`/opt/psiphon-3x-ui/data/%i`."
+            "Phase 24 Hotfix #4 — ExecStartPre path must contain `/opt/psiphon-3x-ui/data/%i`."
         )
-        assert (
-            pre_path_match.group(1) == execstart_datapath_match.group(1)
-        ), (
+        assert pre_path_match.group(1) == execstart_datapath_match.group(1), (
             "Phase 24 Hotfix #4 — ExecStartPre pre-create path MUST equal "
             "ExecStart's -dataRootDirectory argument so the pre-create "
             "actually unblocks the binary's subsequent mkdir of its own "
@@ -4591,12 +4584,9 @@ class TestHotfix18PostReleaseRegressions:
         call (which would suggest a copy-paste duplication)."""
         lines = self._no_comment_nonblank_lines()
         reset_failed_lines = [
-            ln for ln in lines
-            if "systemctl reset-failed psiphon-3x-ui.service" in ln
+            ln for ln in lines if "systemctl reset-failed psiphon-3x-ui.service" in ln
         ]
-        assert (
-            len(reset_failed_lines) == 3
-        ), (
+        assert len(reset_failed_lines) == 3, (
             "Phase 24 Hotfix #5 + Hotfix #6 — expected exactly 3 "
             "`systemctl reset-failed psiphon-3x-ui.service` call sites in "
             "panel_install.sh: (H6) pre-build quiesce, (H5) between "
@@ -4650,18 +4640,15 @@ class TestHotfix18PostReleaseRegressions:
         the implicit auto-start `enable` triggers via the wants-symlink."""
         lines = self._no_comment_nonblank_lines()
         idx_daemon_reload = next(
-            (i for i, ln in enumerate(lines)
-             if "systemctl daemon-reload" in ln),
+            (i for i, ln in enumerate(lines) if "systemctl daemon-reload" in ln),
             None,
         )
         idx_enable = next(
-            (i for i, ln in enumerate(lines)
-             if "systemctl enable psiphon-3x-ui.service" in ln),
+            (i for i, ln in enumerate(lines) if "systemctl enable psiphon-3x-ui.service" in ln),
             None,
         )
         reset_failed_indices = [
-            i for i, ln in enumerate(lines)
-            if "systemctl reset-failed psiphon-3x-ui.service" in ln
+            i for i, ln in enumerate(lines) if "systemctl reset-failed psiphon-3x-ui.service" in ln
         ]
         assert (
             idx_daemon_reload is not None
@@ -4681,10 +4668,7 @@ class TestHotfix18PostReleaseRegressions:
         # no longer be the lexicographically-FIRST reset-failed call, so
         # ``min(reset_failed_indices)`` would now wrongly grab the
         # pre-build site).
-        site_1_candidates = [
-            i for i in reset_failed_indices
-            if idx_daemon_reload < i < idx_enable
-        ]
+        site_1_candidates = [i for i in reset_failed_indices if idx_daemon_reload < i < idx_enable]
         assert site_1_candidates, (
             "Phase 24 Hotfix #5 — call site #1 MUST sit strictly BETWEEN "
             "`systemctl daemon-reload` and `systemctl enable "
@@ -4716,8 +4700,11 @@ class TestHotfix18PostReleaseRegressions:
         # by the 'Pre-flight' info() that precedes it.
         nonblank_with_indices = list(enumerate(lines))
         idx_preflight_info = next(
-            (i for i, ln in nonblank_with_indices
-             if "Pre-flight: stopping any prior psiphon-3x-ui.service unit" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if "Pre-flight: stopping any prior psiphon-3x-ui.service unit" in ln
+            ),
             None,
         )
         assert idx_preflight_info is not None, (
@@ -4726,8 +4713,11 @@ class TestHotfix18PostReleaseRegressions:
             "the pre-flight stop."
         )
         idx_preflight_stop = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_preflight_info and "systemctl stop psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_preflight_info and "systemctl stop psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         # The START of the unit comes after the orphan-kill block. Phase 24
@@ -4740,26 +4730,31 @@ class TestHotfix18PostReleaseRegressions:
         # the line directly above the `if ! systemctl start ...` block and
         # is unchanged by Hotfix #7.
         idx_start_info = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_preflight_stop
-             and "Starting psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_preflight_stop and "Starting psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         assert idx_start_info is not None, (
-            "Phase 24 Hotfix #7 — pre-condition: the `info \"Starting "
-            "psiphon-3x-ui.service …\"` banner that precedes the post-pre-"
+            'Phase 24 Hotfix #7 — pre-condition: the `info "Starting '
+            'psiphon-3x-ui.service …"` banner that precedes the post-pre-'
             "flight `systemctl start` MUST still be present (Hotfix #7 "
             "only added a `2>/dev/null` redirect + `if ! ...; then warn; fi` "
             "wrapper around the start — it did NOT touch this banner)."
         )
         idx_start_unit = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_start_info
-             and "systemctl start psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_start_info and "systemctl start psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         reset_failed_indices = [
-            i for i, ln in nonblank_with_indices
+            i
+            for i, ln in nonblank_with_indices
             if "systemctl reset-failed psiphon-3x-ui.service" in ln
         ]
         assert (
@@ -4774,8 +4769,7 @@ class TestHotfix18PostReleaseRegressions:
         # The reset-failed call that bounds the pre-flight site is the one
         # strictly AFTER idx_preflight_stop and strictly BEFORE idx_start_unit.
         site_2_candidates = [
-            i for i in reset_failed_indices
-            if idx_preflight_stop < i < idx_start_unit
+            i for i in reset_failed_indices if idx_preflight_stop < i < idx_start_unit
         ]
         assert site_2_candidates, (
             "Phase 24 Hotfix #5 — call site #2 MUST run strictly BETWEEN the "
@@ -4856,13 +4850,10 @@ class TestHotfix19PostReleaseRegressions:
         four systemctl no-ops that follow with intentional hygiene, rather
         than mistaking them for stray installer chatter."""
         lines = self._no_comment_nonblank_lines()
-        banner = [
-            ln for ln in lines
-            if "Pre-build quiesce" in ln and "disabling" in ln
-        ]
+        banner = [ln for ln in lines if "Pre-build quiesce" in ln and "disabling" in ln]
         assert len(banner) == 1, (
             "Phase 24 Hotfix #6 — panel_install.sh must have EXACTLY ONE "
-            "`info \"Pre-build quiesce: ... disabling ...` banner that "
+            '`info "Pre-build quiesce: ... disabling ...` banner that '
             "precedes the four systemctl quiesce calls. Without it the "
             "no-op calls look like noise to a tailing operator (who can't "
             "tell them from stray installer chatter). "
@@ -4886,8 +4877,7 @@ class TestHotfix19PostReleaseRegressions:
         # sites, the daemon-reload+enable+start block, etc.). So we
         # anchor on the Pre-build quiesce banner and walk forward.
         idx_banner = next(
-            (i for i, ln in enumerate(lines)
-             if "Pre-build quiesce" in ln),
+            (i for i, ln in enumerate(lines) if "Pre-build quiesce" in ln),
             None,
         )
         assert idx_banner is not None, (
@@ -4900,7 +4890,7 @@ class TestHotfix19PostReleaseRegressions:
         # first `systemctl daemon-reload` line; the venv-create
         # `if [[ ! -x "${VENV_DIR}/bin/python" ]]` line follows.
         quiesce_block = []
-        for ln in lines[idx_banner + 1:]:
+        for ln in lines[idx_banner + 1 :]:
             if "systemctl" in ln and "psiphon-3x-ui.service" in ln:
                 quiesce_block.append(ln)
                 if "daemon-reload" in ln:
@@ -4939,25 +4929,27 @@ class TestHotfix19PostReleaseRegressions:
         is exactly the boot-loop Hotfix #6 is meant to prevent."""
         lines = self._no_comment_nonblank_lines()
         idx_banner = next(
-            (i for i, ln in enumerate(lines)
-             if "Pre-build quiesce" in ln),
+            (i for i, ln in enumerate(lines) if "Pre-build quiesce" in ln),
             None,
         )
         idx_venv = next(
-            (i for i, ln in enumerate(lines)
-             if "${VENV_DIR}/bin/python" in ln
-             and ("! -x" in ln or "venv" in ln.lower())),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if "${VENV_DIR}/bin/python" in ln and ("! -x" in ln or "venv" in ln.lower())
+            ),
             None,
         )
         assert idx_banner is not None and idx_venv is not None, (
             "Phase 24 Hotfix #6 — pre-condition: panel_install.sh must have "
             "both the `Pre-build quiesce` banner and the venv-create "
-            "`if [[ ! -x \"${VENV_DIR}/bin/python\" ]]` block."
+            '`if [[ ! -x "${VENV_DIR}/bin/python" ]]` block.'
         )
         # Collect all four systemctl quiesce operations between banner and
         # venv-create and assert they ALL sit strictly before venv-create.
         quiesce_indices = [
-            i for i, ln in enumerate(lines)
+            i
+            for i, ln in enumerate(lines)
             if idx_banner < i < idx_venv
             and "systemctl" in ln
             and ("psiphon-3x-ui.service" in ln or "daemon-reload" in ln)
@@ -5010,14 +5002,15 @@ class TestHotfix19PostReleaseRegressions:
         """
         lines = self._no_comment_nonblank_lines()
         idx_banner = next(
-            (i for i, ln in enumerate(lines)
-             if "Pre-build quiesce" in ln),
+            (i for i, ln in enumerate(lines) if "Pre-build quiesce" in ln),
             None,
         )
         idx_venv = next(
-            (i for i, ln in enumerate(lines)
-             if "${VENV_DIR}/bin/python" in ln
-             and ("! -x" in ln or "venv" in ln.lower())),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if "${VENV_DIR}/bin/python" in ln and ("! -x" in ln or "venv" in ln.lower())
+            ),
             None,
         )
         assert idx_banner is not None and idx_venv is not None, (
@@ -5026,27 +5019,36 @@ class TestHotfix19PostReleaseRegressions:
         )
         # Within the [banner, venv) span, find the FIRST index of each op.
         idx_stop = next(
-            (i for i, ln in enumerate(lines)
-             if idx_banner < i < idx_venv
-             and "systemctl stop psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if idx_banner < i < idx_venv and "systemctl stop psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_disable = next(
-            (i for i, ln in enumerate(lines)
-             if idx_banner < i < idx_venv
-             and "systemctl disable psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if idx_banner < i < idx_venv and "systemctl disable psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_reset = next(
-            (i for i, ln in enumerate(lines)
-             if idx_banner < i < idx_venv
-             and "systemctl reset-failed psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if idx_banner < i < idx_venv
+                and "systemctl reset-failed psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_reload = next(
-            (i for i, ln in enumerate(lines)
-             if idx_banner < i < idx_venv
-             and "systemctl daemon-reload" in ln),
+            (
+                i
+                for i, ln in enumerate(lines)
+                if idx_banner < i < idx_venv and "systemctl daemon-reload" in ln
+            ),
             None,
         )
         assert (
@@ -5137,10 +5139,7 @@ class TestHotfix19PostReleaseRegressions:
         text = self._PANEL_INSTALL_SH.read_text(encoding="utf-8")
         # The `disable` line MUST be present (not just `enable` somewhere
         # later). Anchored to the psiphon-3x-ui.service unit.
-        assert (
-            "systemctl disable psiphon-3x-ui.service 2>/dev/null || true"
-            in text
-        ), (
+        assert "systemctl disable psiphon-3x-ui.service 2>/dev/null || true" in text, (
             "Phase 24 Hotfix #6 — panel_install.sh must call "
             "`systemctl disable psiphon-3x-ui.service 2>/dev/null || true` "
             "in the pre-build quiesce block. Without `disable`, the prior "
@@ -5320,7 +5319,7 @@ class TestHotfix20PostReleaseRegressions:
         ), (
             "Phase 24 Hotfix #7 — the post-pre-flight unit start MUST be "
             "rewritten as `if ! systemctl start psiphon-3x-ui.service "
-            "2>/dev/null; then warn \"...\"; fi`. The bare "
+            '2>/dev/null; then warn "..."; fi`. The bare '
             "`systemctl start psiphon-3x-ui.service` (no redirect, no "
             "if/then/fi wrapper) leaks systemd's transient "
             "`Failed to restart ... Unit not found.` JobResult emit to "
@@ -5385,8 +5384,7 @@ class TestHotfix20PostReleaseRegressions:
         # — the substring ``-m panel.seed`` is the stable part (the
         # ``"${VENV_DIR}/bin/python"`` prefix has shell interpolation).
         idx_seed = next(
-            (i for i, ln in nonblank_with_indices
-             if "-m panel.seed" in ln),
+            (i for i, ln in nonblank_with_indices if "-m panel.seed" in ln),
             None,
         )
         # ``print_summary`` lives in ``install.sh``, NOT in
@@ -5399,13 +5397,10 @@ class TestHotfix20PostReleaseRegressions:
         # ``if ! wait_for_panel_socket; then`` form uniquely picks the
         # call site inside the function body.
         idx_socket_wait = next(
-            (i for i, ln in nonblank_with_indices
-             if "if ! wait_for_panel_socket; then" in ln),
+            (i for i, ln in nonblank_with_indices if "if ! wait_for_panel_socket; then" in ln),
             None,
         )
-        assert (
-            idx_seed is not None and idx_socket_wait is not None
-        ), (
+        assert idx_seed is not None and idx_socket_wait is not None, (
             "Phase 24 Hotfix #7 — pre-condition: panel_install.sh MUST "
             "still invoke ``-m panel.seed`` (the install.sh call site) "
             "AND contain an ``if ! wait_for_panel_socket; then`` block "
@@ -5424,18 +5419,22 @@ class TestHotfix20PostReleaseRegressions:
         # the seed invocation (it's at the top of run_panel_install),
         # so the post-seed daemon-reload is the only candidate > idx_seed.
         idx_daemon_reload = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_seed
-             and "systemctl daemon-reload" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_seed and "systemctl daemon-reload" in ln
+            ),
             None,
         )
         # Start: the LAST ``systemctl start psiphon-3x-ui.service`` in
         # non-comment source — there is no other start in the file (the
         # pre-flight stop is a ``stop``, not a start).
         idx_start = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_seed
-             and "systemctl start psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_seed and "systemctl start psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         assert idx_daemon_reload is not None, (
@@ -5522,9 +5521,11 @@ class TestHotfix20PostReleaseRegressions:
         lines = self._no_comment_nonblank_lines()
         nonblank_with_indices = list(enumerate(lines))
         idx_start = next(
-            (i for i, ln in nonblank_with_indices
-             if "systemctl start psiphon-3x-ui.service" in ln
-             and "2>/dev/null" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if "systemctl start psiphon-3x-ui.service" in ln and "2>/dev/null" in ln
+            ),
             None,
         )
         assert idx_start is not None, (
@@ -5770,8 +5771,7 @@ class TestHotfix21PostReleaseRegressions:
         # The pre-build stop is the FIRST `systemctl stop
         # psiphon-3x-ui.service` AFTER the "Pre-build quiesce" banner.
         idx_banner = next(
-            (i for i, ln in nonblank_with_indices
-             if "Pre-build quiesce" in ln),
+            (i for i, ln in nonblank_with_indices if "Pre-build quiesce" in ln),
             None,
         )
         assert idx_banner is not None, (
@@ -5779,26 +5779,31 @@ class TestHotfix21PostReleaseRegressions:
             "info banner must be present (Hotfix #6 pinned this)."
         )
         idx_stop = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_banner
-             and "systemctl stop psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_banner and "systemctl stop psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_wait_loop_start = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_stop and "tries-- > 0" in ln),
+            (i for i, ln in nonblank_with_indices if i > idx_stop and "tries-- > 0" in ln),
             None,
         )
         idx_is_active_check = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_stop
-             and "systemctl is-active --quiet psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_stop and "systemctl is-active --quiet psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         idx_disable = next(
-            (i for i, ln in nonblank_with_indices
-             if i > idx_stop
-             and "systemctl disable psiphon-3x-ui.service" in ln),
+            (
+                i
+                for i, ln in nonblank_with_indices
+                if i > idx_stop and "systemctl disable psiphon-3x-ui.service" in ln
+            ),
             None,
         )
         assert idx_stop is not None, (
@@ -6003,7 +6008,7 @@ class TestHotfix23PostReleaseRegressions:
                 and isinstance(node.slice, ast.Constant)
                 and node.slice.value == "obj"
             ):
-                offenders.append(f"{node.value.id}[\"obj\"] at line {node.lineno}")
+                offenders.append(f'{node.value.id}["obj"] at line {node.lineno}')
         assert not offenders, (
             "router.py indexes ['obj'] on an already-unwrapped clone/inbound "
             f"response, which raises KeyError in production: {offenders}"
@@ -6105,9 +6110,7 @@ class TestHotfix23PostReleaseRegressions:
         ):
             assert not (self.REPO_ROOT / rel).exists(), f"{rel} should be deleted"
 
-        install_sh = (self.REPO_ROOT / "installer" / "panel_install.sh").read_text(
-            encoding="utf-8"
-        )
+        install_sh = (self.REPO_ROOT / "installer" / "panel_install.sh").read_text(encoding="utf-8")
         for needle in (
             "installer/xray_applier.sh",
             "installer/xray_apply.py",
@@ -6389,9 +6392,7 @@ class TestPhase29FirewallRemoval:
     def test_change_panel_port_still_persists_and_restarts(self):
         """The port change itself must still work end-to-end."""
         body = self._change_panel_port_body()
-        assert "settings.panel_port" in body, (
-            "the new port must be persisted to the settings"
-        )
+        assert "settings.panel_port" in body, "the new port must be persisted to the settings"
         assert "db.commit()" in body, "the new port must be committed"
         assert "restart" in body.lower(), (
             "the service must restart so the panel actually binds the new port"
@@ -6415,8 +6416,7 @@ class TestPhase29FirewallRemoval:
         text = self._INSTALL_SH.read_text(encoding="utf-8")
         no_comments = re.sub(r"#[^\n]*", "", text)
         occurrences = [
-            m.start()
-            for m in re.finditer(r"_remove_stale_sudoers_dropin\b", no_comments)
+            m.start() for m in re.finditer(r"_remove_stale_sudoers_dropin\b", no_comments)
         ]
         assert len(occurrences) >= 2, (
             "Phase 29 (item 3) — install.sh must define "
@@ -6425,8 +6425,7 @@ class TestPhase29FirewallRemoval:
         def_idx = no_comments.index("_remove_stale_sudoers_dropin() {")
         call_sites = [i for i in occurrences if i > def_idx]
         assert call_sites, (
-            "Phase 29 (item 3) — the function must actually be invoked, not "
-            "just defined."
+            "Phase 29 (item 3) — the function must actually be invoked, not just defined."
         )
         # One call on the INSTALL path, before the summary.
         assert any(i < no_comments.index("print_summary") for i in call_sites), (
@@ -6529,8 +6528,7 @@ class TestPhase28DashboardActions:
     def test_ping_button_exists_and_calls_the_country_endpoint(self):
         cell = self._actions_cell()
         assert "pingCountry(c)" in cell, (
-            "Phase 28 (item 3) — each country row needs a Ping test button "
-            "wired to pingCountry(c)."
+            "Phase 28 (item 3) — each country row needs a Ping test button wired to pingCountry(c)."
         )
         html = self._strip_comments(self._DASHBOARD_HTML.read_text(encoding="utf-8"))
         assert "/_ping" in html and "${c.code}/_ping" in html.replace("'", '"').replace(
@@ -6545,12 +6543,9 @@ class TestPhase28DashboardActions:
         cell = self._actions_cell()
         # The countdown must gate the button, not merely be displayed.
         assert "cooldown[c.code]" in cell, (
-            "Phase 28 (item 3) — the Ping test button must consult the "
-            "per-country cooldown."
+            "Phase 28 (item 3) — the Ping test button must consult the per-country cooldown."
         )
-        m = re.search(
-            r'@click="pingCountry\(c\)"\s*:disabled="([^"]*)"', cell, re.DOTALL
-        )
+        m = re.search(r'@click="pingCountry\(c\)"\s*:disabled="([^"]*)"', cell, re.DOTALL)
         assert m is not None, "the Ping test button must carry a :disabled binding"
         guard = m.group(1)
         assert "cooldown[c.code]" in guard and "> 0" in guard, (
@@ -6588,9 +6583,7 @@ class TestPhase28DashboardActions:
 
     def test_disabled_country_freezes_ports_inbound_and_ping(self):
         cell = self._actions_cell()
-        bindings = re.findall(
-            r'@click="(\w+)\(c\)"[^>]*?:disabled="([^"]*)"', cell, re.DOTALL
-        )
+        bindings = re.findall(r'@click="(\w+)\(c\)"[^>]*?:disabled="([^"]*)"', cell, re.DOTALL)
         found = dict(bindings)
         for handler in ("openPorts", "openEditInbound", "pingCountry"):
             assert handler in found, (

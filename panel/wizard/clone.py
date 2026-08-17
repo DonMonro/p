@@ -314,7 +314,8 @@ async def clone_for_country(
         if not rok:
             _log.warning(
                 "clone_for_country routing for %s failed: %s",
-                country_row.code, rerr,
+                country_row.code,
+                rerr,
             )
     except Exception as exc:  # noqa: BLE001  defensive — never fail the clone
         routing_error = f"{type(exc).__name__}: {exc}"

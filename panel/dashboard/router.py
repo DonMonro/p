@@ -64,11 +64,11 @@ from ..psiphon import (
 # Hotfix #10 (Bug #3): apply_country / PortAssignmentSpec power the inline
 # enable-without-existing-PortAssignment branch inside patch_country.
 from ..wizard.apply import PortAssignmentSpec, apply_country
-from ..wizard.ports import listening_ports
 
 # Phase 25 (Feature A/C/D): single-country clone helper — shared by the
 # extended PATCH (enable-with-inbound) and the new _reclone endpoint.
 from ..wizard.clone import clone_for_country
+from ..wizard.ports import listening_ports
 from .xray_routing import apply_country_binding, remove_country_binding
 from .xui_client import XuiClient, XuiClientError
 
@@ -245,10 +245,8 @@ async def _gather_claimed_ports(
         except Exception:  # noqa: BLE001  panel not reachable; proceed
             pass
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await client.aclose()
-            except Exception:  # noqa: BLE001
-                pass
 
     # 3. OS listening ports (best-effort).
     try:
@@ -636,9 +634,7 @@ async def patch_country(
         # disable→enable sequence doesn't hand out a port already held by
         # another listener.
         claimed = await _gather_claimed_ports(db, exclude_country=country.code)
-        socks_port = (
-            int(body.socks_port) if body.socks_port else _pick_free_socks_port(db, claimed)
-        )
+        socks_port = int(body.socks_port) if body.socks_port else _pick_free_socks_port(db, claimed)
         public_port = (
             int(body.public_port) if body.public_port else _pick_free_public_port(db, claimed)
         )
@@ -754,7 +750,8 @@ async def patch_country(
             if not mok:
                 _log.warning(
                     "patch_country disable routing_cleanup for %s failed: %s",
-                    country.code, merr,
+                    country.code,
+                    merr,
                 )
             routing_result = {"applied": False, "removed": mok, "error": None if mok else merr}
         country.enabled = False
@@ -824,7 +821,8 @@ async def patch_country(
             if not routing_result["applied"]:
                 _log.warning(
                     "patch_country routing for %s failed: %s",
-                    country.code, clone_result.get("routing_error"),
+                    country.code,
+                    clone_result.get("routing_error"),
                 )
     elif body.enabled:
         # ── Phase 26 Hotfix #15 ──────────────────────────────────────────────
@@ -870,7 +868,9 @@ async def patch_country(
                     except Exception as exc:  # noqa: BLE001
                         _log.warning(
                             "patch_country could not read tag for inbound %d (%s): %s",
-                            inbound_id, country.code, exc,
+                            inbound_id,
+                            country.code,
+                            exc,
                         )
                     if tag is None:
                         tag = f"in-{int(assignment.public_port)}-tcp"
@@ -888,12 +888,14 @@ async def patch_country(
                     if rok:
                         _log.info(
                             "patch_country restored routing for %s (inbound_tag=%s)",
-                            country.code, tag,
+                            country.code,
+                            tag,
                         )
                     else:
                         _log.warning(
                             "patch_country routing restore for %s failed: %s",
-                            country.code, rerr,
+                            country.code,
+                            rerr,
                         )
             except Exception as exc:  # noqa: BLE001  never block the enable
                 routing_result = {
@@ -966,9 +968,7 @@ async def reclone_country(
     if assignment is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"{country.code} has no PortAssignment — enable it with ports first"
-            ),
+            detail=(f"{country.code} has no PortAssignment — enable it with ports first"),
         )
 
     # ── 1. Delete the existing cloned inbound (if any) ────────────────────
@@ -1012,7 +1012,8 @@ async def reclone_country(
                     routing_remove_result = {"removed": False, "error": serr}
                     _log.warning(
                         "reclone: stale routing cleanup for %s failed: %s",
-                        country.code, serr,
+                        country.code,
+                        serr,
                     )
             except Exception as exc:  # noqa: BLE001  best-effort cleanup
                 routing_remove_result = {
@@ -1057,7 +1058,8 @@ async def reclone_country(
         if not routing_result["applied"]:
             _log.warning(
                 "reclone routing for %s failed: %s",
-                country.code, clone_result.get("routing_error"),
+                country.code,
+                clone_result.get("routing_error"),
             )
 
     response = _country_card(country, db)
@@ -1152,7 +1154,8 @@ async def delete_country(
                 summary["removed_xray_routing_error"] = rerr
                 _log.warning(
                     "delete_country routing cleanup for %s failed: %s",
-                    country.code, rerr,
+                    country.code,
+                    rerr,
                 )
     except Exception as exc:  # noqa: BLE001  teardown must always return
         summary["removed_xray_routing"] = False
@@ -1211,9 +1214,7 @@ async def ping_country(
         )
 
     assignment = (
-        db.query(PortAssignment)
-        .filter(PortAssignment.country_code == country.code)
-        .first()
+        db.query(PortAssignment).filter(PortAssignment.country_code == country.code).first()
     )
     if assignment is None:
         raise HTTPException(
@@ -1679,9 +1680,7 @@ async def reapply_all(
                             # "reapply" would otherwise resurrect the inbound
                             # while leaving the country egressing on the
                             # server's own IP.
-                            new_tag = (
-                                new_obj.get("tag") or f"in-{c_public}-tcp"
-                            )
+                            new_tag = new_obj.get("tag") or f"in-{c_public}-tcp"
                             rok, rerr = await apply_country_binding(
                                 client, country.code, c_socks, new_tag
                             )

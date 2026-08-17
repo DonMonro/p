@@ -684,9 +684,7 @@ class TestCloneEndpoint:
         assert summary["wizard_state"]["current_step"] == "done"
         assert summary["wizard_state"]["is_completed"] is True
 
-    def test_clone_writes_outbound_and_routing_rule_per_country(
-        self, clone_client, monkeypatch
-    ):
+    def test_clone_writes_outbound_and_routing_rule_per_country(self, clone_client, monkeypatch):
         """Phase 26 regression: the batch clone must leave the Xray template
         carrying ONE socks outbound + ONE routing rule per country.
 
@@ -723,20 +721,18 @@ class TestCloneEndpoint:
             rule = matching[0]
             assert rule["type"] == "field"
             # The rule must reference the tag the panel reported for the clone.
-            tag_event = next(
-                e for e in events if e["country"] == code and e["status"] == "routing"
-            )
+            tag_event = next(e for e in events if e["country"] == code and e["status"] == "routing")
             assert rule["inboundTag"] == [tag_event["inbound_tag"]]
 
         # The freedom outbound stays FIRST — Xray uses outbounds[0] as the
         # default egress for traffic no rule matched.
         assert template["outbounds"][0]["tag"] == "direct"
         # Per-country rules precede the stock catch-alls (first match wins).
-        first_catch_all = next(
-            i for i, r in enumerate(rules) if r.get("outboundTag") == "blocked"
-        )
+        first_catch_all = next(i for i, r in enumerate(rules) if r.get("outboundTag") == "blocked")
         last_country = max(
-            i for i, r in enumerate(rules) if str(r.get("outboundTag", "")).startswith("psiphon-out-")
+            i
+            for i, r in enumerate(rules)
+            if str(r.get("outboundTag", "")).startswith("psiphon-out-")
         )
         assert last_country < first_catch_all
 
@@ -758,9 +754,7 @@ class TestCloneEndpoint:
         assert all(e["status"] == "routing_failed" for e in routing)
         assert all("template rejected" in e["message"] for e in routing)
         # The clones themselves survived and the wizard still completed.
-        assert [e["status"] for e in events if e["status"] == "cloned"] == [
-            "cloned"
-        ] * 3
+        assert [e["status"] for e in events if e["status"] == "cloned"] == ["cloned"] * 3
         assert events[-1]["status"] == "done"
         assert events[-1]["rolled_back"] == []
 

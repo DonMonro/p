@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -87,8 +88,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=False,
         default=None,
         help=(
-            "SQLite DB path. Defaults to PSIPHON3XUI_DB_PATH env or "
-            "/opt/psiphon-3x-ui/panel.db."
+            "SQLite DB path. Defaults to PSIPHON3XUI_DB_PATH env or /opt/psiphon-3x-ui/panel.db."
         ),
     )
     p.add_argument(
@@ -210,9 +210,7 @@ async def _cleanup(db_path: str | None, *, dry_run: bool) -> dict[str, Any]:
             if not isinstance(template, dict):
                 raise ValueError("xraySetting did not decode to an object")
         except Exception as exc:  # noqa: BLE001
-            report["errors"].append(
-                f"read xray template: {type(exc).__name__}: {exc}"
-            )
+            report["errors"].append(f"read xray template: {type(exc).__name__}: {exc}")
             return report
 
         changed_codes = []
@@ -221,9 +219,7 @@ async def _cleanup(db_path: str | None, *, dry_run: bool) -> dict[str, Any]:
                 if strip_binding(template, code, None):
                     changed_codes.append(code)
             except Exception as exc:  # noqa: BLE001
-                report["errors"].append(
-                    f"strip_binding({code}): {type(exc).__name__}: {exc}"
-                )
+                report["errors"].append(f"strip_binding({code}): {type(exc).__name__}: {exc}")
 
         if changed_codes:
             try:
@@ -238,10 +234,8 @@ async def _cleanup(db_path: str | None, *, dry_run: bool) -> dict[str, Any]:
         else:
             report["countries"] = []
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await client.aclose()
-        except Exception:  # noqa: BLE001
-            pass
 
     return report
 
@@ -268,10 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         n_in = len(report["inbounds"])
         n_co = len(report["countries"])
-        print(
-            f"3x-ui cleanup: removed {n_in} inbound(s) "
-            f"{report['inbounds'] or ''}".rstrip()
-        )
+        print(f"3x-ui cleanup: removed {n_in} inbound(s) {report['inbounds'] or ''}".rstrip())
         print(
             f"3x-ui cleanup: removed outbound+routing rules for {n_co} "
             f"country/countries {report['countries'] or ''}".rstrip()

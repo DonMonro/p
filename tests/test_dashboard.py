@@ -805,8 +805,12 @@ class TestPatchCountryWithInbound:
         assert body["clone_result"]["error"] is None
         # xui_client.clone_inbound was invoked with the template_id we sent.
         assert FakeXuiClient.clone_inbound_calls == [
-            (17, {"code": "JP", "name": "United States", "flag": "🇺🇸"},
-             body["socks_port"], body["public_port"])
+            (
+                17,
+                {"code": "JP", "name": "United States", "flag": "🇺🇸"},
+                body["socks_port"],
+                body["public_port"],
+            )
         ]
         # DB row mirrors it.
         init_db()
@@ -834,7 +838,9 @@ class TestPatchCountryWithInbound:
         assert body["public_port"] >= 11050
 
     def test_enable_existing_assignment_with_inbound_applies_and_clones(
-        self, monkeypatch, tmp_path,
+        self,
+        monkeypatch,
+        tmp_path,
     ):
         """A country that ALREADY has a PortAssignment still runs
         apply_country + clone when enabled=true + inbound_id are sent; the
@@ -967,9 +973,7 @@ class TestRecloneCountry:
         from panel.psiphon import HealthProbeResult
         from panel.wizard import apply as apply_mod
 
-        monkeypatch.setattr(
-            apply_mod, "write_config", lambda *a, **k: Path("/tmp/fake.json")
-        )
+        monkeypatch.setattr(apply_mod, "write_config", lambda *a, **k: Path("/tmp/fake.json"))
         monkeypatch.setattr(apply_mod, "start_unit", lambda *a, **k: None)
         monkeypatch.setattr(apply_mod, "is_unit_active", lambda *a, **k: True)
         monkeypatch.setattr(
@@ -1100,9 +1104,7 @@ class TestRecloneCountry:
         r = client.post("/api/dashboard/countries/US/_reclone", json={})
         assert r.status_code == 422
         # bool rejected at the StrictInt schema level.
-        r = client.post(
-            "/api/dashboard/countries/US/_reclone", json={"inbound_id": True}
-        )
+        r = client.post("/api/dashboard/countries/US/_reclone", json={"inbound_id": True})
         assert r.status_code == 422
 
 
@@ -1699,9 +1701,7 @@ def _stub_listening_ports(monkeypatch, ports: set[int]):
     monkeypatch.setattr(dashboard_router, "listening_ports", _fake)
 
 
-def _stub_port_change_host(
-    monkeypatch, *, env=(True, "rewritten"), restart=(True, "")
-):
+def _stub_port_change_host(monkeypatch, *, env=(True, "rewritten"), restart=(True, "")):
     """Model a host where the port-change side effects succeed.
 
     Phase 28 (item 1, part 2) made the env-rewrite step an ABORT condition
@@ -1738,8 +1738,7 @@ class TestChangePanelPort:
             "the note must tell the operator where the panel is coming back"
         )
         assert "firewall" not in body["note"].lower(), (
-            "Phase 29 (item 3) — the note must not mention a firewall the "
-            "panel no longer touches."
+            "Phase 29 (item 3) — the note must not mention a firewall the panel no longer touches."
         )
 
         init_db()
@@ -1899,9 +1898,7 @@ class TestDashboardRoutingBinding:
     egressing on the server's own IP.
     """
 
-    def test_reenable_after_disable_restores_outbound_and_rule(
-        self, monkeypatch, tmp_path
-    ):
+    def test_reenable_after_disable_restores_outbound_and_rule(self, monkeypatch, tmp_path):
         """THE reported bug: disable then re-enable loses the routing binding.
 
         The disable branch calls remove_country_binding (stripping the outbound
@@ -1914,9 +1911,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=True)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _seed_xui_link()
         # 3x-ui handed this inbound a collision-suffixed tag, so a guessed
         # "in-31001-tcp" would bind a rule that matches nothing.
@@ -1927,9 +1922,7 @@ class TestDashboardRoutingBinding:
             {
                 "tag": "psiphon-out-US",
                 "protocol": "socks",
-                "settings": {
-                    "servers": [{"address": "127.0.0.1", "port": 11001, "users": []}]
-                },
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 11001, "users": []}]},
             }
         )
         FakeXuiClient.xray_template["routing"]["rules"].insert(
@@ -1976,9 +1969,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=False)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _seed_xui_link()
 
         r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
@@ -1994,9 +1985,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=False)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _seed_xui_link()
 
         r = client.patch("/api/dashboard/countries/US", json={"enabled": True})
@@ -2016,9 +2005,7 @@ class TestDashboardRoutingBinding:
         assert r.json()["enabled"] is True
         assert FakeXuiClient.xray_updates == []
 
-    def test_reenable_routing_failure_does_not_block_enable(
-        self, monkeypatch, tmp_path
-    ):
+    def test_reenable_routing_failure_does_not_block_enable(self, monkeypatch, tmp_path):
         """A routing failure is reported, never fatal - the inbound already
         exists, so unwinding the enable would strand the operator."""
         from panel.dashboard.xui_client import XuiClientError
@@ -2027,9 +2014,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=False)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _seed_xui_link()
         FakeXuiClient.xray_get_raises = XuiClientError
 
@@ -2039,9 +2024,7 @@ class TestDashboardRoutingBinding:
         assert r.json()["routing_result"]["applied"] is False
         assert r.json()["routing_result"]["error"]
 
-    def test_reenable_falls_back_to_derived_tag_when_get_inbound_fails(
-        self, monkeypatch, tmp_path
-    ):
+    def test_reenable_falls_back_to_derived_tag_when_get_inbound_fails(self, monkeypatch, tmp_path):
         """If the tag cannot be read, still bind rather than skipping entirely -
         a derived tag is a guess, but no rule at all is a guaranteed failure."""
         from panel.dashboard.xui_client import XuiClientError
@@ -2050,9 +2033,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=False)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _seed_xui_link()
         FakeXuiClient.get_inbound_raises = XuiClientError
 
@@ -2069,9 +2050,7 @@ class TestDashboardRoutingBinding:
         _login(client)
         _seed_country(code="US", enabled=True)
         _seed_assignment(code="US", socks_port=11001, public_port=31001)
-        _seed_clone(
-            country_code="US", inbound_id=31001, socks_port=11001, public_port=31001
-        )
+        _seed_clone(country_code="US", inbound_id=31001, socks_port=11001, public_port=31001)
         _set_wizard_step_data({"template": {"template_inbound_id": 17}})
         _seed_xui_link()
         FakeXuiClient.clone_inbound_result = {"id": 31002, "tag": "in-31099-tcp"}
@@ -2223,11 +2202,7 @@ class TestPingCountry:
         client = _seed_us_full(monkeypatch, tmp_path)
         _stub_ping(
             monkeypatch,
-            {
-                11001: TunnelPingResult(
-                    ok=False, detail="tunnel refused CONNECT: host unreachable"
-                )
-            },
+            {11001: TunnelPingResult(ok=False, detail="tunnel refused CONNECT: host unreachable")},
         )
 
         r = client.post("/api/dashboard/countries/US/_ping")

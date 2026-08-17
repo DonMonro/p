@@ -7,7 +7,6 @@ and routing rules this panel created, leaving everything else in 3x-ui intact.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm import Session
@@ -20,6 +19,7 @@ def _isolated_env(tmp_path, monkeypatch) -> None:
     """Isolate the DB per test. Mirrors tests/test_dashboard.py."""
     monkeypatch.setenv("PSIPHON3XUI_DB_PATH", str(tmp_path / "panel.db"))
     from panel import config, db
+
     config.get_settings.cache_clear()
     config.load_countries.cache_clear()
     db._engine = None  # noqa: SLF001
@@ -304,9 +304,7 @@ async def test_leaves_countries_with_no_outbound_unchanged(monkeypatch, tmp_path
 # ===========================================================================
 class TestPhase29UninstallCredentialDecryption:
     @pytest.mark.asyncio
-    async def test_wrong_session_secret_reports_a_decrypt_failure(
-        self, monkeypatch, tmp_path
-    ):
+    async def test_wrong_session_secret_reports_a_decrypt_failure(self, monkeypatch, tmp_path):
         """A row that exists but won't decrypt must say WHY, not "no creds".
 
         This is the exact production failure: the row was fine, the secret was
@@ -343,9 +341,7 @@ class TestPhase29UninstallCredentialDecryption:
         assert FakeUninstallClient.deleted_inbounds == []
 
     @pytest.mark.asyncio
-    async def test_correct_session_secret_deletes_everything(
-        self, monkeypatch, tmp_path
-    ):
+    async def test_correct_session_secret_deletes_everything(self, monkeypatch, tmp_path):
         """With the env var loaded, the same DB cleans up completely.
 
         The positive control for the test above: identical fixtures, only the
@@ -367,9 +363,7 @@ class TestPhase29UninstallCredentialDecryption:
                 {"tag": "psiphon-out-US", "protocol": "socks"},
             ],
             "routing": {
-                "rules": [
-                    {"inboundTag": ["in-31001-tcp"], "outboundTag": "psiphon-out-US"}
-                ]
+                "rules": [{"inboundTag": ["in-31001-tcp"], "outboundTag": "psiphon-out-US"}]
             },
         }
 
@@ -383,9 +377,7 @@ class TestPhase29UninstallCredentialDecryption:
         assert final["routing"]["rules"] == []
 
     @pytest.mark.asyncio
-    async def test_empty_password_column_is_reported_separately(
-        self, monkeypatch, tmp_path
-    ):
+    async def test_empty_password_column_is_reported_separately(self, monkeypatch, tmp_path):
         """An actually-empty password_enc keeps the "no cached credentials" text.
 
         The two failures need distinguishable messages or the diagnostic value
@@ -431,4 +423,3 @@ class TestPhase29UninstallCredentialDecryption:
             f"stdout={captured.out!r} stderr={captured.err!r}"
         )
         assert "3x-ui" in captured.err
-

@@ -41,6 +41,14 @@
       --pico-primary-hover-border: var(--no-accent-hi);
     }
 
+    /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
+       root font-size scales every component proportionally. */
+    html { font-size: 14.5px; }
+
+    /* Full-bleed layout: override Pico's centered .container max-width so the
+       dashboard uses the entire viewport with only a hair of breathing room. */
+    main.container { max-width: none; width: 100%; padding-inline: 1rem; }
+
     body {
       background: linear-gradient(180deg, var(--no-bg) 0%, var(--no-bg-2) 100%);
       background-attachment: fixed;
@@ -157,6 +165,10 @@
     table#countries td[data-col="name"] { white-space: normal; }
     table#countries td[data-col="actions"] { white-space: normal; }
     table#countries button { margin: .1rem .15rem; }
+    /* Actions-cell buttons are dense (4 per row) — keep them compact. */
+    table#countries td[data-col="actions"] button {
+      font-size: .72rem; padding: .3rem .6rem; letter-spacing: .01em;
+    }
     table#countries code {
       background: var(--no-input); border: 1px solid var(--no-hairline);
       border-radius: 6px; padding: .1rem .35rem; color: var(--no-accent-hi); font-size: .85em;
@@ -313,8 +325,8 @@
         <tbody :class="{ busy: busy.countries }">
           <template x-for="c in countries" :key="c.code">
             <tr>
-              <td><span class="country-flag" x-text="c.flag"></span><code x-text="c.code"></code></td>
-              <td data-col="name" x-text="c.name"></td>
+              <td><code x-text="c.code"></code></td>
+              <td data-col="name"><span class="country-flag" x-text="c.flag"></span><span x-text="c.name"></span></td>
               <td>
                 <input type="checkbox" :checked="c.enabled"
                        @change="toggleEnabled(c, $event.target.checked)">

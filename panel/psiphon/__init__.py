@@ -127,9 +127,7 @@ _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS: tuple[str, ...] = (
 # signature, base64-encoded (~716 chars including '=' padding). The full
 # value is below as a single string literal (PEM-style line breaks inside
 # JSON would corrupt tunnel-core's parsing, so we keep it on one line).
-_PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY = (
-    "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM="
-)
+_PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY = "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM="
 
 # Ed25519 server-entry signature pubkey (44 chars base64) — also universal
 # across every public Psiphon client binary.
@@ -225,9 +223,7 @@ def _looks_like_placeholder(name: str, value: str) -> str | None:
     if name == "PSIPHON_PROPAGATION_CHANNEL_ID" and _is_all_hex_repeat("F", value):
         return "is the all-FF placeholder (32 × 'F') — replace with your real Psiphon-Inc PropagationChannelId (or unset the env var to use the panel's baked-in public-bootstrap default)"
     if name == "PSIPHON_SPONSOR_ID" and _is_all_hex_repeat("0", value):
-        return (
-            "is the all-zero placeholder (16 × '0') — replace with your real Psiphon-Inc SponsorId (or unset the env var to use the panel's baked-in public-bootstrap default)"
-        )
+        return "is the all-zero placeholder (16 × '0') — replace with your real Psiphon-Inc SponsorId (or unset the env var to use the panel's baked-in public-bootstrap default)"
     if name == "PSIPHON_REMOTE_SERVER_LIST_URL" and not value.startswith(("https://", "http://")):
         return "is not an http(s):// URL — Psiphon Inc. publishes a well-known S3 mirror (or unset the env var to use the panel's baked-in 4-mirror public-bootstrap default)"
     return None
@@ -710,9 +706,7 @@ def tunnel_ping(
     """
     port = int(socks_port)
     if not (1024 <= port <= 65535):
-        return TunnelPingResult(
-            ok=False, detail=f"socks_port {port} out of range [1024, 65535]"
-        )
+        return TunnelPingResult(ok=False, detail=f"socks_port {port} out of range [1024, 65535]")
 
     target = target_host.encode("idna") if target_host else b""
     if not target or len(target) > 255:
@@ -738,9 +732,7 @@ def tunnel_ping(
             sock.sendall(bytes([0x05, 0x01, 0x00]))
             greeting = sock.recv(2)
             if len(greeting) < 2 or greeting[0] != 0x05:
-                return TunnelPingResult(
-                    ok=False, detail="SOCKS5 negotiation failed (bad greeting)"
-                )
+                return TunnelPingResult(ok=False, detail="SOCKS5 negotiation failed (bad greeting)")
             if greeting[1] == 0xFF:
                 return TunnelPingResult(
                     ok=False, detail="listener refused all offered SOCKS5 methods"
@@ -764,9 +756,7 @@ def tunnel_ping(
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
         if len(reply) < 2:
-            return TunnelPingResult(
-                ok=False, detail=f"short CONNECT reply ({len(reply)} bytes)"
-            )
+            return TunnelPingResult(ok=False, detail=f"short CONNECT reply ({len(reply)} bytes)")
         code = reply[1]
         if code != 0x00:
             return TunnelPingResult(

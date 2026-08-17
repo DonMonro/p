@@ -176,9 +176,13 @@ def test_build_clone_payload_preserves_non_empty_template_clients_verbatim(templ
         "subId": "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
         "reset": 0,
     }
-    template_with_clients = {**template_json, "settings": {
-        **template_json["settings"], "clients": [existing_client],
-    }}
+    template_with_clients = {
+        **template_json,
+        "settings": {
+            **template_json["settings"],
+            "clients": [existing_client],
+        },
+    }
     p = _build_clone_payload(
         template=template_with_clients,
         protocol="vless",
@@ -466,9 +470,7 @@ async def test_base_url_normalisation_strips_panel_SPA_route():
         password="p",
     )
     assert c3.base_url == "http://3x-ui.test/WSCM6EhC9pO6T9K0RA/"
-    assert c3.base_url + "login" == (
-        "http://3x-ui.test/WSCM6EhC9pO6T9K0RA/login"
-    )
+    assert c3.base_url + "login" == ("http://3x-ui.test/WSCM6EhC9pO6T9K0RA/login")
     assert c3.base_url + "panel/api/inbounds/list" == (
         "http://3x-ui.test/WSCM6EhC9pO6T9K0RA/panel/api/inbounds/list"
     )
@@ -614,9 +616,7 @@ async def test_get_xray_setting_handles_empty_obj_string(client: XuiClient):
         cookies={"session": "test-session"},
     )
 
-    respx.post(BASE + "panel/api/xray/").respond(
-        json={"success": True, "msg": "", "obj": "   "}
-    )
+    respx.post(BASE + "panel/api/xray/").respond(json={"success": True, "msg": "", "obj": "   "})
 
     result = await client.get_xray_setting()
     assert result == {}
@@ -632,9 +632,7 @@ async def test_update_xray_setting_posts_form_data(client: XuiClient):
     )
 
     template = {"log": {"loglevel": "debug"}, "outbounds": [], "routing": {"rules": []}}
-    respx.post(BASE + "panel/api/xray/update").respond(
-        json={"success": True, "msg": ""}
-    )
+    respx.post(BASE + "panel/api/xray/update").respond(json={"success": True, "msg": ""})
 
     await client.update_xray_setting(json.dumps(template, indent=2))
 

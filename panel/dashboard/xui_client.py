@@ -319,9 +319,7 @@ class XuiClient:
             try:
                 obj = json.loads(obj)
             except (TypeError, ValueError) as exc:
-                raise XuiClientError(
-                    f"get_xray_setting: obj is not valid JSON: {exc}"
-                ) from exc
+                raise XuiClientError(f"get_xray_setting: obj is not valid JSON: {exc}") from exc
         if obj is None:
             return {}
         if not isinstance(obj, dict):

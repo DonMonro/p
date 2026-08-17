@@ -41,6 +41,14 @@
       --pico-primary-hover-border: var(--no-accent-hi);
     }
 
+    /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
+       root font-size scales every component proportionally. */
+    html { font-size: 14.5px; }
+
+    /* Full-bleed layout: override Pico's centered .container max-width so the
+       wizard uses the entire viewport with only a hair of breathing room. */
+    main.container { max-width: none; width: 100%; padding-inline: 1rem; }
+
     body {
       background: linear-gradient(180deg, var(--no-bg) 0%, var(--no-bg-2) 100%);
       background-attachment: fixed;
@@ -114,6 +122,9 @@
     }
     select:focus { border-color: var(--no-accent-hi); box-shadow: 0 0 0 3px var(--no-accent-soft); outline: none; }
     small { color: var(--no-text-2); }
+    /* Hint text that belongs on its own line below a radio/checkbox label —
+       keeps multi-clause option descriptions from running into the title. */
+    small.hint-below { display: block; margin-top: .35rem; line-height: 1.45; }
     hr { border-color: var(--no-hairline); opacity: 1; }
     code { background: var(--no-input); border: 1px solid var(--no-hairline);
            border-radius: 6px; padding: .1rem .35rem; color: var(--no-accent-hi); font-size: .85em; }
@@ -148,6 +159,29 @@
                                              background: rgba(37,99,235,.10); }
     .country-grid input:disabled + span { opacity: .5; }
     .country-flag { margin-right: .25rem; }
+
+    /* ── Resource warning (banner + confirmation modal) ──────── */
+    .warn-banner { display: flex; gap: .6rem; align-items: flex-start;
+                   background: rgba(245,158,11,.08); border: 1px solid rgba(245,158,11,.45);
+                   border-radius: var(--no-radius-ctl); padding: .7rem .9rem;
+                   margin: 0 0 1rem; color: var(--no-text);
+                   font-size: .85rem; line-height: 1.5; }
+    .warn-banner .warn-icon { flex: 0 0 auto; font-size: 1.05rem; line-height: 1.3; }
+    .warn-banner strong { color: var(--no-warn); }
+
+    .modal-backdrop { position: fixed; inset: 0; z-index: 20;
+                      background: rgba(4,6,10,.72); backdrop-filter: blur(3px);
+                      display: flex; align-items: center; justify-content: center;
+                      padding: 1rem; }
+    .modal-card { width: min(34rem, 100%); margin: 0;
+                  background: linear-gradient(180deg, var(--no-surface-2), var(--no-surface));
+                  border: 1px solid rgba(245,158,11,.45);
+                  border-radius: var(--no-radius-card);
+                  padding: 1.5rem 1.75rem; box-shadow: 0 24px 64px rgba(0,0,0,.6); }
+    .modal-card h4 { display: flex; gap: .5rem; align-items: center;
+                     color: var(--no-warn); font-size: 1.05rem; font-weight: 700; margin: 0 0 .6rem; }
+    .modal-card p { color: var(--no-text); font-size: .9rem; line-height: 1.6; margin-bottom: 1.1rem; }
+    .modal-actions { display: flex; gap: .6rem; justify-content: flex-end; margin: 0; }
 
     /* ── SSE progress logs ───────────────────────────────────── */
     pre.log { max-height: 22rem; overflow: auto; background: var(--no-console); color: #D7DEE8;
@@ -236,6 +270,10 @@
     <!-- ─────────────────────────  Step: countries  ──────────────── -->
     <article x-show="state.current_step === 'countries'">
       <h3 x-text="titleFor('countries')"></h3>
+      <div class="warn-banner">
+        <span class="warn-icon">⚠️</span>
+        <span><strong>Warning:</strong> <span x-text="resourceWarningText()"></span></span>
+      </div>
       <p>Choose which countries the panel should expose egress for. You can enable all or hand-pick a subset.</p>
       <fieldset :disabled="busy">
         <label>
@@ -255,8 +293,8 @@
           <label>
             <input type="checkbox" :value="c.code" x-model="form.countries.codes"
                    :disabled="form.countries.mode !== 'specific'">
-            <span><span class="country-flag" x-text="c.flag"></span>
-                  <code x-text="c.code"></code> · <span x-text="c.name"></span></span>
+            <span><code x-text="c.code"></code>
+                  <span class="country-flag" x-text="c.flag"></span><span x-text="c.name"></span></span>
           </label>
         </template>
       </div>
@@ -264,7 +302,7 @@
         <small x-text="`${form.countries.codes.length} of ${countryCatalog.length} selected`"></small>
       </p>
 
-      <button @click.prevent="submitCountries()" :disabled="busy">Continue → ports</button>
+      <button @click.prevent="confirmCountries()" :disabled="busy">Continue → ports</button>
     </article>
 
     <!-- ─────────────────────────  Step: ports  ───────────────────── -->
@@ -284,7 +322,7 @@
           <input type="radio" name="portAssign" value="shared_range"
                  x-model="form.ports.assignment">
           Shared ranges — every country re-uses one socks+public pair
-          <small>(only useful if the panel is fronted by a load-balancer)</small>
+          <small class="hint-below">(only useful if the panel is fronted by a load-balancer)</small>
         </label>
 
         <hr>
@@ -424,6 +462,19 @@
          rotate the admin password and change the panel's port.</p>
       <button @click.prevent="goToDashboard()">Open the Management Dashboard →</button>
     </article>
+
+    <!-- ───────────  Resource warning modal (countries step)  ──────── -->
+    <div class="modal-backdrop" x-show="warnModal.open" x-cloak
+         @keydown.escape.window="warnModal.open = false">
+      <article class="modal-card" @click.outside="warnModal.open = false">
+        <h4>⚠️ Resource warning</h4>
+        <p x-text="resourceWarningText()"></p>
+        <div class="modal-actions">
+          <button class="secondary" @click.prevent="warnModal.open = false">Cancel</button>
+          <button @click.prevent="acceptWarning()">I understand — continue</button>
+        </div>
+      </article>
+    </div>
   </main>
 
   <!-- Alpine.js pulls the same minimal build used by the dashboard/login SPAs -->
@@ -461,6 +512,11 @@
 
         busy: false,
         toast: { text: "", kind: "ok" },
+
+        // Resource-warning confirmation gate for the countries step. The
+        // Continue button opens the modal; only "I understand — continue"
+        // (acceptWarning) runs the real submitCountries() POST.
+        warnModal: { open: false },
 
         // Per-step form models. Initialized to empty defaults; repopulated
         // from state.step_data on each refreshState() so a page reload does
@@ -580,6 +636,41 @@
           } catch (e) {
             this.notify(`failed to load country catalog: ${e.message}`, "err");
           }
+        },
+
+        // ── Resource-warning gate (countries step) ─────────────────
+        // One Psiphon tunnel per country ≈ 1 CPU core + 150 MB RAM, so the
+        // operator must acknowledge the footprint of their selection before
+        // the wizard proceeds. Counts are derived from the live selection:
+        // "all" mode uses the catalog length, "specific" the checked codes.
+        selectedCountryCount() {
+          return this.form.countries.mode === "specific"
+            ? this.form.countries.codes.length
+            : this.countryCatalog.length;
+        },
+
+        resourceWarningText() {
+          const n = this.selectedCountryCount();
+          const cores = n === 1 ? "1 CPU core" : `${n} CPU cores`;
+          return `Activating ${n} ${n === 1 ? "country" : "countries"} requires ` +
+                 `${cores} and ${n * 150} MB of RAM, so only activate the ` +
+                 `required countries to prevent server instability.`;
+        },
+
+        // Continue button → open the confirmation modal instead of posting.
+        confirmCountries() {
+          if (this.busy) return;
+          if (this.form.countries.mode === "specific" && !this.form.countries.codes.length) {
+            this.notify("select at least one country first", "err");
+            return;
+          }
+          this.warnModal.open = true;
+        },
+
+        // Modal "I understand" → close the popup and run the real submit.
+        acceptWarning() {
+          this.warnModal.open = false;
+          this.submitCountries();
         },
 
         // POST /api/wizard/countries

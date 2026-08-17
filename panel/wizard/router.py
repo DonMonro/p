@@ -63,11 +63,11 @@ from .clone import (
     clone_country,
 )
 from .ports import (
+    PUBLIC_PORT_FLOOR,
+    SOCKS_PORT_FLOOR,
     NoFreeRangeError,
     PortRange,
     PortRangeError,
-    SOCKS_PORT_FLOOR,
-    PUBLIC_PORT_FLOOR,
     WizardPortsInput,
     _listening_ports_sync,
     recommend_port_range,
@@ -1249,9 +1249,7 @@ async def submit_clone(
             # pass ONLY the actual clone events (filtering out the Hotfix #9
             # routing records appended above) so the rollback logic still
             # counts the real clone outcomes.
-            clone_outcomes = [
-                e for e in events if e.status in ("cloned", "failed")
-            ]
+            clone_outcomes = [e for e in events if e.status in ("cloned", "failed")]
             _, rolled_back = await _rollback_on_failure(
                 events=clone_outcomes,
                 db=db,

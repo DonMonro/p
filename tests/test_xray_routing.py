@@ -33,11 +33,7 @@ class TestSocksOutboundFor:
         assert out == {
             "tag": "psiphon-out-US",
             "protocol": "socks",
-            "settings": {
-                "servers": [
-                    {"address": "127.0.0.1", "port": 11001, "users": []}
-                ]
-            },
+            "settings": {"servers": [{"address": "127.0.0.1", "port": 11001, "users": []}]},
         }
 
     def test_different_port(self):
@@ -160,9 +156,7 @@ class TestUpsertBinding:
             xray_routing.upsert_binding(template, "US", 11001, tag)
 
         us_rules = [
-            r
-            for r in template["routing"]["rules"]
-            if r.get("outboundTag") == "psiphon-out-US"
+            r for r in template["routing"]["rules"] if r.get("outboundTag") == "psiphon-out-US"
         ]
         assert len(us_rules) == 1, f"stale rules left behind: {us_rules}"
         assert us_rules[0]["inboundTag"] == ["in-30001-tcpudp"]
@@ -262,7 +256,11 @@ class TestStripBinding:
         template = {
             "routing": {
                 "rules": [
-                    {"type": "field", "inboundTag": ["in-30001-tcp"], "outboundTag": "psiphon-out-US"},
+                    {
+                        "type": "field",
+                        "inboundTag": ["in-30001-tcp"],
+                        "outboundTag": "psiphon-out-US",
+                    },
                     {"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"},
                 ]
             }
@@ -276,8 +274,16 @@ class TestStripBinding:
         template = {
             "routing": {
                 "rules": [
-                    {"type": "field", "inboundTag": ["in-30001-tcp"], "outboundTag": "psiphon-out-US"},
-                    {"type": "field", "inboundTag": ["in-30002-tcp"], "outboundTag": "psiphon-out-US"},
+                    {
+                        "type": "field",
+                        "inboundTag": ["in-30001-tcp"],
+                        "outboundTag": "psiphon-out-US",
+                    },
+                    {
+                        "type": "field",
+                        "inboundTag": ["in-30002-tcp"],
+                        "outboundTag": "psiphon-out-US",
+                    },
                 ]
             }
         }
@@ -290,7 +296,9 @@ class TestStripBinding:
     def test_second_call_is_no_op(self):
         template = {
             "outbounds": [{"tag": "psiphon-out-US", "protocol": "socks"}],
-            "routing": {"rules": [{"outboundTag": "psiphon-out-US", "inboundTag": ["in-30001-tcp"]}]},
+            "routing": {
+                "rules": [{"outboundTag": "psiphon-out-US", "inboundTag": ["in-30001-tcp"]}]
+            },
         }
         xray_routing.strip_binding(template, "US")
         changed = xray_routing.strip_binding(template, "US")

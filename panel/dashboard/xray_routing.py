@@ -193,16 +193,12 @@ def upsert_binding(
     # and would hijack traffic if its now-dead inbound tag is later reissued
     # to a different country. Collapse to exactly one rule per country.
     existing = [
-        i
-        for i, r in enumerate(rules)
-        if isinstance(r, dict) and r.get("outboundTag") == out_tag
+        i for i, r in enumerate(rules) if isinstance(r, dict) and r.get("outboundTag") == out_tag
     ]
     if not (len(existing) == 1 and rules[existing[0]] == new_rule):
         for i in reversed(existing):
             del rules[i]
-        insert_at = next(
-            (i for i, r in enumerate(rules) if _is_catch_all(r)), len(rules)
-        )
+        insert_at = next((i for i, r in enumerate(rules) if _is_catch_all(r)), len(rules))
         rules.insert(insert_at, new_rule)
         changed = True
 
@@ -229,11 +225,7 @@ def strip_binding(
 
     outbounds = template.get("outbounds")
     if isinstance(outbounds, list):
-        kept = [
-            ob
-            for ob in outbounds
-            if not (isinstance(ob, dict) and ob.get("tag") == out_tag)
-        ]
+        kept = [ob for ob in outbounds if not (isinstance(ob, dict) and ob.get("tag") == out_tag)]
         if len(kept) != len(outbounds):
             template["outbounds"] = kept
             changed = True
@@ -251,8 +243,7 @@ def strip_binding(
                     and (
                         inbound_tag is None
                         or (
-                            isinstance(r.get("inboundTag"), list)
-                            and inbound_tag in r["inboundTag"]
+                            isinstance(r.get("inboundTag"), list) and inbound_tag in r["inboundTag"]
                         )
                     )
                 )

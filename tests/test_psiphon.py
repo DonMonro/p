@@ -314,6 +314,7 @@ class TestPsiphonCredentialErrorRegressions:
         cfg = render_config("US", 1080)
         # The baked-in default for the sig-pubkey is the RSA-2048 SPKI (~716 chars).
         from panel.psiphon import _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
+
         assert (
             cfg["RemoteServerListSignaturePublicKey"]
             == _PUBLIC_REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY
@@ -431,10 +432,7 @@ class TestPublicBootstrapDefaults:
             == "sHuUVTWaRyh5pZwy4UguSgkwmBe0EHtJJkoF5WrxmvA="
         )
         # ExchangeObfuscationKey is the ~44-char handshake obfuscation seed.
-        assert (
-            _PUBLIC_EXCHANGE_OBFUSCATION_KEY
-            == "DpXzloJk1Hw6aSzmKKky0xcahsEHubch81Mi6K0XMlU="
-        )
+        assert _PUBLIC_EXCHANGE_OBFUSCATION_KEY == "DpXzloJk1Hw6aSzmKKky0xcahsEHubch81Mi6K0XMlU="
 
     def test_render_config_no_env_uses_public_bootstrap_defaults(self):
         """With every PSIPHON_* env var UNSET, render_config() must produce a
@@ -471,6 +469,7 @@ class TestPublicBootstrapDefaults:
         assert isinstance(urls, list)
         assert len(urls) == 4
         from panel.psiphon import _PUBLIC_REMOTE_SERVER_LIST_URLS  # noqa: PLC0415
+
         for entry, raw_url in zip(urls, _PUBLIC_REMOTE_SERVER_LIST_URLS, strict=True):
             assert isinstance(entry, dict)
             assert entry["URL"] == base64.b64encode(raw_url.encode()).decode()
@@ -496,6 +495,7 @@ class TestPublicBootstrapDefaults:
             _PUBLIC_OBFUSCATED_SERVER_LIST_ROOT_URLS,
             _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY,
         )
+
         assert cfg["ServerEntrySignaturePublicKey"] == _PUBLIC_SERVER_ENTRY_SIGNATURE_PUBLIC_KEY
         assert cfg["ExchangeObfuscationKey"] == _PUBLIC_EXCHANGE_OBFUSCATION_KEY
         # The obfuscated-roots array round-trips as TransferURL dicts wrapped over
@@ -847,7 +847,7 @@ def test_tunnel_ping_connect_failure_returns_ok_false():
 
 
 def test_tunnel_ping_negotiation_failure():
-    sock = _ScriptedSocket(replies=[b"\x05\xFF"])  # refused all methods
+    sock = _ScriptedSocket(replies=[b"\x05\xff"])  # refused all methods
     result = tunnel_ping(11001, _sock_factory=lambda: sock)
     assert result.ok is False
     assert "refused all offered" in result.detail
