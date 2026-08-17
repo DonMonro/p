@@ -43,7 +43,7 @@
 
     /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
        root font-size scales every component proportionally. */
-    html { font-size: 15.5px; }
+    html { font-size: 16.5px; }
 
     /* Full-bleed layout: override Pico's centered .container max-width so the
        wizard uses the entire viewport with only a hair of breathing room. */
@@ -161,7 +161,14 @@
     .country-grid label:has(input:checked) { border-color: var(--no-accent-hi);
                                              background: rgba(37,99,235,.10); }
     .country-grid input:disabled + span { opacity: .5; }
-    .country-flag { margin-right: .25rem; }
+    /* Flags are small PNGs (flagcdn.com) because emoji flag glyphs don't
+       render on most Linux servers' font stacks — the operator saw the raw
+       regional-indicator symbols instead. Emoji stays as alt text. */
+    .country-flag {
+      width: 1.5rem; height: 1rem; object-fit: cover; border-radius: 3px;
+      margin-right: .4rem; vertical-align: -0.15em;
+      box-shadow: 0 0 0 1px var(--no-hairline);
+    }
 
     /* ── Resource warning (banner + confirmation modal) ──────── */
     .warn-banner { display: flex; gap: .6rem; align-items: flex-start;
@@ -298,7 +305,7 @@
             <input type="checkbox" :value="c.code" x-model="form.countries.codes"
                    :disabled="form.countries.mode !== 'specific'">
             <span><code x-text="c.code"></code>
-                  <span class="country-flag" x-text="c.flag"></span><span x-text="c.name"></span></span>
+                  <img class="country-flag" :src="'https://flagcdn.com/w40/' + c.code.toLowerCase() + '.png'" :alt="c.flag"><span x-text="c.name"></span></span>
           </label>
         </template>
       </div>

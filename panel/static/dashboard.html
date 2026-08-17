@@ -43,7 +43,7 @@
 
     /* Slightly reduce the overall scale — Pico is rem-based, so lowering the
        root font-size scales every component proportionally. */
-    html { font-size: 15.5px; }
+    html { font-size: 16.5px; }
 
     /* Full-bleed layout: override Pico's centered .container max-width so the
        dashboard uses the entire viewport with only a hair of breathing room. */
@@ -131,7 +131,15 @@
     .card p { color: var(--no-text-2); line-height: 1.55; }
 
     /* ── Countries table ─────────────────────────────────────── */
-    .country-flag { margin-right: .35rem; }
+    /* Flags are small PNGs (flagcdn.com, same jsDelivr-class CDN as the rest
+       of the page) because emoji flag glyphs don't render on most Linux
+       servers' font stacks — the operator saw the raw regional-indicator
+       symbols instead. The emoji stays as alt text / broken-image fallback. */
+    .country-flag {
+      width: 1.5rem; height: 1rem; object-fit: cover; border-radius: 3px;
+      margin-right: .45rem; vertical-align: -0.15em;
+      box-shadow: 0 0 0 1px var(--no-hairline);
+    }
     /* Status badges — pills per the Night-Ops design language */
     .healthy-badge {
       color: var(--no-ok); font-weight: 600; font-size: .75rem;
@@ -357,7 +365,7 @@
           <tbody :class="{ busy: busy.countries }">
             <tr>
               <td><code x-text="c.code"></code></td>
-              <td data-col="name"><span class="country-flag" x-text="c.flag"></span><span x-text="c.name"></span></td>
+              <td data-col="name"><img class="country-flag" :src="'https://flagcdn.com/w40/' + c.code.toLowerCase() + '.png'" :alt="c.flag"><span x-text="c.name"></span></td>
               <td>
                 <input type="checkbox" :checked="c.enabled"
                        @change="toggleEnabled(c, $event.target.checked)">
