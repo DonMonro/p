@@ -34,9 +34,14 @@
 > (exposing only local SOCKS proxies) if `3x-ui` is absent.
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh) \
-  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh)
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/latest/install.sh) \
+  || sudo bash <(wget -qO- https://raw.githubusercontent.com/DonMonro/p/latest/install.sh)
 ```
+
+> The `latest` tag always points at the newest release, so this one-liner needs
+> no version number. (It is a *moving* tag, re-pointed at each release — see the
+> release procedure below. Pin a specific version with `…/p/v1.0.1/install.sh`
+> if you need a reproducible install.)
 
 The installer will:
 - Install system dependencies (Python venv, `git`, `golang-go`, `jq`, `curl`, …). The installer does **not** manage a host firewall.
@@ -81,7 +86,7 @@ to stop and remove the install:
 # operator never downloaded install.sh to disk (the canonical Psiphon-3X-UI
 # install route is `bash <(curl -sL …install.sh)`). Pass `--uninstall` as
 # the first arg to the resulting shell:
-sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.1/install.sh) --uninstall
+sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/latest/install.sh) --uninstall
 # → Type "yes" to confirm: the panel service + /opt/psiphon-3x-ui are removed.
 #   3x-ui's own inbounds installed through it are NOT touched — you must
 #   delete them from 3x-ui manually.
@@ -331,17 +336,20 @@ for the override-format details + the placeholder-rejector rules.
 
 We tag releases following the [Phase 7 — tag v1.0.0 + GitHub Release + SHA256 manifest](plans/ROADMAP.md) procedure:
 
-1. Update `panel/main.py`'s `app.version` to the new release number (`vMAJOR.MINOR.PATCH`).
+1. Bump the version pin in `install.sh` (`REPO_REF`) **and** `pyproject.toml`
+   (`version`) to the new release number — in the same commit as the tag, so the
+   served `install.sh` and the helpers it clones always come from one commit
+   (the version-skew guard).
 2. Run all four validation gates (above) locally — they must be green.
-3. Tag the commit: `git tag -s vMAJOR.MINOR.PATCH` (signed).
-4. Push the tag: `git push --tags`.
-5. Generate the SHA256 manifest of the shipped artefacts:
+3. Commit, push `main`, then tag the commit: `git tag vMAJOR.MINOR.PATCH`.
+4. Push the tag: `git push origin vMAJOR.MINOR.PATCH` (this fires the release
+   workflow, which builds the wheel and attaches it + `sha256.txt` to the
+   GitHub Release).
+5. Move the `latest` tag to the new release so the version-free one-liner
+   keeps working:
    ```bash
-   sha256sum install.sh installer/*.sh panel/i18n/*.json \
-       > release-artifacts.sha256
+   git tag -f latest vMAJOR.MINOR.PATCH && git push -f origin latest
    ```
-6. Create a GitHub Release from the tag, attach `release-artifacts.sha256`,
-   and paste the Phase-N summary from this README's "Project status" table.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the codebase layout and
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for common install-time
