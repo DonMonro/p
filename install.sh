@@ -52,18 +52,14 @@ REPO_URL="https://github.com/DonMonro/p.git"
 # so the operator's workflow stays "push a commit → re-run the installer →
 # the new code is installed" — no tag or release needed to test a change.
 #
-# History: this used to be pinned to a release tag (v1.1.0) so a tagged
-# install.sh could never source helpers from a different commit. That
-# protected public tagged installs but froze every install at the tag,
-# forcing a new release just to ship a one-line fix. For this repo's
-# single-operator workflow the pin was pure friction, so the default is
-# back to `main`.
+# History: this used to be pinned to a release tag so a tagged install.sh
+# could never source helpers from a different commit. That protected public
+# tagged installs but froze every install at the tag, forcing a new release
+# just to ship a one-line fix. For this repo's single-operator workflow the
+# pin was pure friction, so the default is back to `main`. The release tags
+# were deleted in 2026-08 — installs always track main now.
 #
-# A reproducible / version-pinned install is still one env var away:
-#   PSIPHON3XUI_REPO_REF=v1.1.0 sudo bash install.sh
-# (The v1.0.0-era skew bug — a tagged script sourcing helpers that main no
-# longer shipped — cannot recur for tagged installs as long as the tag's own
-# install.sh keeps its baked-in pin; only THIS main-branch copy is unpinned.)
+# PSIPHON3XUI_REPO_REF=<branch> overrides the cloned ref for testing.
 REPO_REF="${PSIPHON3XUI_REPO_REF:-main}"
 LOG_FILE="${INSTALL_PREFIX}/install.log"
 PSIPHON3XUI_USER="${PSIPHON3XUI_USER:-psiphon3xui}"
@@ -186,17 +182,14 @@ ensure_helpers_present() {
         fi
         # Clone REPO_REF. On the main branch that defaults to `main` itself —
         # the "push a commit → re-run the installer → new code" workflow.
-        # A TAGGED install.sh keeps its own baked-in pin instead, so a tagged
-        # script always sources helpers from the same commit it came from.
         #
-        # Why the pin exists at all: this clone used to be unpinned for
-        # everyone, which silently mixed versions — a tagged install.sh would
-        # source helpers from whatever the default branch happened to be.
-        # Deleting installer/firewall.sh in Phase 29 made every `v1.0.0`
+        # History: this clone was once pinned per release tag so a tagged
+        # install.sh could never source helpers from a different commit.
+        # Deleting installer/firewall.sh in Phase 29 made every pinned
         # install abort with "installer/firewall.sh: No such file or
         # directory" — a tagged script looking for a file that tag still
-        # lists but main no longer ships. The fix baked each tag's pin into
-        # its own install.sh; only the main-branch copy is unpinned again.
+        # listed but main no longer shipped. The tags were deleted in
+        # 2026-08, so installs always track main now.
         #
         # PSIPHON3XUI_REPO_REF overrides the ref for testing a branch. A ref
         # that does not exist on the remote is a hard error, never a silent
@@ -435,8 +428,8 @@ Usage: install.sh [--uninstall]
   Most operators reach this script via a curl-into-bash one-liner rather than
   downloading install.sh to disk; the curl form works for every subcommand:
 
-    bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh)            # install
-    sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/v1.0.0/install.sh) --uninstall
+    bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.sh)            # install
+    sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.sh) --uninstall
 
   Operators who cloned the repo to disk and have install.sh in CWD can also:
 

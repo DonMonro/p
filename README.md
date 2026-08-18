@@ -40,9 +40,8 @@ sudo bash <(curl -sL https://raw.githubusercontent.com/DonMonro/p/main/install.s
 
 > The one-liner tracks `main`, so a plain `git push` is all it takes to ship a
 > change — re-run the installer and the new code is installed. No tag or
-> release needed. For a reproducible install pinned to a specific release,
-> fetch that tag's script **and** pin the clone to the same tag:
-> `PSIPHON3XUI_REPO_REF=v1.1.0 sudo bash <(curl -sL …/p/v1.1.0/install.sh)`
+> release needed. (`PSIPHON3XUI_REPO_REF=<branch>` can override the cloned
+> ref for testing.)
 >
 > If `raw.githubusercontent.com` rate-limits you (bash errors like
 > `429:: command not found`), clone instead — same code, no raw-file CDN:
@@ -341,24 +340,13 @@ for the override-format details + the placeholder-rejector rules.
 
 ---
 
-## Contributing & release procedure
+## Contributing & shipping changes
 
-We tag releases following the [Phase 7 — tag v1.0.0 + GitHub Release + SHA256 manifest](plans/ROADMAP.md) procedure:
+There is no tag/release step — the installer tracks `main`:
 
-1. Bump the version pin in `install.sh` (`REPO_REF`) **and** `pyproject.toml`
-   (`version`) to the new release number — in the same commit as the tag, so the
-   served `install.sh` and the helpers it clones always come from one commit
-   (the version-skew guard).
-2. Run all four validation gates (above) locally — they must be green.
-3. Commit, push `main`, then tag the commit: `git tag vMAJOR.MINOR.PATCH`.
-4. Push the tag: `git push origin vMAJOR.MINOR.PATCH` (this fires the release
-   workflow, which builds the wheel and attaches it + `sha256.txt` to the
-   GitHub Release).
-5. Move the `latest` tag to the new release so the version-free one-liner
-   keeps working:
-   ```bash
-   git tag -f latest vMAJOR.MINOR.PATCH && git push -f origin latest
-   ```
+1. Run the validation gates (above) locally — they must be green.
+2. Commit and push `main`.
+3. Re-run the installer on the server; the new code is installed.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the codebase layout and
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for common install-time
